@@ -69,6 +69,9 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
     pipe = request.app["pipe"]
     peer = str(request.remote)
     pipe.ws_peers.add(peer)
+    # 同时登记连接对象：退出时要靠它主动关闭，否则 runner.cleanup() 会
+    # 一直等 WS 处理器返回（NapCat 不断线就永远不返回）。
+    pipe.ws_conns.add(ws)
     log.info("协议端已连接: %s", request.remote)
     accepted = 0
     try:
@@ -90,6 +93,7 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
     finally:
         # 必须在 finally 里移除，否则断线后 /health 会一直显示「已连接」
         pipe.ws_peers.discard(peer)
+        pipe.ws_conns.discard(ws)
         log.info("协议端断开（本次接收 %s 条事件）", accepted)
     return ws
 

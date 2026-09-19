@@ -139,20 +139,75 @@ def main() -> int:
     except ImportError:
         print("  (未安装 aiohttp，跳过 WS 握手测试)")
 
-    print("\n=== 协作退出 ===")
+    print("\n=== 协作退出（持有活动 WS 连接）===")
+    # 关键回归点：真实场景下 NapCat 会一直挂着反向 WS。而 runner.cleanup() 会等待
+    # 所有活动连接结束，WS 处理器 `async for raw in ws` 在 NapCat 不断线时永不返回
+    # —— 曾导致停止服务卡 39 秒（直到心跳报 No PONG 才解开）。
+    # 所以这里必须**握着一条连接**去停，才能测出该缺陷。
+    holder: subprocess.Popen | None = None
+    if proc.poll() is None:
+        holder_code = (
+            "import asyncio, sys, aiohttp\n"
+            "async def m():\n"
+            "    async with aiohttp.ClientSession(trust_env=False) as s:\n"
+            "        async with s.ws_connect(sys.argv[1], timeout=5) as ws:\n"
+            "            print('HOLDING', flush=True)\n"
+            "            async for msg in ws:\n"
+            "                pass\n"
+            "asyncio.run(m())\n"
+        )
+        holder = subprocess.Popen(
+            [str(PY), "-u", "-c", holder_code, f"ws://127.0.0.1:{ws_port}/onebot/ws"],
+            cwd=str(PROJ),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        op2 = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        peers: list = []
+        for _ in range(20):
+            time.sleep(0.5)
+            try:
+                with op2.open(f"http://127.0.0.1:{http_port}/health", timeout=1.5) as r:
+                    peers = json.loads(r.read().decode("utf-8")).get("ws_peers") or []
+            except Exception:  # noqa: BLE001
+                pass
+            if peers:
+                break
+        check("测试客户端已挂上 WS（模拟 NapCat 在线）", bool(peers), str(peers))
+
     if proc.poll() is None:
         t0 = time.time()
         stop_path.touch()
         try:
             rc = proc.wait(timeout=25)
-            check("创建停止文件后服务自行退出", True, f"退出码 {rc}，耗时 {time.time() - t0:.1f}s")
+            elapsed = time.time() - t0
+            check("创建停止文件后服务自行退出", True, f"退出码 {rc}，耗时 {elapsed:.1f}s")
             check("退出码为 0（正常收尾，非强杀）", rc == 0, str(rc))
+            check("持有活动 WS 时仍能快速退出（<8s）", elapsed < 8, f"{elapsed:.1f}s")
         except subprocess.TimeoutExpired:
             check("创建停止文件后服务自行退出", False, "25 秒内未退出")
             proc.kill()
             proc.wait(timeout=10)
     else:
         check("服务不应提前退出", False, f"提前退出，码 {proc.poll()}")
+
+    if holder is not None:
+        if holder.poll() is None:
+            holder.kill()
+        try:
+            holder.wait(timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
+        if holder.stdout:
+            try:
+                hout = holder.stdout.read()
+            except Exception:  # noqa: BLE001
+                hout = ""
+            check("持有连接的过程确实建立过 WS", "HOLDING" in hout or holder.poll() is not None)
 
     out = ""
     if proc.stdout:

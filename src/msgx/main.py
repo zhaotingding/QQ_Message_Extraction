@@ -74,8 +74,22 @@ async def cmd_run(cfg: dict, stop_file: str | None = None) -> None:
     finally:
         if watcher is not None:
             watcher.cancel()
-        await runner.cleanup()
-        await pipe.stop()
+        # 顺序不能反：必须先主动关掉反向 WS，再 runner.cleanup()。
+        # cleanup() 会等待所有活动连接处理完毕，而反向 WS 的处理器是
+        # `async for raw in ws` —— NapCat 只要不断线，它就永远不返回。
+        # 实测：NapCat 未连入时退出 0.6s；NapCat 连着时要卡 39s，
+        # 直到 aiohttp 心跳报 "No PONG received after 15.0 seconds" 才解开。
+        closed = await pipe.close_ws_conns()
+        if closed:
+            log.info("已关闭 %s 个协议端连接，开始收尾", closed)
+        try:
+            await asyncio.wait_for(runner.cleanup(), timeout=10)
+        except asyncio.TimeoutError:
+            log.warning("服务端清理超时（10s），继续退出")
+        try:
+            await asyncio.wait_for(pipe.stop(), timeout=15)
+        except asyncio.TimeoutError:
+            log.warning("管道收尾超时（15s），继续退出")
 
 
 async def cmd_summary(cfg: dict, kind: str) -> None:

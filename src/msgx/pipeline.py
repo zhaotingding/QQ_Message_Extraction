@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from datetime import datetime
+
+from aiohttp import WSCloseCode
 
 from .config import api_key, load
 from .llm import BudgetExceeded, LLM
@@ -40,6 +43,13 @@ class Pipeline:
         # 当前连入的协议端（NapCat）地址集合。由接入层维护，供 /health 展示，
         # 让界面能明确区分「服务在跑」和「NapCat 已连上」——这两件事经常被混淆。
         self.ws_peers: set[str] = set()
+        # 活着的 WebSocket 连接对象。**退出时必须主动关掉它们**：
+        # aiohttp 的 AppRunner.cleanup() 会等待所有活动连接处理完毕，而反向 WS 的
+        # 处理器是 `async for raw in ws`，只要 NapCat 不断线就永远不返回。
+        # 症状：NapCat 没连入时 0.6s 退干净；NapCat 连着时要卡到心跳超时（实测 39s，
+        # 日志里表现为等 15s 没收到 PONG 才报 WS 错误）。界面「停止服务」会一直
+        # 停在「正在退出中…」。
+        self.ws_conns: set = set()
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
         self.started_at = time.time()
@@ -79,6 +89,23 @@ class Pipeline:
             asyncio.create_task(self._daily_loop(), name="daily"),
             asyncio.create_task(self._prune_loop(), name="prune"),
         ]
+
+    async def close_ws_conns(self) -> int:
+        """主动关闭所有反向 WS 连接，返回关闭条数。
+
+        必须在 runner.cleanup() 之前调用，否则 cleanup 会一直等 WS 处理器返回。
+        用 GOING_AWAY 告知对端是「服务要关了」，NapCat 收到后会自行重连。
+        """
+        conns = list(self.ws_conns)
+        for ws in conns:
+            with contextlib.suppress(Exception):
+                await ws.close(code=WSCloseCode.GOING_AWAY, message=b"server shutdown")
+        # 给 aiohttp 一点时间把关闭帧发出去并回收连接
+        for _ in range(20):
+            if not self.ws_conns:
+                break
+            await asyncio.sleep(0.05)
+        return len(conns)
 
     async def stop(self) -> None:
         self._stop.set()
