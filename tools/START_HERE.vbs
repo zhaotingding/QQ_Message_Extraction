@@ -7,7 +7,7 @@ Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
 here = fso.GetParentFolderName(WScript.ScriptFullName)
-cmd = """" & here & "\tools\start_gui.cmd"""
+cmd = """" & here & "\start_gui.cmd"""
 
 ' 第二个参数 0 = 隐藏窗口，第三个参数 False = 不等待返回
 sh.Run cmd, 0, False

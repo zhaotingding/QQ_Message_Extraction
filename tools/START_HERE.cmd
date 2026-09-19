@@ -1,6 +1,8 @@
 @echo off
 rem ============================================================
-rem  消息萃取 msgx 主入口
+rem  命令行备用入口（已移入 tools\）
+rem
+rem  日常使用请直接双击项目根目录的「消息萃取.exe」。
 rem
 rem    双击                  -> 打开图形界面（无黑框）
 rem    START_HERE.cmd --cli  -> 打开命令行菜单（界面起不来时用这个）
@@ -16,7 +18,7 @@ start "" wscript.exe "%~dp0START_HERE.vbs"
 exit /b
 
 :console
-call "%~dp0tools\launcher.cmd"
+call "%~dp0launcher.cmd"
 if errorlevel 1 (
   echo.
   pause
@@ -104,7 +106,7 @@ goto menu
 
 :opt7
 echo.
-"%PYTHON_EXE%" "%~dp0tools\check_napcat_env.py" --probe 6700 6701
+"%PYTHON_EXE%" "%~dp0check_napcat_env.py" --probe 6700 6701
 echo.
 pause
 goto menu

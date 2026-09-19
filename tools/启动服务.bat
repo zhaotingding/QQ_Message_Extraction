@@ -1,8 +1,9 @@
 @echo off
 rem 启动常驻服务。保持本窗口开启；关闭窗口 = 停止服务。
+rem 日常使用请双击项目根目录的「消息萃取.exe」，在界面里点「启动服务」。
 title 消息萃取 - 服务
 
-call "%~dp0tools\launcher.cmd"
+call "%~dp0launcher.cmd"
 if errorlevel 1 (
   echo.
   pause

@@ -31,24 +31,40 @@ async def cmd_run(cfg: dict, stop_file: str | None = None) -> None:
     stop_file 用于「协作退出」：界面点停止时只创建一个文件，由本进程在两次
     检查之间自行收尾退出。比直接 kill 安全 —— 不会打断正在写库或下载图片的动作。
     """
+    log = logging.getLogger("msgx")
     pipe = Pipeline(cfg)
     await pipe.start()
     app = build_app(cfg, pipe)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     host = cfg["onebot"]["host"]
-    site_ws = web.TCPSite(runner, host, int(cfg["onebot"]["ws_port"]))
-    site_http = web.TCPSite(runner, host, int(cfg["onebot"]["http_port"]))
-    await site_ws.start()
-    await site_http.start()
+    ws_port = int(cfg["onebot"]["ws_port"])
+    http_port = int(cfg["onebot"]["http_port"])
+    site_ws = web.TCPSite(runner, host, ws_port)
+    site_http = web.TCPSite(runner, host, http_port)
 
-    log = logging.getLogger("msgx")
+    # 端口被占用是「已经有一个服务在跑」最常见的表现，而原始 OSError 栈对用户毫无意义
+    # （实测用户看到「winerror 10048 通常每个套接字地址只允许使用一次」就卡住了）。
+    for site, port, what in ((site_ws, ws_port, "反向 WS"), (site_http, http_port, "HTTP 上报")):
+        try:
+            await site.start()
+        except OSError as exc:
+            log.error("启动失败：%s 端口 %s 无法绑定 —— %s", what, port, exc.strerror or exc)
+            log.error("  最常见的原因：**已经有一个服务实例在运行**。")
+            log.error("  确认方法：浏览器打开 http://127.0.0.1:%s/health", http_port)
+            log.error("           能返回 JSON 就说明服务已在运行，无需重复启动。")
+            log.error("  若确实没有实例，用下面命令看谁占了端口：")
+            log.error("           netstat -ano | findstr :%s", port)
+            await runner.cleanup()
+            await pipe.stop()
+            raise SystemExit(2) from exc
+
     log.info("=" * 62)
     log.info("消息萃取服务已启动")
-    log.info("  NapCat 反向 WS  : ws://%s:%s/onebot/ws", host, cfg["onebot"]["ws_port"])
-    log.info("  OneBot HTTP 上报: http://%s:%s/onebot", host, cfg["onebot"]["http_port"])
-    log.info("  本地注入测试     : POST http://%s:%s/inject", host, cfg["onebot"]["http_port"])
-    log.info("  健康检查         : http://%s:%s/health", host, cfg["onebot"]["http_port"])
+    log.info("  NapCat 反向 WS  : ws://%s:%s/onebot/ws", host, ws_port)
+    log.info("  OneBot HTTP 上报: http://%s:%s/onebot", host, http_port)
+    log.info("  本地注入测试     : POST http://%s:%s/inject", host, http_port)
+    log.info("  健康检查         : http://%s:%s/health", host, http_port)
     if not pipe.llm.available:
         log.warning("  未设置 DEEPSEEK_API_KEY —— 当前为「仅规则」模式")
     log.info("=" * 62)

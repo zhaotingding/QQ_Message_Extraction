@@ -21,6 +21,13 @@ venv/
 # ---- 一次性安装物（NapCat 压缩包等大文件）----
 _install/
 
+# ---- 打包产物：主程序 exe 是构建出来的，不是源码 ----
+# 它由 tools/exe_main.py 打包而成（命令见 README「重新打包」一节）。
+# 不入库的原因：二进制无法 review、体积与机器相关；克隆后自己打一次即可。
+消息萃取.exe
+msgx_launcher.exe
+*.spec
+
 # ---- Python 缓存 ----
 __pycache__/
 *.py[cod]

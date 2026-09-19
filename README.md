@@ -93,6 +93,11 @@ setx DEEPSEEK_API_KEY "sk-你的key"
 
 ### 3. 启动服务
 
+**日常用法（推荐）**：双击项目根目录的 **`消息萃取.exe`** —— 会打开图形界面，点「启动服务」即可。
+不需要记命令，也不需要先配环境变量。
+
+命令行方式（排查问题时用）：
+
 ```powershell
 # 在项目根目录执行
 .venv\Scripts\python.exe -m msgx.main run
@@ -107,7 +112,9 @@ setx DEEPSEEK_API_KEY "sk-你的key"
   健康检查         : http://127.0.0.1:6701/health
 ```
 
-也可以直接双击 `启动服务.bat`（内部会设好 Python 路径与 `PYTHONPATH`，不需要你手动配环境）。
+> **不要重复启动。** 端口 6700 已被占用时，第二次启动会失败并提示
+> 「端口无法绑定 —— 最常见的原因：已经有一个服务实例在运行」。
+> 判断方法：浏览器打开 `http://127.0.0.1:6701/health`，能返回 JSON 就说明服务已在运行。
 
 ### 4. 接上 QQ（见下一节）
 
@@ -243,7 +250,7 @@ INFO  msgx.onebot   协议端已连接: 127.0.0.1
 .venv\Scripts\python.exe -m msgx.main vision --force
 ```
 
-双击 `查看状态.bat` 也能看。
+双击 `tools\查看状态.bat` 也能看，或者直接看图形界面「运行状态」页。
 
 ---
 
@@ -293,12 +300,16 @@ llm_review_min_score = 2   # 规则分达到多少才交给模型复核（直接
 
 ## 日常使用
 
+**主程序只有一个：双击项目根目录的 `消息萃取.exe`。** 图形界面里有启停、状态、日志和全部设置。
+下面这些是排查问题或做运维时用的备用入口（都在 `tools\` 里）。
+
 | 操作 | 双击 | 或命令行 |
 |---|---|---|
-| **打开图形界面** | `START_HERE.cmd`、或 `START_HERE.vbs` | `python -m msgx.main gui` |
-| 命令行菜单 | `START_HERE.cmd --cli` | — |
-| 启动服务 | `启动服务.bat` | `python -m msgx.main run` |
-| 查看状态与花费 | `查看状态.bat` | `python -m msgx.main stats` |
+| **主程序（开图形界面）** | **`消息萃取.exe`** | `python -m msgx.main gui` |
+| 备用：开图形界面 | `tools\START_HERE.cmd`、`tools\START_HERE.vbs` | `python -m msgx.main gui` |
+| 备用：命令行菜单 | `tools\START_HERE.cmd --cli` | — |
+| 备用：只跑服务（无界面） | `tools\启动服务.bat` | `python -m msgx.main run` |
+| 备用：查看状态与花费 | `tools\查看状态.bat` | `python -m msgx.main stats` |
 | 立即生成摘要 | — | `python -m msgx.main summary --kind periodic` |
 | 生成日报 | — | `python -m msgx.main summary --kind daily` |
 | 清理过期数据 | — | `python -m msgx.main prune` |
@@ -314,7 +325,11 @@ llm_review_min_score = 2   # 规则分达到多少才交给模型复核（直接
 
 ## 图形界面
 
-双击 **`START_HERE.cmd`**（或 `START_HERE.vbs`）即可，全程没有黑色命令行窗口。
+双击项目根目录的 **`消息萃取.exe`** 即可，全程没有黑色命令行窗口。
+
+> `消息萃取.exe` 是个「启动器」：体积约 10MB，只负责找到项目里的 `.venv` 并拉起界面。
+> 依赖（onnxruntime / rapidocr 等）仍在 `.venv` 里，**所以改 `src/` 下的代码后不需要重新打包**。
+> 重新打包的命令见本节末尾。
 
 ### 运行状态
 
@@ -340,6 +355,20 @@ llm_review_min_score = 2   # 规则分达到多少才交给模型复核（直接
 这样配置文件的改动归版本管理，各人的偏好互不干扰 —— 多人协作时不会因为谁改了配置而互相覆盖。
 
 规则是「留空 = 沿用 `config.toml`」而不是「清空」：比如关键词留空，服务仍会用配置文件里的关键词。
+
+> ⚠️ **注意**：这些设置只在**从图形界面启动服务**时生效（界面通过环境变量 `MSGX_PREFS` 传给服务进程）。
+> 若改用 `tools\启动服务.bat` 或命令行手动启动，服务只读 `config.toml`，**界面里的设置不会生效**。
+
+### 重新打包 `消息萃取.exe`
+
+只在 `tools\exe_main.py` 本身需要改动时才要重打包（业务代码改动不需要）：
+
+```powershell
+.venv\Scripts\python.exe -m PyInstaller --onefile --noconsole `
+  --name msgx_launcher --distpath . --workpath build\tmp --specpath build `
+  --paths src tools\exe_main.py
+# 然后把生成的 msgx_launcher.exe 改名为 消息萃取.exe
+```
 
 > 「不选任何群」和「选了全部群」效果相同，都表示关注全部群。
 
@@ -395,29 +424,34 @@ python tools/make_demo.py --post --reset
 │   ├── test_filters.py
 │   ├── test_service.py
 │   └── test_gui.py
-├── tools/                    ← 辅助脚本（不属于业务代码）
+├── tools/                    ← 辅助脚本与备用入口（不属于业务代码）
+│   ├── exe_main.py           ← 主程序「消息萃取.exe」的入口（PyInstaller 冻结它）
+│   ├── gui_entry.py          ← 界面启动入口（无控制台，自行兜异常）
 │   ├── make_demo.py          ← 仿真数据生成
 │   ├── launcher.cmd          ← 环境探测（找 Python、设 PYTHONPATH）
 │   ├── start_gui.cmd         ← 用 pythonw 拉起图形界面
-│   ├── gui_entry.py          ← 界面启动入口（无控制台，自行兜异常）
 │   ├── start_napcat.bat      ← NapCat 启动包装器
-│   └── check_napcat_env.py   ← NapCat 环境体检（只读）
+│   ├── check_napcat_env.py   ← NapCat 环境体检（只读）
+│   ├── START_HERE.cmd/.vbs   ← 备用入口（默认开界面，--cli 进菜单）
+│   ├── 启动服务.bat          ← 备用：只跑服务，无界面
+│   └── 查看状态.bat          ← 备用：查看状态与用量
 ├── data/                     ← 运行时产物，不入库
 │   ├── msgx.db               ← SQLite 数据库
 │   ├── media/                ← 下载的图片
 │   └── reports/              ← 生成的摘要 HTML
 ├── .ui/                      ← 界面本地偏好，不入库
 │   └── preferences.json
+├── 消息萃取.exe              ← ★ 主程序：双击即打开图形界面
 ├── config.toml               ← 配置文件（入库，团队共享）
 ├── requirements.txt          ← 直接依赖（人工维护）
 ├── requirements.lock.txt     ← 锁定版本（实测快照，不手工改）
+├── requirements-dev.txt      ← 只给打包用（PyInstaller），运行时不需要
 ├── .env.example              ← 环境变量模板
-├── START_HERE.vbs            ← 无黑框打开界面
-├── START_HERE.cmd            ← 主入口（默认开界面，--cli 进菜单）
-├── 启动服务.bat / 查看状态.bat
 ├── CHANGELOG.md
 └── pyproject.toml
 ```
+
+**`消息萃取.exe` 不在版本库里**（它是构建产物，已加入 `.gitignore`）。克隆仓库后按上面「重新打包」一节自行生成即可，或者直接用 `tools\START_HERE.cmd` 打开界面。
 
 **代码为什么放在 `src/`？** 避免测试时把当前目录误当包导入，也让「哪些是业务代码、哪些是脚本」一目了然。
 `config.py` 中项目根是**三级上溯**（`src/msgx/config.py` → `src/` → 项目根），少写一层会导致配置读不到、数据库凭空重建。
@@ -452,7 +486,8 @@ python tools/make_demo.py --post --reset
 
 ### 不要提交
 
-`.gitignore` 已覆盖：`data/`（含真实聊天记录）、`.venv/`、`.env`、`.ui/`、`_install/`。
+`.gitignore` 已覆盖：`data/`（含真实聊天记录）、`.venv/`、`.env`、`.ui/`、`_install/`、
+`消息萃取.exe`（构建产物）与 `build/`（PyInstaller 中间文件）。
 
 **提交前务必确认 `data/` 没有被加入** —— 里面有真实群聊内容。
 
@@ -460,7 +495,7 @@ python tools/make_demo.py --post --reset
 
 ## 排障
 
-### 双击 `START_HERE.cmd` 后没有任何反应
+### 双击 `消息萃取.exe` 后没有任何反应
 
 多半是当前 Python 解释器没有 tkinter。界面启动失败的原因会写在 `.ui/gui_error.log`，先看它。
 
@@ -470,7 +505,23 @@ python tools/make_demo.py --post --reset
 ```
 
 报 `ModuleNotFoundError` 就换一个带 tkinter 的解释器重建 `.venv`（见「关于 tkinter」一节）。
-临时也可以走命令行：`START_HERE.cmd --cli`。
+临时也可以走命令行：`tools\START_HERE.cmd --cli`。
+
+若 `.ui/gui_error.log` 不存在、界面也没出现，说明连 Python 都没拉起来：
+检查 `.venv\Scripts\pythonw.exe` 是否存在，以及项目根目录的 `.venv` 是否完整。
+
+### 启动服务时报「端口无法绑定」
+
+**最常见的原因：已经有一个服务实例在运行。** 不需要重复启动。
+
+```powershell
+# 能返回 JSON 就说明服务已在运行
+curl http://127.0.0.1:6701/health
+# 或直接双击 tools\查看状态.bat
+```
+
+确认没有实例却仍报错时，用 `netstat -ano | findstr :6700` 看是谁占了端口
+（正常情况下只可能是本项目的 Python 进程，或 NapCat 自己的端口冲突）。
 
 ### 界面能开，但日志报 `No module named 'msgx'`
 
