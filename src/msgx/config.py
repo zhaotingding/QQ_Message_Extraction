@@ -63,6 +63,15 @@ DEFAULTS: dict = {
         "webhook_url": "",
         "webhook_type": "wecom",
     },
+    # 消息类型过滤。默认全部为 false —— 过滤是界面（0.2.0）引入的能力，
+    # 默认值必须保持「与 0.1.0 行为完全一致」：什么都不丢。
+    "filters": {
+        "skip_face_only": False,
+        "skip_image_only": False,
+        "skip_forward": False,
+        "skip_record": False,
+        "min_text_length": 0,
+    },
     "retention": {"keep_days_raw": 90, "keep_days_media": 30},
 }
 
@@ -83,7 +92,17 @@ def load(path: str | Path | None = None) -> dict:
     if cfg_path.exists():
         with open(cfg_path, "rb") as f:
             user = tomllib.load(f)
-    return _merge(DEFAULTS, user)
+    cfg = _merge(DEFAULTS, user)
+
+    # 叠加界面偏好。只有 GUI 启动的子进程会设置 MSGX_PREFS 环境变量，
+    # 直接跑命令行时不设，因此 CLI 行为完全不受影响。
+    # 这样界面改设置无需改写受 Git 管理的 config.toml，多人协作不会冲突。
+    from .prefs import apply_to_config, load_from_env
+
+    prefs = load_from_env()
+    if prefs:
+        cfg = apply_to_config(cfg, prefs)
+    return cfg
 
 
 def api_key(cfg: dict) -> str:

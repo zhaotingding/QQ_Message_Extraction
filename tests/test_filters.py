@@ -1,0 +1,78 @@
+"""消息过滤判定测试。
+
+覆盖 prefs.skip_reason 与 prefs.plain_text。
+这些规则直接决定「什么消息会被丢弃」，误判会造成静默丢数据，因此每条都要有断言。
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from msgx.models import Msg  # noqa: E402
+from msgx.prefs import apply_to_config, plain_text, skip_reason  # noqa: E402
+
+fails: list[str] = []
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    print(f"  [{'OK  ' if ok else 'FAIL'}] {name}" + (f"  -> {detail}" if detail else ""))
+    if not ok:
+        fails.append(name)
+
+
+face = Msg(msg_id="1", group_id="g", text="[表情]")
+mface = Msg(msg_id="2", group_id="g", text="[表情包]", image_urls=["http://x/a.png"])
+img = Msg(msg_id="3", group_id="g", text="[图片]", image_urls=["http://x/b.png"])
+mixed = Msg(msg_id="4", group_id="g", text="看这个报错 [图片]", image_urls=["http://x/c.png"])
+fwd = Msg(msg_id="5", group_id="g", text="[合并转发]")
+rec = Msg(msg_id="6", group_id="g", text="[语音]")
+short = Msg(msg_id="7", group_id="g", text="好的")
+normal = Msg(msg_id="8", group_id="g", text="正常的技术讨论内容")
+
+print("=== 过滤规则 ===")
+check("纯表情 命中", skip_reason(face, {"skip_face_only": True}) == "纯表情")
+check("表情包 命中（它也带图片 URL）", skip_reason(mface, {"skip_face_only": True}) == "纯表情")
+check("纯图片 命中", skip_reason(img, {"skip_image_only": True}) == "纯图片")
+check("纯图片 不被纯表情规则误伤", skip_reason(img, {"skip_face_only": True}) == "")
+check("带文字的图片 不命中", skip_reason(mixed, {"skip_image_only": True}) == "")
+check("合并转发 命中", skip_reason(fwd, {"skip_forward": True}) == "合并转发")
+check("语音 命中", skip_reason(rec, {"skip_record": True}) == "语音")
+check("短消息 命中", skip_reason(short, {"min_text_length": 5}) == "短于 5 字")
+
+print("\n=== 占位符处理（关键回归）===")
+# "[图片]" 是 4 个字符。若直接按原文长度判断，min_text_length=5 时它会被
+# 当成「有 4 个字的短消息」而放过/拦下，与用户预期不符。
+check("占位符不计入长度", plain_text("[图片][表情]") == "", repr(plain_text("[图片][表情]")))
+check("占位符不影响真实文本", plain_text("[图片] 显存怎么调") == "显存怎么调")
+check("文件占位符可剥离", plain_text("[文件:report.pdf] 见附件") == "见附件")
+check("纯图片在 min_length 下不被误判为短消息", skip_reason(img, {"min_text_length": 5}) == "")
+
+print("\n=== 默认值必须放行一切 ===")
+check("默认配置下放行", skip_reason(normal, {}) == "")
+check("开关关闭时不生效", skip_reason(face, {"skip_face_only": False}) == "")
+check("min_length=0 不过滤", skip_reason(short, {"min_text_length": 0}) == "")
+
+print("\n=== 偏好叠加到配置 ===")
+cfg = {"score": {"keywords": ["原有关键词"]}, "summary": {"interval_minutes": 30},
+       "watch": {"groups": []}, "filters": {}}
+merged = apply_to_config(cfg, {"keywords": ["新词"], "interval_minutes": 15, "groups": ["123"],
+                              "filters": {"skip_face_only": True, "min_text_length": 3}})
+check("关键词被覆盖", merged["score"]["keywords"] == ["新词"])
+check("间隔被覆盖", merged["summary"]["interval_minutes"] == 15)
+check("群列表被覆盖", merged["watch"]["groups"] == ["123"])
+check("过滤开关生效", merged["filters"]["skip_face_only"] is True)
+check("最小长度生效", merged["filters"]["min_text_length"] == 3)
+check("入参 cfg 未被修改", cfg["score"]["keywords"] == ["原有关键词"])
+
+empty = apply_to_config(cfg, {"keywords": [], "interval_minutes": 0, "groups": []})
+check("空关键词 = 沿用配置文件", empty["score"]["keywords"] == ["原有关键词"])
+check("间隔 0 = 沿用配置文件", empty["summary"]["interval_minutes"] == 30)
+check("空群列表 = 关注全部", empty["watch"]["groups"] == [])
+
+print()
+if fails:
+    print(f"存在 {len(fails)} 项失败: {fails}")
+    raise SystemExit(1)
+print("全部通过")

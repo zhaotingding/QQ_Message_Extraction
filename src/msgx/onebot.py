@@ -67,6 +67,8 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(heartbeat=30, max_msg_size=MAX_WS_MSG)
     await ws.prepare(request)
     pipe = request.app["pipe"]
+    peer = str(request.remote)
+    pipe.ws_peers.add(peer)
     log.info("协议端已连接: %s", request.remote)
     accepted = 0
     try:
@@ -86,6 +88,8 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
                 log.warning("WS 错误: %s", ws.exception())
                 break
     finally:
+        # 必须在 finally 里移除，否则断线后 /health 会一直显示「已连接」
+        pipe.ws_peers.discard(peer)
         log.info("协议端断开（本次接收 %s 条事件）", accepted)
     return ws
 

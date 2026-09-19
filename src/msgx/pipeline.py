@@ -10,6 +10,7 @@ from .llm import BudgetExceeded, LLM
 from .media import MediaWorker
 from .models import Msg, parse_onebot_event
 from .notify import Notifier
+from .prefs import skip_reason
 from .score import Scorer
 from .store import Store
 from .summarize import Summarizer
@@ -36,10 +37,20 @@ class Pipeline:
 
         # 接入队列：WebSocket 回调只做入队（不能阻塞协议端），由 _ingest_loop 串行消费。
         self.ingest_q: asyncio.Queue[dict] = asyncio.Queue(maxsize=5000)
+        # 当前连入的协议端（NapCat）地址集合。由接入层维护，供 /health 展示，
+        # 让界面能明确区分「服务在跑」和「NapCat 已连上」——这两件事经常被混淆。
+        self.ws_peers: set[str] = set()
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
         self.started_at = time.time()
-        self.counters = {"received": 0, "stored": 0, "duplicate": 0, "skipped": 0, "alerts": 0}
+        self.counters = {
+            "received": 0,
+            "stored": 0,
+            "duplicate": 0,
+            "skipped": 0,
+            "filtered": 0,
+            "alerts": 0,
+        }
 
     def _db_path(self) -> str:
         from .config import abs_path
@@ -115,6 +126,13 @@ class Pipeline:
         if self.watch and msg.group_id not in self.watch:
             self.counters["skipped"] += 1
             return {"ok": False, "reason": f"群 {msg.group_id} 不在监听列表"}
+
+        # 界面配置的消息类型过滤。在入库前拦截，省下存储与模型成本。
+        # 默认全部关闭，因此默认行为与不启用过滤时完全一致。
+        reason = skip_reason(msg, self.cfg.get("filters") or {})
+        if reason:
+            self.counters["filtered"] += 1
+            return {"ok": False, "reason": f"已按过滤规则丢弃: {reason}"}
 
         name = self.group_name(msg.group_id)
         row_id = self.store.insert_message(msg, name)
@@ -236,6 +254,7 @@ class Pipeline:
             "spent_today_cny": round(self.llm.spent_today_cny(), 4),
             "budget_cny": self.cfg["llm"]["max_daily_cost_cny"],
             "watch_groups": sorted(self.watch) or "全部",
+            "ws_peers": sorted(self.ws_peers),
             "counters": self.counters,
             "stats": self.store.stats(),
         }

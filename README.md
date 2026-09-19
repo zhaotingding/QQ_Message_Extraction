@@ -69,7 +69,7 @@ NapCat ──反向 WebSocket──► 本服务 :6700/onebot/ws
 ### 1. 准备环境
 
 ```powershell
-# 在项目根目录执行
+# 在项目根目录执行。"py -3.13" 换成你那个带 tkinter 的解释器
 py -3.13 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.lock.txt
 ```
@@ -295,17 +295,71 @@ llm_review_min_score = 2   # 规则分达到多少才交给模型复核（直接
 
 | 操作 | 双击 | 或命令行 |
 |---|---|---|
+| **打开图形界面** | `START_HERE.cmd`、或 `START_HERE.vbs` | `python -m msgx.main gui` |
+| 命令行菜单 | `START_HERE.cmd --cli` | — |
 | 启动服务 | `启动服务.bat` | `python -m msgx.main run` |
 | 查看状态与花费 | `查看状态.bat` | `python -m msgx.main stats` |
 | 立即生成摘要 | — | `python -m msgx.main summary --kind periodic` |
 | 生成日报 | — | `python -m msgx.main summary --kind daily` |
 | 清理过期数据 | — | `python -m msgx.main prune` |
 | 灌注演示数据 | — | `python tools/make_demo.py --post --reset` |
+| 跑测试 | — | `python tests/run_all.py` |
 
 > 命令行方式需要先 `set PYTHONPATH=src`，或执行一次 `pip install -e .`（之后就不用管 PYTHONPATH 了）。
 > 双击脚本已经帮你处理好这些。
 
 摘要 HTML 输出在 `data/reports/YYYYMMDD/`，可直接双击用浏览器打开。
+
+---
+
+## 图形界面
+
+双击 **`START_HERE.cmd`**（或 `START_HERE.vbs`）即可，全程没有黑色命令行窗口。
+
+### 运行状态
+
+- **状态卡片**：服务进程、协议端（NapCat）连接、已入库条数、今日花费、模型状态
+  - 「协议端」一项会明确区分 *服务在跑* 和 *NapCat 已连上* —— 这两件事经常被混淆，
+    是排查「为什么没有消息」时最先要看的地方
+- **按钮**：启动服务 / 停止服务 / 立即生成摘要 / 打开数据目录
+- **日志**：服务进程的实时输出，等同于控制台里看到的内容
+
+点「停止服务」时不会强杀进程，而是发一个信号文件让服务自己收尾退出 ——
+这样不会打断正在写数据库或下载图片的动作。
+
+### 设置
+
+| 界面项 | 作用 | 落到哪里 |
+|---|---|---|
+| 关注关键词 | 命中即进入候选池，再由模型判定是否值得提醒 | `score.keywords` |
+| 摘要间隔 | 每 N 分钟生成一次摘要（0 = 沿用 `config.toml`） | `summary.interval_minutes` |
+| 统计哪些群 | 勾选参与统计的群；**不选 = 全部群** | `watch.groups` |
+| 不接收的消息类型 | 纯表情 / 纯图片 / 合并转发 / 语音 / 短于 N 字 | `filters` |
+
+**设置保存在 `.ui/preferences.json`（本人本地，不入版本库），界面永远不会改写 `config.toml`。**
+这样配置文件的改动归版本管理，各人的偏好互不干扰 —— 多人协作时不会因为谁改了配置而互相覆盖。
+
+规则是「留空 = 沿用 `config.toml`」而不是「清空」：比如关键词留空，服务仍会用配置文件里的关键词。
+
+> 「不选任何群」和「选了全部群」效果相同，都表示关注全部群。
+
+---
+
+## 测试
+
+```powershell
+.venv\Scripts\python.exe tests\run_all.py
+```
+
+三组测试，零额外依赖（不需要 pytest）：
+
+| 测试 | 覆盖内容 |
+|---|---|
+| `test_filters.py` | 过滤判定与偏好叠加，含「占位符不计入长度」这类关键回归 |
+| `test_service.py` | 启动、健康检查、WS 端点契约（含写错路径的反例）、协作退出 |
+| `test_gui.py` | 真实构建全部界面控件并用假数据刷新，能查出 `compileall` 查不到的变量绑定错误 |
+
+`test_service.py` 会向系统要一个空闲端口并用临时数据库，**不会碰真实数据，也不会和正在运行的服务抢端口**。
 
 ### 不接 QQ 也能试
 
@@ -323,7 +377,8 @@ python tools/make_demo.py --post --reset
 消息萃取-MCP/
 ├── src/msgx/                 ← 全部业务代码
 │   ├── __init__.py           ← __version__ 在这里，版本号唯一来源
-│   ├── config.py             ← 配置加载与默认值
+│   ├── config.py             ← 配置加载、默认值、偏好叠加
+│   ├── prefs.py              ← .ui/preferences.json 读写 + 消息过滤判定
 │   ├── models.py             ← OneBot 事件 → 内部消息模型
 │   ├── store.py              ← SQLite 存储
 │   ├── onebot.py             ← WebSocket / HTTP 接入层
@@ -333,21 +388,32 @@ python tools/make_demo.py --post --reset
 │   ├── summarize.py          ← 周期摘要 / 日报 / HTML 渲染
 │   ├── notify.py             ← 本机托盘通知
 │   ├── pipeline.py           ← 消息总线，串起上面全部环节
+│   ├── gui.py                ← 图形界面（只做交互与进程管理）
 │   └── main.py               ← 命令行入口
+├── tests/                    ← 测试（零依赖，run_all.py 一键运行）
+│   ├── run_all.py
+│   ├── test_filters.py
+│   ├── test_service.py
+│   └── test_gui.py
 ├── tools/                    ← 辅助脚本（不属于业务代码）
 │   ├── make_demo.py          ← 仿真数据生成
 │   ├── launcher.cmd          ← 环境探测（找 Python、设 PYTHONPATH）
+│   ├── start_gui.cmd         ← 用 pythonw 拉起图形界面
+│   ├── gui_entry.py          ← 界面启动入口（无控制台，自行兜异常）
 │   ├── start_napcat.bat      ← NapCat 启动包装器
 │   └── check_napcat_env.py   ← NapCat 环境体检（只读）
 ├── data/                     ← 运行时产物，不入库
 │   ├── msgx.db               ← SQLite 数据库
 │   ├── media/                ← 下载的图片
 │   └── reports/              ← 生成的摘要 HTML
-├── config.toml               ← 配置文件（入库）
+├── .ui/                      ← 界面本地偏好，不入库
+│   └── preferences.json
+├── config.toml               ← 配置文件（入库，团队共享）
 ├── requirements.txt          ← 直接依赖（人工维护）
 ├── requirements.lock.txt     ← 锁定版本（实测快照，不手工改）
 ├── .env.example              ← 环境变量模板
-├── START_HERE.cmd            ← 菜单入口
+├── START_HERE.vbs            ← 无黑框打开界面
+├── START_HERE.cmd            ← 主入口（默认开界面，--cli 进菜单）
 ├── 启动服务.bat / 查看状态.bat
 ├── CHANGELOG.md
 └── pyproject.toml
@@ -393,6 +459,28 @@ python tools/make_demo.py --post --reset
 ---
 
 ## 排障
+
+### 双击 `START_HERE.cmd` 后没有任何反应
+
+多半是当前 Python 解释器没有 tkinter。界面启动失败的原因会写在 `.ui/gui_error.log`，先看它。
+
+```powershell
+# 5 秒确认
+.venv\Scripts\python.exe -c "import tkinter; print(tkinter.TkVersion)"
+```
+
+报 `ModuleNotFoundError` 就换一个带 tkinter 的解释器重建 `.venv`（见「关于 tkinter」一节）。
+临时也可以走命令行：`START_HERE.cmd --cli`。
+
+### 界面能开，但日志报 `No module named 'msgx'`
+
+`PYTHONPATH` 没设上。双击脚本会自动设置；手动跑命令行时需要先 `set PYTHONPATH=src`，
+或在项目根执行一次 `pip install -e .`。
+
+### 界面显示「服务在跑」但「协议端未连接」
+
+这两件事是分开的：服务起来了不等于 NapCat 连上了。检查 NapCat 那边的反向 WS 地址是否为
+`ws://127.0.0.1:6700/onebot/ws`（**不是** `/onebot`），端口是否为 6700。
 
 ### 服务起来了，但数据库里一条消息都没有
 

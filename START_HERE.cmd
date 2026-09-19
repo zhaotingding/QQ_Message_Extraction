@@ -1,14 +1,19 @@
 @echo off
 rem ============================================================
 rem  消息萃取 msgx 主入口
-rem    双击进入菜单；START_HERE.cmd --cli 等价。
+rem
+rem    双击                  -> 打开图形界面（无黑框）
+rem    START_HERE.cmd --cli  -> 打开命令行菜单（界面起不来时用这个）
 rem
 rem  说明: choice 返回的 errorlevel 必须从大到小判断。
 rem        /c 有 8 个字符，所以最后一个选项对应 errorlevel 8。
 rem ============================================================
 
 if /i "%~1"=="--cli" goto console
-goto console
+
+rem 默认走图形界面。用 wscript 调用 vbs，全程无窗口。
+start "" wscript.exe "%~dp0START_HERE.vbs"
+exit /b
 
 :console
 call "%~dp0tools\launcher.cmd"

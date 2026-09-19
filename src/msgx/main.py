@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 from contextlib import suppress
+from pathlib import Path
 
 from aiohttp import web
 
@@ -24,7 +25,12 @@ def setup_logging(level: str) -> None:
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
 
-async def cmd_run(cfg: dict) -> None:
+async def cmd_run(cfg: dict, stop_file: str | None = None) -> None:
+    """启动常驻服务。
+
+    stop_file 用于「协作退出」：界面点停止时只创建一个文件，由本进程在两次
+    检查之间自行收尾退出。比直接 kill 安全 —— 不会打断正在写库或下载图片的动作。
+    """
     pipe = Pipeline(cfg)
     await pipe.start()
     app = build_app(cfg, pipe)
@@ -47,9 +53,27 @@ async def cmd_run(cfg: dict) -> None:
         log.warning("  未设置 DEEPSEEK_API_KEY —— 当前为「仅规则」模式")
     log.info("=" * 62)
 
+    stop_evt = asyncio.Event()
+    watcher: asyncio.Task | None = None
+    if stop_file:
+        marker = Path(stop_file)
+
+        async def _watch_stop() -> None:
+            while not stop_evt.is_set():
+                if marker.exists():
+                    log.info("检测到停止信号，正在安全退出…")
+                    stop_evt.set()
+                    return
+                await asyncio.sleep(1)
+
+        watcher = asyncio.create_task(_watch_stop(), name="stop-watch")
+        log.info("停止信号文件: %s", marker)
+
     try:
-        await asyncio.Event().wait()
+        await stop_evt.wait()
     finally:
+        if watcher is not None:
+            watcher.cancel()
         await runner.cleanup()
         await pipe.stop()
 
@@ -127,7 +151,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-c", "--config", default=None, help="配置文件路径（默认 config.toml）")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("run", help="启动常驻服务")
+    # --stop-file 必须挂在 run 子命令上。挂在顶层的话，写成
+    # `msgx run --stop-file x` 时该参数位于子命令之后，会由子命令的解析器处理
+    # 而报 "unrecognized arguments"。
+    p_run = sub.add_parser("run", help="启动常驻服务")
+    p_run.add_argument(
+        "--stop-file",
+        default=None,
+        help="该文件一旦出现，服务就安全退出。供图形界面点「停止服务」时使用",
+    )
+    sub.add_parser("gui", help="打开图形界面（配置 + 启停 + 实时日志）")
 
     p_sum = sub.add_parser("summary", help="立即生成摘要")
     p_sum.add_argument("--kind", choices=["periodic", "daily"], default="periodic")
@@ -142,11 +175,18 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("prune", help="按保留策略清理旧数据")
 
     args = ap.parse_args(argv)
+
+    # 图形界面有自己的事件循环，不能塞进 asyncio.run
+    if args.cmd == "gui":
+        from .gui import main as gui_main
+
+        return gui_main(args.config)
+
     cfg = load(args.config)
     setup_logging(cfg["app"]["log_level"])
 
     coro = {
-        "run": lambda: cmd_run(cfg),
+        "run": lambda: cmd_run(cfg, args.stop_file),
         "summary": lambda: cmd_summary(cfg, args.kind),
         "inject": lambda: cmd_inject(cfg, args.json),
         "vision": lambda: cmd_vision(cfg, args.force),
