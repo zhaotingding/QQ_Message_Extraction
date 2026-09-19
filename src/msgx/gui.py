@@ -155,6 +155,11 @@ class App:
         self.btn_summary = ttk.Button(buttons, text="立即生成摘要", command=self.summary_now)
         self.btn_summary.pack(side="left")
         ttk.Button(buttons, text="打开数据目录", command=self.open_data_dir).pack(side="right")
+        # 协议端必须单独启动 —— 本服务只监听它连入。没配脚本就不显示这个按钮。
+        if self.napcat_script():
+            ttk.Button(
+                buttons, text="启动协议端(NapCat)", command=self.start_napcat
+            ).pack(side="right", padx=8)
 
         log_frame = ttk.LabelFrame(tab, text="服务日志", padding=8)
         log_frame.pack(fill="both", expand=True, pady=(6, 0))
@@ -482,6 +487,54 @@ class App:
     def open_data_dir(self) -> None:
         open_path(abs_path(self.cfg, "report_dir").parent)
 
+    # ---------------- 协议端 ----------------
+
+    def napcat_script(self) -> Path | None:
+        """协议端启动脚本的绝对路径；config.toml 没配置时返回 None。"""
+        raw = str((self.cfg.get("napcat") or {}).get("start_script") or "").strip()
+        if not raw:
+            return None
+        p = Path(raw)
+        return p if p.is_absolute() else ROOT / p
+
+    def start_napcat(self) -> None:
+        """拉起协议端（NapCat）。
+
+        本服务只监听协议端连入，替不了它启动，所以这里执行的是配置里的启动脚本 ——
+        与手动双击脚本行为完全一致（脚本内部会自行请求管理员权限）。
+        向 QQ 进程注入 DLL 必须是管理员，UAC 弹窗绕不过去，这是设计使然而非缺陷。
+        """
+        script = self.napcat_script()
+        if script is None:
+            messagebox.showinfo(
+                "未配置协议端",
+                "config.toml 的 [napcat] 段没有填 start_script，界面不知道要启动哪个脚本。\n\n"
+                "填上 NapCat 的启动脚本路径后重开界面即可，例如：\n"
+                'start_script = "D:\\App\\NapCat\\start-napcat.bat"',
+                parent=self.root,
+            )
+            return
+        if not script.exists():
+            messagebox.showerror(
+                "启动脚本不存在",
+                f"找不到：{script}\n\n请检查 config.toml 里 [napcat] start_script 的路径。",
+                parent=self.root,
+            )
+            return
+
+        self._log_ui(f"[界面] 正在启动协议端：{script}\n")
+        self.status.set("已请求启动 NapCat —— 请在 UAC 窗口点「是」，再完成扫码登录")
+        try:
+            os.startfile(str(script))  # 与手动双击脚本等价
+        except OSError as exc:
+            self._log_ui(f"[界面] 启动协议端失败：{exc}\n")
+            messagebox.showerror("启动失败", str(exc), parent=self.root)
+            return
+        self._log_ui(
+            "[界面] NapCat 要先注入 QQ 再登录，通常需要 10~30 秒。\n"
+            "[界面] 连上后上方「协议端(NapCat)」会自己变成「已连接」，无需重启服务。\n"
+        )
+
     # ---------------- 健康轮询 ----------------
 
     def _tick_health(self) -> None:
@@ -549,8 +602,10 @@ class App:
         peers = data.get("ws_peers") or []
         if peers:
             self.v_peer.set(f"已连接 · {', '.join(peers)}")
+        elif self.napcat_script():
+            self.v_peer.set("未连接 —— 请点「启动协议端(NapCat)」")
         else:
-            self.v_peer.set("未连接（NapCat 未连入）")
+            self.v_peer.set("未连接（NapCat 未启动）")
 
         c = data.get("counters") or {}
         s = data.get("stats") or {}

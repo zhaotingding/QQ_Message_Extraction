@@ -84,8 +84,30 @@ app._apply_health({
     "spent_today_cny": 0, "budget_cny": 10,
     "llm_available": False, "vision_supported": False,
 })
-check("未连协议端时提示准确", "NapCat 未连入" in app.v_peer.get(), app.v_peer.get())
+# 文案要既点明「未连接」，又说清缺的是协议端 NapCat —— 只说「未连接」用户不知道下一步做什么
+peer_txt = app.v_peer.get()
+check(
+    "未连协议端时提示准确",
+    "未连接" in peer_txt and ("NapCat" in peer_txt or "协议端" in peer_txt),
+    peer_txt,
+)
 check("无 API Key 时提示准确", "仅规则模式" in app.v_llm.get(), app.v_llm.get())
+
+print("\n=== 协议端启动脚本解析 ===")
+app.cfg["napcat"] = {"start_script": ""}
+check("未配置 start_script 时返回 None", app.napcat_script() is None, str(app.napcat_script()))
+app.cfg["napcat"] = {"start_script": "tools/whatever.bat"}
+check(
+    "相对路径拼到项目根",
+    app.napcat_script() == PROJ / "tools" / "whatever.bat",
+    str(app.napcat_script()),
+)
+app.cfg["napcat"] = {"start_script": r"D:\App\NapCat\start-napcat.bat"}
+check(
+    "绝对路径原样返回",
+    app.napcat_script() == Path(r"D:\App\NapCat\start-napcat.bat"),
+    str(app.napcat_script()),
+)
 
 print("\n=== 日志区 ===")
 app._log_ui("测试日志行\n")

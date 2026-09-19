@@ -70,6 +70,23 @@ sound        = true            # 强提醒播放系统提示音
 webhook_url  = ""              # 留空 = 仅本机通知；将来要推手机时填入即可
 webhook_type = "wecom"         # wecom | serverchan | json
 
+[napcat]
+# 协议端（NapCat）的启动脚本。
+#
+# 本服务只做「监听协议端连入」，**不会**替你启动 NapCat —— 这是两件事。
+# 填上下面这行，界面里就会出现「启动协议端(NapCat)」按钮，点一下即可拉起。
+#
+# 默认指向项目自带的 tools/start_napcat.bat：它会自动探测 NapCat 目录
+# （也可用环境变量 NAPCAT_HOME 指定），先修正工作目录再提权 —— 直接调 NapCat 自带的
+# launcher.bat 会因为工作目录变成 System32 而一闪而过。
+# 相对路径以项目根为基准，所以整个项目搬到别的目录也不用改这里。
+#
+# 注意：会弹一次 UAC 授权窗口，必须点「是」。原因：NapCat 要向 QQ 进程注入 DLL，
+# 这属于管理员操作，无法绕过。（NapCat 启动后 QQ 会一起起来，首次需扫码登录。）
+#
+# 留空 = 不显示该按钮，仍可手动启动。
+start_script = "tools/start_napcat.bat"
+
 [retention]
 keep_days_raw   = 90
 keep_days_media = 30
