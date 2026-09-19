@@ -87,6 +87,11 @@ webhook_type = "wecom"         # wecom | serverchan | json
 # 留空 = 不显示该按钮，仍可手动启动。
 start_script = "tools/start_napcat.bat"
 
+# NapCat 的安装目录。填了它，界面才会自动把登录二维码弹出来给你扫 ——
+# NapCat 需要登录时会把码写到 <dir>\cache\qrcode.png 就不管了，用户原本得
+# 自己去文件管理器里翻。留空 = 不自动弹（仍可自己去找那个文件扫）。
+dir = "D:\\App\\NapCat"
+
 [retention]
 keep_days_raw   = 90
 keep_days_media = 30

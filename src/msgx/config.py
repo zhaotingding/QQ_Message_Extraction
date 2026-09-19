@@ -63,9 +63,10 @@ DEFAULTS: dict = {
         "webhook_url": "",
         "webhook_type": "wecom",
     },
-    # 协议端（NapCat）的启动脚本。本服务只监听协议端连入，**不负责启动它**，
-    # 所以默认是空的。填上之后界面会出现「启动协议端」按钮。
-    "napcat": {"start_script": ""},
+    # 协议端（NapCat）。本服务只监听协议端连入，**不负责启动它**，所以默认都是空的。
+    #   start_script —— 填上后界面出现「启动协议端(NapCat)」按钮
+    #   dir          —— NapCat 安装目录，用于自动弹出登录二维码（<dir>\cache\qrcode.png）
+    "napcat": {"start_script": "", "dir": ""},
     # 消息类型过滤。默认全部为 false —— 过滤是界面（0.2.0）引入的能力，
     # 默认值必须保持「与 0.1.0 行为完全一致」：什么都不丢。
     "filters": {

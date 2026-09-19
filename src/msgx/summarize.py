@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from .config import abs_path
+from . import hotspot
 
 log = logging.getLogger("msgx.summarize")
 
@@ -30,6 +31,25 @@ DIGEST_SYSTEM = """你在为一位科研 + 工程双线作战的用户做群聊�
 MERGE_SYSTEM = """你在合并同一时间段内、来自同一群的多份摘要片段。
 把重复的话题合并成一个，按信息价值从高到低排序，保留所有链接、命令、参数、版本号原文。
 直接输出合并后的 Markdown，格式与输入一致，不要开场白。
+"""
+
+HOTSPOT_SYSTEM = """你在为一位科研 + 工程双线作战的用户做「跨群热点」归纳。
+下面每个热点都已统计好：出现在几个群、几个不同的人、提到几次，并附有原文片段。
+你的任务不是发现热点（统计已经做了），而是把每个热点压缩成高密度结论。
+
+要求：
+1. 每个热点输出：一句话结论（这件事到底是什么、进展到哪一步）+ 值得保留的细节
+   （命令 / 链接 / 版本号 / 结论性判断）。
+2. 标题必须保留统计数字，格式如「### GPT 降智（3 群 · 5 人 · 9 次）」——
+   密度是读者判断重要性的依据，不许省略。
+3. 保留原文里的链接、命令、参数，原样不改写。
+4. 信息密度优先：能一句话说清的绝不用两句；没有实质内容的热点直接跳过。
+5. 直接输出 Markdown，无开场白、无总结性评价。
+
+输出格式（严格遵守）：
+### <词>（<N> 群 · <M> 人 · <K> 次）
+- <一句话结论>
+- <细节 / 可复用内容>
 """
 
 
@@ -140,6 +160,11 @@ class Summarizer:
         now = int(time.time())
         names = self.store.group_names()
         created: list[dict] = []
+        # 跨群热点先行：同一件事散在多个群里时，逐群摘要永远体现不出「多群共鸣」，
+        # 这是用户最容易漏掉的信号 —— 必须单独统计、放在最前面。
+        hot = await self._summarize_hotspots(now)
+        if hot:
+            created.append(hot)
         for group_id in names:
             try:
                 item = await self._summarize_group(group_id, names.get(group_id, ""), now)
@@ -150,6 +175,55 @@ class Summarizer:
         if created:
             await self._notify_periodic(created, names)
         return created
+
+    async def _summarize_hotspots(self, now: int) -> dict | None:
+        """跨群热点：先统计后归纳。
+
+        统计（群数/人数/次数）免费且确定，不依赖模型；模型只负责把
+        附带原文片段的热点压缩成高密度结论。窗口独立于各群摘要 ——
+        各群的窗口推进节奏不同，热点必须用自己的（kind='hotspot'）节奏。
+        """
+        first = self.store.first_ts_all()
+        if not first:
+            return None
+        # 与各群摘要同理：messages_between_all 是开区间（ts > start），
+        # 首窗口须以 first - 1 为下界，否则全局第一条消息被永久排除。
+        start = self.store.window_end_all() or (first - 1)
+        rows = self.store.messages_between_all(start, now)
+        if len(rows) < int(self.scfg.get("min_messages", 8)):
+            return None
+
+        hotspots = hotspot.collect(rows, keywords=self.cfg["score"].get("keywords") or ())
+        if not hotspots:
+            return None
+
+        body = hotspot.format_for_llm(hotspots, self.store.group_names())
+        try:
+            content = await self.llm.chat(
+                HOTSPOT_SYSTEM, body, max_tokens=2000, temperature=0.2, think=False
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("热点归纳调用失败: %s", e)
+            return None
+        content = (content or "").strip()
+        if not content:
+            return None
+
+        title = (
+            f"跨群热点 {time.strftime('%m-%d %H:%M', time.localtime(start))}"
+            f"~{time.strftime('%H:%M', time.localtime(now))}"
+        )
+        path = self._write_report(title, content, "热点", start, now, len(rows))
+        sid = self.store.add_summary("hotspot", start, now, len(rows), content, "hotspot", str(path))
+        log.info("跨群热点 %d 个（%d 条消息）已生成", len(hotspots), len(rows))
+        return {
+            "id": sid,
+            "group_id": "hotspot",
+            "title": title,
+            "path": str(path),
+            "count": len(rows),
+            "n_hotspots": len(hotspots),
+        }
 
     async def _summarize_group(self, group_id: str, group_name: str, now: int) -> dict | None:
         first = self.store.first_ts(group_id)
@@ -212,14 +286,23 @@ class Summarizer:
 
     async def _notify_periodic(self, created: list[dict], names: dict) -> None:
         total = sum(c["count"] for c in created)
-        lines = [f"{names.get(c['group_id']) or c['group_id']}：{c['count']} 条" for c in created[:6]]
+        hot = next((c for c in created if c.get("group_id") == "hotspot"), None)
+        if hot:
+            # 有热点时以热点为标题 —— 这是读者最该先看的东西
+            title = f"跨群热点 {hot['n_hotspots']} 个（覆盖 {total} 条消息）"
+        else:
+            title = f"群摘要已生成（{len(created)} 个群 / {total} 条）"
+        lines = [
+            f"{names.get(c['group_id']) or c['title']}: {c['count']} 条"
+            for c in created[:6]
+        ]
         newest = max(created, key=lambda c: c["id"])
         await self.notifier.notify(
-            f"群摘要已生成（{len(created)} 个群 / {total} 条）",
+            title,
             "\n".join(lines),
             level="P1",
             action=Path(newest["path"]).as_uri(),
-            action_label="查看摘要",
+            action_label="查看热点" if hot else "查看摘要",
         )
 
     # ---------- daily ----------

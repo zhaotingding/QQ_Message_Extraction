@@ -18,6 +18,8 @@ PY = PROJ / ".venv" / "Scripts" / "python.exe"
 
 SUITES = [
     ("过滤规则", "test_filters.py"),
+    ("跨群热点", "test_hotspot.py"),
+    ("媒体校验", "test_media.py"),
     ("服务生命周期", "test_service.py"),
     ("界面构建", "test_gui.py"),
 ]

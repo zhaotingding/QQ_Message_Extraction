@@ -36,6 +36,25 @@ def _sniff_ext(data: bytes) -> str:
     return ".jpg"
 
 
+def _decodable(data: bytes) -> bool:
+    """用 Pillow 试着解码，确认内容完整。
+
+    Pillow 是 rapidocr 的既有依赖，不是新增。fetch 时的长度校验只能挡住
+    「字节数不足」，挡不住「字节数刚好但结构损坏」的情况 —— 后者正是
+    OCR 报 `image file is truncated`、多模态接口报 `unsupported image` 的来源。
+    """
+    try:
+        from io import BytesIO
+
+        from PIL import Image  # 惰性导入：装不上 OCR 时本模块仍可用
+
+        with Image.open(BytesIO(data)) as im:
+            im.verify()  # 只查结构完整性，不解码像素
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _load_ocr():
     try:
         from rapidocr_onnxruntime import RapidOCR  # type: ignore
@@ -116,6 +135,41 @@ class MediaWorker:
                 texts.extend(str(t) for t in txts)
         return "\n".join(t for t in texts if t.strip()).strip()
 
+    async def _fetch_complete(self, url: str, cap: int) -> bytes | None:
+        """下载并校验完整性：字节数必须与 Content-Length 一致，且能被 Pillow 解码。
+
+        原来的写法只做 `read(cap + 1)` 就写盘，从不校验长度 —— NapCat 的图床
+        偶发半途断流时，半张图会被存下来，随后 OCR 报 `image file is truncated`、
+        多模态接口报 `unsupported image`，两处都只是结果，根因在下载。
+        坏数据必须在源头拦下，**不落盘**，否则会污染 media 目录并反复报错。
+        """
+        s = await self.session()
+        for attempt in (1, 2):
+            try:
+                async with s.get(url) as r:
+                    if r.status != 200:
+                        log.debug("图片下载失败 HTTP %s: %s", r.status, url[:80])
+                        return None
+                    expected = r.content_length  # chunked 传输时为 None
+                    data = await r.content.read(cap + 1)
+            except Exception as e:  # noqa: BLE001
+                log.debug("图片下载异常: %s", e)
+                return None
+            if len(data) > cap:
+                log.warning("图片超过 %sMB，跳过", self.mcfg.get("max_download_mb"))
+                return None
+            if expected is not None and len(data) != expected:
+                log.warning(
+                    "图片不完整（收到 %d / 应为 %d 字节），%s",
+                    len(data), expected, "重试一次" if attempt == 1 else "放弃",
+                )
+                continue
+            if not _decodable(data):
+                log.warning("图片无法解码，%s", "重试一次" if attempt == 1 else "放弃")
+                continue
+            return data
+        return None
+
     async def _download(self, url: str) -> Path | None:
         cap = int(float(self.mcfg.get("max_download_mb", 20)) * 1024 * 1024)
         if url.startswith("file:"):
@@ -127,18 +181,8 @@ class MediaWorker:
                 log.debug("本地文件不存在: %s", p)
                 return None
             return p
-        s = await self.session()
-        try:
-            async with s.get(url) as r:
-                if r.status != 200:
-                    log.debug("图片下载失败 HTTP %s: %s", r.status, url[:80])
-                    return None
-                data = await r.content.read(cap + 1)
-                if len(data) > cap:
-                    log.warning("图片超过 %sMB，跳过", self.mcfg.get("max_download_mb"))
-                    return None
-        except Exception as e:  # noqa: BLE001
-            log.debug("图片下载异常: %s", e)
+        data = await self._fetch_complete(url, cap)
+        if data is None:
             return None
 
         sha = hashlib.sha256(data).hexdigest()[:32]

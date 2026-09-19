@@ -108,6 +108,17 @@ check(
     app.napcat_script() == Path(r"D:\App\NapCat\start-napcat.bat"),
     str(app.napcat_script()),
 )
+# NapCat 安装目录：留空 → 不自动弹二维码；填了 → 供监视 <dir>\cache\qrcode.png
+app.cfg["napcat"] = {"dir": ""}
+check("未配置 NapCat 目录时返回 None", app.napcat_dir() is None, str(app.napcat_dir()))
+app.cfg["napcat"] = {"dir": "NapCat"}
+check("相对目录拼到项目根", app.napcat_dir() == PROJ / "NapCat", str(app.napcat_dir()))
+app.cfg["napcat"] = {"dir": r"D:\App\NapCat"}
+check(
+    "绝对目录原样返回",
+    app.napcat_dir() == Path(r"D:\App\NapCat"),
+    str(app.napcat_dir()),
+)
 
 print("\n=== 日志区 ===")
 app._log_ui("测试日志行\n")

@@ -18,6 +18,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import urllib.request
 from pathlib import Path
@@ -69,6 +70,10 @@ class App:
         self.events: queue.Queue = queue.Queue()
         self.closing = False
         self.health_busy = False
+        # 登录二维码弹窗。Tkinter 只能在主线程碰控件，所以监视线程只把路径
+        # 丢进 events 队列，由 _drain 在主线程里弹窗。
+        self.qr_win: tk.Toplevel | None = None
+        self.qr_watching = False
 
         self._group_ids: list[str] = []
         self._build()
@@ -534,6 +539,79 @@ class App:
             "[界面] NapCat 要先注入 QQ 再登录，通常需要 10~30 秒。\n"
             "[界面] 连上后上方「协议端(NapCat)」会自己变成「已连接」，无需重启服务。\n"
         )
+        if self.napcat_dir():
+            self.qr_watching = True
+            threading.Thread(target=self._watch_qrcode, daemon=True).start()
+
+    # ---------------- 登录二维码 ----------------
+
+    def napcat_dir(self) -> Path | None:
+        """NapCat 安装目录（config.toml 的 [napcat] dir），未配置返回 None。"""
+        raw = str((self.cfg.get("napcat") or {}).get("dir") or "").strip()
+        if not raw:
+            return None
+        p = Path(raw)
+        return p if p.is_absolute() else ROOT / p
+
+    def _watch_qrcode(self) -> None:
+        """子线程：盯住 NapCat 的登录二维码文件。
+
+        NapCat 需要登录时会把二维码写到「安装目录/cache/qrcode.png」就完事了，
+        从不主动展示 —— 用户原本得自己去文件管理器里翻。这里检测到新二维码
+        就把路径丢进事件队列，交给主线程弹窗。
+        """
+        d = self.napcat_dir()
+        if d is None:
+            return
+        qr = d / "cache" / "qrcode.png"
+        seen = 0.0
+        while self.qr_watching and not self.closing:
+            try:
+                mtime = qr.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            # 只认 10 分钟内更新过的码：过期文件弹出来是误导
+            if mtime and mtime != seen and (time.time() - mtime) < 600:
+                seen = mtime
+                self.events.put(("qrcode", str(qr)))
+            time.sleep(1.0)
+
+    def _show_qrcode(self, path: str) -> None:
+        """主线程：弹出扫码窗口。同一时刻只保留一个。"""
+        self._close_qrcode()
+        try:
+            from PIL import Image, ImageTk  # Pillow 是 rapidocr 的既有依赖
+
+            img = Image.open(path)
+            img.thumbnail((340, 340))
+            photo = ImageTk.PhotoImage(img)
+        except Exception as exc:  # noqa: BLE001
+            self._log_ui(f"[界面] 二维码读取失败：{exc}\n")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("扫码登录 QQ")
+        win.attributes("-topmost", True)
+        ttk.Label(win, text="请用手机 QQ 扫描下方二维码完成登录", font=(FONT, 11)).pack(
+            padx=20, pady=(16, 8)
+        )
+        ttk.Label(win, image=photo).pack(padx=20, pady=4)
+        ttk.Label(
+            win, text="登录成功后本窗口会自动关闭；也可以直接关掉它", style="Hint.TLabel"
+        ).pack(pady=(6, 14))
+        win.photo = photo  # 必须挂在控件上，否则被 GC 后图像变空白
+        self.qr_win = win
+
+    def _close_qrcode(self) -> None:
+        """关掉扫码窗口（协议端连上后自动调用）。"""
+        win = self.qr_win
+        if win is None:
+            return
+        try:
+            win.destroy()
+        except Exception:  # noqa: BLE001  窗口可能已被用户手动关闭
+            pass
+        self.qr_win = None
 
     # ---------------- 健康轮询 ----------------
 
@@ -577,6 +655,8 @@ class App:
                 self.status.set(value)
             elif kind == "health":
                 self._apply_health(value)
+            elif kind == "qrcode":
+                self._show_qrcode(value)
             elif kind == "exit":
                 if self.proc is not None and self.proc.stdout:
                     try:
@@ -602,6 +682,8 @@ class App:
         peers = data.get("ws_peers") or []
         if peers:
             self.v_peer.set(f"已连接 · {', '.join(peers)}")
+            self.qr_watching = False  # 已连上，没必要再盯着二维码
+            self._close_qrcode()
         elif self.napcat_script():
             self.v_peer.set("未连接 —— 请点「启动协议端(NapCat)」")
         else:
@@ -637,6 +719,7 @@ class App:
     # ---------------- 关闭 ----------------
 
     def on_close(self) -> None:
+        self.qr_watching = False  # 先停掉二维码监视线程，再关界面
         if self.proc is None:
             self.root.destroy()
             return

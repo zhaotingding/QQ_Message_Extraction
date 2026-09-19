@@ -187,6 +187,28 @@ class Store:
         ).fetchone()
         return int(row["t"]) if row and row["t"] else 0
 
+    # ---------- 跨群（热点统计用） ----------
+
+    def first_ts_all(self) -> int:
+        row = self.conn.execute("SELECT MIN(ts) AS t FROM messages").fetchone()
+        return int(row["t"]) if row and row["t"] else 0
+
+    def window_end_all(self) -> int:
+        """跨群热点视角的窗口上界：最近一份热点报告覆盖到的时间点。"""
+        row = self.conn.execute(
+            "SELECT MAX(window_end) AS e FROM summaries WHERE kind='hotspot'"
+        ).fetchone()
+        return int(row["e"]) if row and row["e"] else 0
+
+    def messages_between_all(self, start: int, end: int, limit: int = 8000) -> list:
+        """窗口内全部群的消息，按时间升序。供跨群热点统计使用。"""
+        return list(
+            self.conn.execute(
+                "SELECT * FROM messages WHERE ts>? AND ts<=? ORDER BY ts ASC LIMIT ?",
+                (start, end, limit),
+            )
+        )
+
     # ---------- summaries ----------
 
     def add_summary(
