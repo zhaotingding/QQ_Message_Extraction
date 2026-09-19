@@ -1,0 +1,35 @@
+# 消息萃取（msgx）项目配置
+#
+# 构建系统：setuptools（src 布局）
+# Python 要求：>= 3.11（用到 tomllib，3.10 及以下不可用）
+#
+# 版本号是单一来源：写在这里的 version 从 src/msgx/__init__.py 的 __version__ 读取，
+# 发版时只改那一个文件即可。
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "msgx"
+dynamic = ["version"]
+description = "QQ 群消息萃取服务：接收 → 落库 → 媒体理解 → 打分 → 摘要 → 本机提醒"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+# 与 requirements.txt 保持一致。复现完全相同的环境请用 requirements.lock.txt。
+dependencies = [
+  "aiohttp>=3.9",
+  "pillow>=10.0",
+  "winotify>=1.1.0",
+  "rapidocr-onnxruntime==1.2.3",
+]
+
+[project.urls]
+Documentation = "https://github.com/"
+
+[tool.setuptools.dynamic]
+version = { attr = "msgx.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

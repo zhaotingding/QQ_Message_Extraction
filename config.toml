@@ -1,0 +1,75 @@
+# 消息萃取服务配置
+# 修改后重启服务生效。
+
+[app]
+db_path    = "data/msgx.db"
+media_dir  = "data/media"
+report_dir = "data/reports"
+log_level  = "INFO"
+
+[onebot]
+# NapCat 以「反向 WebSocket」方式连入本服务。
+# 注意路径必须是 /onebot/ws（ws_port 端口上）；/onebot 是 HTTP POST 上报路径，混淆会握手失败。
+# NapCat 侧填：ws://127.0.0.1:6700/onebot/ws
+host        = "127.0.0.1"
+ws_port     = 6700
+http_port   = 6701
+access_token = ""          # 与 NapCat 侧 token 保持一致；留空表示不校验
+
+[watch]
+# 留空 = 监听机器人账号加入的全部群。填写群号则只处理所列群。
+groups = []
+
+# 需要「被点名就强提醒」的 QQ 号。
+# 关键：监听用的是独立小号，所以别人 @ 小号几乎不会发生。
+# 把你自己的主号 QQ 填进来，群里 @ 你时才会被判为高优先级。
+# 例：at_qq = ["12345678"]
+at_qq = []
+
+# 群号 → 群名。OneBot 群消息事件不带群名，在这里补上便于阅读。
+# 例：123456789 = "AI 底层原理交流"
+[watch.names]
+
+[llm]
+enabled                 = true
+base_url                = "https://api.deepseek.com"
+model                   = "deepseek-flash"   # 文本模型
+vision_model            = "deepseek-flash"   # 图片模型；实测不支持图片时会自动降级为 OCR-only
+api_key_env             = "DEEPSEEK_API_KEY"
+api_key                 = ""                 # 也可直接写在这里（不推荐，优先用环境变量）
+max_daily_cost_cny      = 10.0
+price_in_usd_per_mtok   = 0.22
+price_out_usd_per_mtok  = 0.66
+usd_to_cny              = 7.2
+timeout_seconds         = 90
+
+[media]
+ocr_enabled        = true
+vision_enabled     = true     # 需 vision_model 实测支持图片，否则自动关闭
+max_download_mb    = 20
+images_per_minute  = 60       # 图片处理限速，控制成本
+
+[summary]
+interval_minutes    = 30      # 周期摘要间隔
+daily_report_at     = "22:00" # 每日报告时间（本地时区）
+chunk_char_budget   = 6000    # 单次送模型的最大字符数
+min_messages        = 8       # 窗口内消息少于此数则不生成摘要
+
+[score]
+# 高精度关键词：命中即进入候选池，再由模型判定
+keywords = ["招聘", "内推", "开源", "白嫖", "免费", "踩坑", "漏洞", "论文", "数据集", "复现", "实测", "避雷"]
+link_domains = ["github.com", "arxiv.org", "huggingface.co", "paperswithcode.com", "zhihu.com"]
+p0_min_score = 8               # 达到该分数才强提醒（先设高，避免误报疲劳）
+p1_min_score = 5               # 无模型时的降级阈值
+llm_review_min_score = 2       # 规则分达到该值就交给模型复核（决定模型调用量，进而决定成本）
+                               # 调高 = 省钱但可能漏掉「没有链接和关键词、但有价值的解答」
+
+[notify]
+backend      = "auto"          # auto | winotify | powershell
+sound        = true            # 强提醒播放系统提示音
+webhook_url  = ""              # 留空 = 仅本机通知；将来要推手机时填入即可
+webhook_type = "wecom"         # wecom | serverchan | json
+
+[retention]
+keep_days_raw   = 90
+keep_days_media = 30
