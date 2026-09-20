@@ -245,6 +245,9 @@ class MediaWorker:
                 media_path=str(path),
                 media_hash=digest,
                 state="done",
+                # 复用同图的历史结果时，语义状态也要跟着复用，否则会被当成
+                # 「还没试过」而重复调用模型。
+                vision_state="ok" if (prev["vision_text"] or "").strip() else "failed",
             )
             return
 
@@ -252,9 +255,11 @@ class MediaWorker:
         if self.mcfg.get("ocr_enabled", True):
             ocr_text = await asyncio.to_thread(self._ocr_sync, path)
 
-        vision_text = ""
-        if self.mcfg.get("vision_enabled", True) and self.llm.vision_supported():
-            vision_text = await self.llm.describe_image(path, VISION_PROMPT)
+        vision_text, vision_state = await self._run_vision(path)
+        if vision_state != "skipped":
+            # 第一次尝试也计数：否则「首跑失败」的行会白得一次额外重试机会，
+            # 而补跑计数只覆盖后续轮次，上限就不是真正的上限了。
+            self.store.bump_vision_tries(row["id"])
 
         self.store.set_media_result(
             row["id"],
@@ -263,7 +268,59 @@ class MediaWorker:
             media_path=str(path),
             media_hash=digest,
             state="done",
+            vision_state=vision_state,
         )
+
+    async def _run_vision(self, path: Path) -> tuple[str, str]:
+        """跑图片语义，返回 ``(文本, 状态)``。状态见 store.MESSAGE_MIGRATIONS。
+
+        为什么要把「失败」单独记下来：失败不落状态的话，这张图以后永远不会
+        再被尝试（实测因此丢掉 62 张）。记成 'failed' 后由 `retry_vision()`
+        在后续轮次里补跑 —— 图片已在本地，补跑只是重发一次推理请求。
+        """
+        if not self.mcfg.get("vision_enabled", True):
+            return "", "skipped"
+        if not self.llm.vision_supported():
+            return "", "skipped"
+        text, ok = await self.llm.describe_image(path, VISION_PROMPT)
+        return text, ("ok" if ok else "failed")
+
+    async def retry_vision(self, limit: int = 8) -> list[int]:
+        """补跑之前语义失败的那些图（只重跑推理，不重新下载、不重跑 OCR）。
+
+        每轮只取少量，避免一次网络恢复后突然对模型发起几十个并发请求。
+        **每次尝试都计数**（store.bump_vision_tries）—— 没有这个上限，一张
+        永远读不出来的图会被每一轮补跑反复送去推理，安静地烧钱。次数用满后
+        它就停在 'failed'，不再进入 `failed_vision` 的结果集。
+
+        返回**这一次补出内容**的行 id，交给调用方重新打分：报错截图的语义文本
+        正是打分依据，第一遍提取失败等于这一条从来没被正确评过。
+        """
+        if not self.mcfg.get("vision_enabled", True) or not self.llm.vision_supported():
+            return []
+        rows = self.store.failed_vision(limit)
+        scored: list[int] = []
+        for row in rows:
+            self.store.bump_vision_tries(row["id"])
+            path = Path(row["media_path"])
+            if not path.exists():
+                continue  # 文件被清理了，保持 failed 即可
+            async with self._sem:
+                text, state = await self._run_vision(path)
+            self.store.set_media_result(
+                row["id"],
+                ocr_text=row["ocr_text"] or "",
+                vision_text=text if state == "ok" else "",
+                media_path=row["media_path"],
+                media_hash=row["media_hash"] or "",
+                state="done",
+                vision_state="ok" if state == "ok" else "failed",
+            )
+            if state == "ok":
+                scored.append(int(row["id"]))
+        if scored:
+            log.info("补跑图片语义成功 %d 张（本轮尝试 %d 张）", len(scored), len(rows))
+        return scored
 
     @staticmethod
     def looks_like_error(text: str) -> bool:

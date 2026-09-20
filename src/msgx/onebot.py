@@ -122,9 +122,40 @@ async def _summary_now(request: web.Request) -> web.Response:
     if kind == "periodic":
         created = await pipe.summarizer.run_periodic(force=True)
         return web.json_response({"ok": True, "created": created})
+    if kind == "range":
+        # 用户指定的时间范围：hours=24/72/168/720，目标字数由 chars_for_hours 决定
+        try:
+            hours = int(request.query.get("hours", 24))
+        except ValueError:
+            return web.json_response({"ok": False, "error": "hours 必须是整数"}, status=400)
+        if hours <= 0:
+            return web.json_response({"ok": False, "error": "hours 必须为正"}, status=400)
+        item = await pipe.summarizer.run_digest(full=True, hours=hours)
+        return web.json_response({"ok": True, "created": [item] if item else []})
     # digest（默认）= 接着上次已总结过的消息做增量纪要；full = 近 24h 全量重做
     item = await pipe.summarizer.run_digest(full=(kind == "full"))
     return web.json_response({"ok": True, "created": [item] if item else []})
+
+
+async def _messages_recent(request: web.Request) -> web.Response:
+    """界面「实时消息」用：最近入库的消息（新的在前）。"""
+    try:
+        limit = int(request.query.get("limit", 60))
+    except ValueError:
+        limit = 60
+    limit = max(1, min(limit, 300))
+    rows = request.app["pipe"].store.recent_messages(limit)
+    return web.json_response({"ok": True, "items": [dict(r) for r in rows]})
+
+
+async def _billing(request: web.Request) -> web.Response:
+    """真实账单：官方余额 + 平台逐日消费（有 token 时）。"""
+    pipe = request.app["pipe"]
+    try:
+        data = await pipe.billing_snapshot(refresh=True)
+    except Exception as e:  # noqa: BLE001
+        return web.json_response({"ok": False, "error": str(e)}, status=502)
+    return web.json_response({"ok": True, **data})
 
 
 async def _groups_refresh(request: web.Request) -> web.Response:
@@ -147,6 +178,8 @@ def build_app(cfg: dict, pipeline) -> web.Application:
     app.router.add_post("/onebot", _http_report)
     app.router.add_post("/inject", _inject)
     app.router.add_get("/alerts", _alerts)
+    app.router.add_get("/messages/recent", _messages_recent)
+    app.router.add_get("/billing", _billing)
     app.router.add_post("/summary/now", _summary_now)
     app.router.add_post("/groups/refresh", _groups_refresh)
     return app

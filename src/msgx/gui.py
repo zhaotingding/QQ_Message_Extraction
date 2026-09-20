@@ -26,8 +26,10 @@ from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from . import __version__
+from . import napcat as napcat_mod
 from . import prefs as prefs_mod
 from .config import ROOT, abs_path, load
+from .summarize import DIGEST_RANGES
 
 APP_TITLE = "消息萃取 msgx"
 FONT = "Microsoft YaHei UI"
@@ -70,6 +72,10 @@ class App:
         self.events: queue.Queue = queue.Queue()
         self.closing = False
         self.health_busy = False
+        # 实时消息页：拉取是否在进行中（避免慢响应时叠请求）、上次用的条数
+        self._rt_busy = False
+        self._rt_limit = 80
+        self.napcat_log_win: tk.Toplevel | None = None
         # 登录二维码弹窗。Tkinter 只能在主线程碰控件，所以监视线程只把路径
         # 丢进 events 队列，由 _drain 在主线程里弹窗。
         self.qr_win: tk.Toplevel | None = None
@@ -81,6 +87,7 @@ class App:
         self.refresh_groups()
         self.root.after(100, self._drain)
         self.root.after(800, self._tick_health)
+        self.root.after(1200, self._tick_realtime)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ---------------- 界面构建 ----------------
@@ -117,7 +124,11 @@ class App:
 
         nb = ttk.Notebook(outer)
         nb.pack(fill="both", expand=True)
+        self.nb = nb
         self._build_status_tab(nb)
+        # 实时消息页刻意排在「运行状态」之后、「设置」之前 —— 它是日常最常看的第二屏：
+        # 想确认「到底收进来了没有、内容对不对」时，不用再去翻 data/msgx.db。
+        self._build_realtime_tab(nb)
         self._build_settings_tab(nb)
 
         self.status = tk.StringVar(value="就绪")
@@ -137,45 +148,76 @@ class App:
         self.v_service = tk.StringVar(value="未运行")
         self.v_peer = tk.StringVar(value="—")
         self.v_stored = tk.StringVar(value="—")
+        self.v_vision = tk.StringVar(value="—")
         self.v_cost = tk.StringVar(value="—")
+        self.v_total = tk.StringVar(value="—")
+        self.v_balance = tk.StringVar(value="—")
         self.v_llm = tk.StringVar(value="—")
 
+        # 两列并排。用户的原话：「出了今日花费，总花费呢，不应该写在进入花费的右边吗」——
+        # 所以这两个必须是同一行的左右邻居，而不是上下两行。
         rows = [
-            ("服务进程", self.v_service),
-            ("协议端(NapCat)", self.v_peer),
-            ("已入库消息", self.v_stored),
-            ("今日花费", self.v_cost),
-            ("模型状态", self.v_llm),
+            [("服务进程", self.v_service), ("协议端(NapCat)", self.v_peer)],
+            [("已入库消息", self.v_stored), ("图片语义失败", self.v_vision)],
+            [("今日花费", self.v_cost), ("累计花费", self.v_total)],
+            [("账户余额", self.v_balance), ("模型状态", self.v_llm)],
         ]
-        for i, (key, var) in enumerate(rows):
-            ttk.Label(card, text=key, style="CardKey.TLabel").grid(
-                row=i, column=0, sticky="w", padx=(0, 14), pady=3
-            )
-            ttk.Label(card, textvariable=var, style="Card.TLabel").grid(
-                row=i, column=1, sticky="w", pady=3
-            )
+        for r, pair in enumerate(rows):
+            for c, (key, var) in enumerate(pair):
+                col = c * 2
+                ttk.Label(card, text=key, style="CardKey.TLabel").grid(
+                    row=r, column=col, sticky="w", padx=(0 if col == 0 else 28, 10), pady=3
+                )
+                ttk.Label(card, textvariable=var, style="Card.TLabel").grid(
+                    row=r, column=col + 1, sticky="w", pady=3
+                )
         card.columnconfigure(1, weight=1)
+        card.columnconfigure(3, weight=1)
 
+        # ---- 按钮区（两行，避免一行挤成一坨）----
         buttons = ttk.Frame(tab)
-        buttons.pack(fill="x", pady=(12, 8))
+        buttons.pack(fill="x", pady=(12, 4))
         self.btn_start = ttk.Button(buttons, text="启动服务", command=self.start_service)
         self.btn_start.pack(side="left")
         self.btn_stop = ttk.Button(buttons, text="停止服务", command=self.stop_service, state="disabled")
         self.btn_stop.pack(side="left", padx=8)
+
+        # 摘要只有两种生成方式：
+        #   ① 增量 —— 接着上次总结过的地方继续（日常就是这个）
+        #   ② 按范围 —— 明确「把最近 N 天的消息重做一份」
+        # 原来的「全量重做」没写清范围与字数，用户原话是「意义不明」。
         self.btn_summary = ttk.Button(
-            buttons, text="立即生成摘要", command=lambda: self.summary_now("digest")
+            buttons, text="生成最新摘要", command=lambda: self.summary_now("digest")
         )
         self.btn_summary.pack(side="left")
+        ttk.Label(buttons, text="按范围重做：").pack(side="left", padx=(16, 4))
+        self.v_range = tk.StringVar(value=DIGEST_RANGES[0][0])
+        self.cb_range = ttk.Combobox(
+            buttons,
+            textvariable=self.v_range,
+            values=[label for label, _h, _c in DIGEST_RANGES],
+            state="readonly",
+            width=11,
+            font=(FONT, 10),
+        )
+        self.cb_range.pack(side="left")
+        self.v_range_desc = tk.StringVar(value=self._range_desc(DIGEST_RANGES[0][0]))
+        self.cb_range.bind("<<ComboboxSelected>>", lambda _e: self._on_range_change())
+        ttk.Button(buttons, text="生成", command=self.summary_by_range, width=6).pack(
+            side="left", padx=6
+        )
         ttk.Button(buttons, text="打开数据目录", command=self.open_data_dir).pack(side="right")
-        # 协议端必须单独启动 —— 本服务只监听它连入。没配脚本就不显示这个按钮。
-        if self.napcat_script():
+
+        buttons2 = ttk.Frame(tab)
+        buttons2.pack(fill="x")
+        ttk.Label(buttons2, textvariable=self.v_range_desc, style="Hint.TLabel").pack(side="left")
+        # 协议端必须单独启动 —— 本服务只监听它连入。没配置就不显示这两个按钮。
+        if self.napcat_script() or self.napcat_dir():
             ttk.Button(
-                buttons, text="启动协议端(NapCat)", command=self.start_napcat
+                buttons2, text="启动协议端(NapCat)", command=self.start_napcat
             ).pack(side="right", padx=8)
-        # 增量纪要是默认动作，通常够用；这个按钮用于「忽略游标、把近 24h 全部重做一遍」。
-        ttk.Button(
-            buttons, text="全量重做", command=lambda: self.summary_now("full")
-        ).pack(side="right", padx=8)
+            ttk.Button(buttons2, text="协议端日志", command=self.show_napcat_log).pack(side="right")
+        ttk.Button(buttons2, text="刷新账单", command=self.refresh_billing).pack(side="right", padx=8)
 
         log_frame = ttk.LabelFrame(tab, text="服务日志", padding=8)
         log_frame.pack(fill="both", expand=True, pady=(6, 0))
@@ -194,7 +236,72 @@ class App:
         )
         self.log.pack(fill="both", expand=True)
 
-    # ---- 标签页 2：设置 ----
+    @staticmethod
+    def _range_desc(label: str) -> str:
+        for text, hours, chars in DIGEST_RANGES:
+            if text == label:
+                return f"目标约 {chars} 字（窗口越长允许写越长），数据源为最近 {hours // 24} 天"
+        return ""
+
+    def _on_range_change(self) -> None:
+        self.v_range_desc.set(self._range_desc(self.v_range.get()))
+
+    # ---- 标签页 2：实时消息 ----
+
+    def _build_realtime_tab(self, nb: ttk.Notebook) -> None:
+        """把「现在收到了什么」搬进界面。
+
+        起因是 NapCat 那个 CMD 黑框：以前有人习惯盯着协议端窗口看消息到底进没进来。
+        既然要把黑框干掉，就得在界面里给一个**更好的**替代品 —— 这里能看到
+        入库后的真实内容（含文本、图片处理状态、是否被 @），比协议端滚屏有用得多。
+        """
+        tab = ttk.Frame(nb, padding=14)
+        nb.add(tab, text="实时消息")
+
+        bar = ttk.Frame(tab)
+        bar.pack(fill="x", pady=(0, 8))
+        self.v_rt_auto = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            bar, text="自动刷新（每 3 秒）", variable=self.v_rt_auto
+        ).pack(side="left")
+        ttk.Button(bar, text="立即刷新", command=self.refresh_messages).pack(side="left", padx=8)
+        self.v_rt_limit = tk.StringVar(value="80")
+        ttk.Label(bar, text="显示条数").pack(side="left", padx=(16, 4))
+        ttk.Entry(bar, textvariable=self.v_rt_limit, width=6).pack(side="left")
+        self.v_rt_status = tk.StringVar(value="尚未加载")
+        ttk.Label(bar, textvariable=self.v_rt_status, style="Hint.TLabel").pack(side="right")
+
+        wrap = ttk.Frame(tab)
+        wrap.pack(fill="both", expand=True)
+        cols = ("time", "group", "who", "text", "state")
+        self.rt = ttk.Treeview(wrap, columns=cols, show="headings", height=18)
+        headings = {
+            "time": ("时间", 78, "center"),
+            "group": ("群", 130, "w"),
+            "who": ("发言人", 110, "w"),
+            "text": ("内容", 430, "w"),
+            "state": ("图片", 70, "center"),
+        }
+        for key, (title, width, anchor) in headings.items():
+            self.rt.heading(key, text=title)
+            self.rt.column(key, width=width, anchor=anchor, stretch=(key == "text"))
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.rt.yview)
+        self.rt.configure(yscrollcommand=sb.set)
+        self.rt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        # 交替行色 + 被 @ 的行标红，扫一眼就能看出有没有需要立刻处理的
+        self.rt.tag_configure("odd", background="#f5f7fa")
+        self.rt.tag_configure("atme", foreground=BAD_COLOR)
+        self.rt.tag_configure("failed", foreground="#a15c00")
+
+        ttk.Label(
+            tab,
+            text="显示最近入库的消息（新的在最上面）。「图片」列 = none 无图 / 完成 / 待处理 / "
+                 "失败 / 语义失败 —— 语义失败会自动补跑，最多 3 次。",
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(8, 0))
+
+    # ---- 标签页 3：设置 ----
 
     def _build_settings_tab(self, nb: ttk.Notebook) -> None:
         # 设置项比一屏还高，窗口一矮底部（保存设置）就掉出可见区。套一层 Canvas 做滚动：
@@ -308,6 +415,54 @@ class App:
         ttk.Entry(minline, textvariable=self.v_minlen, width=6).pack(side="left", padx=6)
         ttk.Label(minline, text="字的消息（0 = 不过滤，不计占位符）").pack(side="left")
 
+        # --- 协议端 ---
+        nc = ttk.LabelFrame(tab, text="协议端（NapCat）", padding=12)
+        nc.pack(fill="x", pady=(12, 0))
+        self.v_napcat_hidden = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            nc,
+            text="隐藏控制台窗口启动（推荐）",
+            variable=self.v_napcat_hidden,
+        ).pack(anchor="w")
+        ttk.Label(
+            nc,
+            text="勾上 = 启动协议端时不出现 CMD 窗口，任务栏干干净净；启动失败会弹消息框提示。\n"
+                 "取消勾选 = 回到「看得见」的模式，会弹控制台并显示完整自检输出（排障时用）。\n"
+                 "两种方式都绕不过 UAC 授权弹窗 —— NapCat 要往 QQ 进程注入 DLL，这是管理员操作。",
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(6, 0))
+
+        # --- 账单 ---
+        bl = ttk.LabelFrame(tab, text="账单（真实数据）", padding=12)
+        bl.pack(fill="x", pady=(12, 0))
+        ttk.Label(
+            bl,
+            text="余额用 API Key 查（自动）；消费明细必须用平台登录态 token，取法见下。"
+                 "留空 = 只显示本地估算，界面会标注「估算」。",
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+        self.txt_platform_token = tk.Text(
+            bl, height=3, wrap="char", font=("Consolas", 9), relief="solid", borderwidth=1
+        )
+        self.txt_platform_token.pack(fill="x")
+        ttk.Label(
+            bl,
+            text="取法：浏览器登录 platform.deepseek.com → F12 → Application → Local Storage "
+                 "→ 复制 userToken 的值 → 粘到上面 → 保存设置 → 重启服务。\n"
+                 "它是短期凭证，会过期；过期后界面会提示重新复制。token 只存在本机 "
+                 ".ui/preferences.json 里，不会进 Git。",
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+        ttk.Button(
+            bl,
+            text="打开 DeepSeek 平台（用于取 token）",
+            command=lambda: open_url("https://platform.deepseek.com/usage"),
+        ).pack(anchor="w", pady=(8, 0))
+
         # --- 操作 ---
         ops = ttk.Frame(tab)
         ops.pack(fill="x", pady=(14, 0))
@@ -358,6 +513,22 @@ class App:
             var.set(bool(f.get(key, False)))
         self.v_minlen.set(str(int(f.get("min_text_length") or 0)))
 
+        self.v_napcat_hidden.set(
+            bool(
+                prefs_mod.load_raw(self.prefs_file).get(
+                    "napcat_hidden", (self.cfg.get("napcat") or {}).get("hidden", True)
+                )
+            )
+        )
+        self.txt_platform_token.delete("1.0", "end")
+        # 偏好文件里留空 = 沿用 config.toml；这种情况下把配置值显示出来，
+        # 免得用户以为「token 没了」。
+        token = str(p.get("platform_token") or "").strip() or str(
+            (self.cfg.get("billing") or {}).get("platform_token") or ""
+        ).strip()
+        if token:
+            self.txt_platform_token.insert("1.0", token)
+
         saved = {str(g) for g in (p.get("groups") or [])}
         for i, gid in enumerate(self._group_ids):
             if gid in saved:
@@ -390,6 +561,8 @@ class App:
                 "skip_record": bool(self.v_filters["skip_record"].get()),
                 "min_text_length": minlen,
             },
+            "napcat_hidden": bool(self.v_napcat_hidden.get()),
+            "platform_token": self.txt_platform_token.get("1.0", "end").strip(),
             "ui": self.prefs.get("ui", {}),
         }
 
@@ -534,40 +707,208 @@ class App:
         finally:
             self.events.put(("exit", proc.wait()))
 
-    def summary_now(self, kind: str = "digest") -> None:
+    def summary_now(self, kind: str = "digest", hours: int | None = None) -> None:
         if self.proc is None:
             messagebox.showinfo("服务未运行", "请先启动服务，再生成摘要。", parent=self.root)
             return
         port = int(self.cfg["onebot"]["http_port"])
-        label = "全量重做" if kind == "full" else "增量纪要"
-        self.status.set(f"正在请求生成{label}…")
+        if kind == "range":
+            label = f"近 {hours} 小时" if hours and hours < 24 else f"近 {(hours or 24) // 24} 天"
+            target = f"按范围重做（{label}）"
+        else:
+            label = "增量"
+            target = "最新摘要"
+        self.status.set(f"正在请求生成{target}…")
 
         def work() -> None:
             try:
-                # digest：接着上次已总结过的消息继续（默认）；full：近 24h 全部重做。
+                # digest：接着上次已总结过的消息继续（默认）；range：把最近 hours
+                # 小时的消息重做一份，目标字数由服务侧按窗口长度取 600~1500。
                 # 两条路径都不受「每组 ≥8 条」的增量门槛限制，避免点按钮却回 0 份。
-                req = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/summary/now?kind={kind}", data=b"", method="POST"
-                )
+                url = f"http://127.0.0.1:{port}/summary/now?kind={kind}"
+                if kind == "range" and hours:
+                    url += f"&hours={int(hours)}"
+                req = urllib.request.Request(url, data=b"", method="POST")
                 op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                with op.open(req, timeout=300) as r:
+                with op.open(req, timeout=600) as r:
                     body = json.loads(r.read().decode("utf-8"))
                 items = body.get("created") or []
                 if items:
-                    chars = items[0].get("chars")
-                    extra = f"（{chars} 字，{items[0]['count']} 条消息）" if chars else ""
-                    self.events.put(("note", f"{label}已生成{extra}，详见 data/reports/"))
-                elif kind == "full":
-                    self.events.put(("note", "没有可总结的消息（最近 24 小时内库中没有群消息）"))
+                    it = items[0]
+                    chars = it.get("chars")
+                    extra = (
+                        f"（{chars} 字，目标 {it.get('target_chars')} 字，{it['count']} 条消息）"
+                        if chars else ""
+                    )
+                    self.events.put(("note", f"{target}已生成{extra}，详见 data/reports/"))
                 else:
-                    self.events.put(("note", "自上次纪要以来没有新消息，无需重复总结"))
+                    self.events.put(
+                        ("note", f"{label}窗口内没有可总结的消息（或自上次以来没有新消息）")
+                    )
             except Exception as exc:  # noqa: BLE001
                 self.events.put(("note", f"摘要请求失败：{exc}"))
 
         threading.Thread(target=work, daemon=True).start()
 
+    def summary_by_range(self) -> None:
+        """按选定的时间范围重做摘要。窗口越长，服务侧允许的目标字数越高。"""
+        label = self.v_range.get()
+        hours = DIGEST_RANGES[0][1]
+        for text, h, _c in DIGEST_RANGES:
+            if text == label:
+                hours = h
+                break
+        self.summary_now("range", hours=hours)
+
     def open_data_dir(self) -> None:
         open_path(abs_path(self.cfg, "report_dir").parent)
+
+    # ---------------- 实时消息 ----------------
+
+    @staticmethod
+    def _media_label(row) -> str:
+        m = str(row.get("media_state") or "")
+        v = str(row.get("vision_state") or "")
+        if m in ("", "none"):
+            return "—"
+        if m == "pending":
+            return "待处理"
+        if m == "failed":
+            return "下载失败"
+        if v == "failed":
+            return "语义失败"
+        if v == "skipped":
+            return "仅 OCR"
+        return "完成"
+
+    def refresh_messages(self) -> None:
+        if self.proc is None:
+            self.status.set("服务未运行 —— 启动服务后才能看到实时消息")
+            return
+        if self._rt_busy:
+            return
+        self._rt_busy = True
+        self._rt_limit = self._read_rt_limit()
+        threading.Thread(target=self._fetch_messages, args=(self._rt_limit,), daemon=True).start()
+
+    def _read_rt_limit(self) -> int:
+        """在主线程里读控件（Tkinter 变量不能在子线程碰）。"""
+        try:
+            return max(1, min(int(self.v_rt_limit.get() or 80), 300))
+        except ValueError:
+            return 80
+
+    def _fetch_messages(self, limit: int) -> None:
+        port = int(self.cfg["onebot"]["http_port"])
+        rows = None
+        try:
+            op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with op.open(f"http://127.0.0.1:{port}/messages/recent?limit={limit}", timeout=5) as r:
+                rows = json.loads(r.read().decode("utf-8")).get("items")
+        except Exception:  # noqa: BLE001
+            rows = None
+        finally:
+            self._rt_busy = False
+        self.events.put(("messages", rows))
+
+    def _render_messages(self, rows) -> None:
+        if rows is None:
+            self.v_rt_status.set("读取失败（服务没跑，或接口不可达）")
+            return
+        # 每 3 秒重建整表。保留选中行，否则用户刚点中的那一行会被刷没影。
+        sel = self.rt.selection()
+        keep = str(sel[0]) if sel else ""
+        self.rt.delete(*self.rt.get_children())
+        for i, r in enumerate(rows):
+            ts = int(r.get("ts") or 0)
+            raw = r.get("text") or ""
+            # 剥掉 [图片]/[表情] 这类占位符后如果没剩下东西，就把图片的语义/OCR
+            # 内容顶上来 —— 纯图片消息的正文是占位符，真正有信息的是识别结果。
+            body = prefs_mod.plain_text(raw)
+            if not body:
+                body = (r.get("vision_text") or r.get("ocr_text") or "").strip()
+            if not body:
+                body = raw.strip() or "（无文本）"
+            body = " ".join(body.split())[:300]
+            state = self._media_label(r)
+            tags: list[str] = []
+            if i % 2:
+                tags.append("odd")
+            if r.get("at_me"):
+                tags.append("atme")
+            if state == "语义失败":
+                tags.append("failed")
+            self.rt.insert(
+                "",
+                "end",
+                iid=str(r.get("id")),
+                values=(
+                    time.strftime("%m-%d %H:%M:%S", time.localtime(ts)),
+                    r.get("group_name") or r.get("group_id") or "",
+                    r.get("sender_name") or "",
+                    body,
+                    state,
+                ),
+                tags=tuple(tags),
+            )
+        if keep and self.rt.exists(keep):
+            self.rt.selection_set(keep)
+        self.v_rt_status.set(f"共 {len(rows)} 条 · 更新于 {time.strftime('%H:%M:%S')}")
+
+    # ---------------- 账单 ----------------
+
+    def refresh_billing(self) -> None:
+        """让服务去 DeepSeek 抓一次真实账单（余额 + 逐日消费）。"""
+        if self.proc is None:
+            messagebox.showinfo(
+                "服务未运行",
+                "账单是服务去抓的，请先启动服务。\n\n"
+                "（余额用 API Key 查；消费明细需要平台 token，见设置页。）",
+                parent=self.root,
+            )
+            return
+        port = int(self.cfg["onebot"]["http_port"])
+        self.status.set("正在向 DeepSeek 抓取真实账单…")
+
+        def work() -> None:
+            try:
+                op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with op.open(f"http://127.0.0.1:{port}/billing", timeout=90) as r:
+                    body = json.loads(r.read().decode("utf-8"))
+                if body.get("ok"):
+                    self.events.put(("billing", body))
+                else:
+                    self.events.put(("note", f"账单抓取失败：{body.get('error')}"))
+            except Exception as exc:  # noqa: BLE001
+                self.events.put(("note", f"账单抓取失败：{exc}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_billing(self, b: dict) -> None:
+        if not b:
+            # 服务刚起来还没抓过：只显示本地估算，并说清这是估算
+            self.v_total.set("—")
+            self.v_balance.set("—")
+            return
+        src = "平台" if b.get("source") == "platform" else "估算"
+        self.v_cost.set(f"¥{float(b.get('today_cny') or 0):.2f}（{src}）")
+        tot = f"¥{float(b.get('total_cny') or 0):.2f}（{src}）"
+        if b.get("source") == "platform" and b.get("from_day"):
+            tot += f" 自 {b['from_day']}"
+        self.v_total.set(tot)
+
+        bal = b.get("balance") or {}
+        if bal.get("ok"):
+            self.v_balance.set(f"¥{float(bal.get('total') or 0):.2f}")
+        else:
+            err = str(bal.get("error") or "不可用")
+            self.v_balance.set(f"—（{err[:26]}{'…' if len(err) > 26 else ''}）")
+
+        err = str(b.get("platform_error") or "")
+        if err and b.get("source") != "platform":
+            # 拿不到平台数据时必须说清原因，否则用户只会觉得「数字不对但不知道为啥」
+            self.v_cost.set(f"¥{float(b.get('today_cny') or 0):.2f}（估算）")
+            self.status.set(f"账单：{err}")
 
     # ---------------- 协议端 ----------------
 
@@ -582,36 +923,29 @@ class App:
     def start_napcat(self) -> None:
         """拉起协议端（NapCat）。
 
-        本服务只监听协议端连入，替不了它启动，所以这里执行的是配置里的启动脚本 ——
-        与手动双击脚本行为完全一致（脚本内部会自行请求管理员权限）。
-        向 QQ 进程注入 DLL 必须是管理员，UAC 弹窗绕不过去，这是设计使然而非缺陷。
-        """
-        script = self.napcat_script()
-        if script is None:
-            messagebox.showinfo(
-                "未配置协议端",
-                "config.toml 的 [napcat] 段没有填 start_script，界面不知道要启动哪个脚本。\n\n"
-                "填上 NapCat 的启动脚本路径后重开界面即可，例如：\n"
-                'start_script = "D:\\App\\NapCat\\start-napcat.bat"',
-                parent=self.root,
-            )
-            return
-        if not script.exists():
-            messagebox.showerror(
-                "启动脚本不存在",
-                f"找不到：{script}\n\n请检查 config.toml 里 [napcat] start_script 的路径。",
-                parent=self.root,
-            )
-            return
+        默认走**隐藏模式**：不再往任务栏里塞一个永久挂着的 CMD 黑框。
+        那个黑框的成因是包装脚本末尾的 ``pause`` —— 真正的启动动作（向 QQ 注入
+        DLL）几秒就结束了，窗口却会一直留着。隐藏模式用 wscript 以窗口样式 0
+        拉起 launcher.bat：全程无窗口，失败会弹消息框，不会静默。
 
-        self._log_ui(f"[界面] 正在启动协议端：{script}\n")
+        UAC 弹窗仍然会有：注入 DLL 必须是管理员，这是设计使然，不是缺陷。
+        想看完整输出就在设置页取消勾选「隐藏控制台窗口启动」。
+        """
+        visible = not bool(self.v_napcat_hidden.get())
+        self._log_ui(f"[界面] 正在启动协议端（{'可见' if visible else '隐藏'}模式）…\n")
         self.status.set("已请求启动 NapCat —— 请在 UAC 窗口点「是」，再完成扫码登录")
         try:
-            os.startfile(str(script))  # 与手动双击脚本等价
-        except OSError as exc:
-            self._log_ui(f"[界面] 启动协议端失败：{exc}\n")
+            r = napcat_mod.launch(self.cfg, visible=visible)
+        except Exception as exc:  # noqa: BLE001
+            self._log_ui(f"[界面] 启动协议端异常：{exc}\n")
             messagebox.showerror("启动失败", str(exc), parent=self.root)
             return
+        if not r.get("ok"):
+            self._log_ui(f"[界面] 启动协议端失败：{r.get('error')}\n")
+            messagebox.showerror("启动失败", str(r.get("error") or "未知错误"), parent=self.root)
+            return
+        self._log_ui(f"[界面] {r.get('note') or ''}\n")
+        self._log_ui(f"[界面] 启动记录：{r.get('log')}（界面「协议端日志」按钮可查看）\n")
         self._log_ui(
             "[界面] NapCat 要先注入 QQ 再登录，通常需要 10~30 秒。\n"
             "[界面] 连上后上方「协议端(NapCat)」会自己变成「已连接」，无需重启服务。\n"
@@ -619,6 +953,56 @@ class App:
         if self.napcat_dir():
             self.qr_watching = True
             threading.Thread(target=self._watch_qrcode, daemon=True).start()
+
+    def show_napcat_log(self) -> None:
+        """协议端日志窗口：我们的启动记录（含预检）+ NapCat 自己的日志尾部。"""
+        text = napcat_mod.log_tail(self.cfg)
+        win = self.napcat_log_win
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    body = getattr(win, "body", None)
+                    if body is not None:
+                        body.configure(state="normal")
+                        body.delete("1.0", "end")
+                        body.insert("1.0", text)
+                        body.configure(state="disabled")
+                    win.lift()
+                    return
+            except Exception:  # noqa: BLE001  窗口可能已被销毁
+                pass
+
+        win = tk.Toplevel(self.root)
+        win.title("协议端日志")
+        win.geometry("940x560")
+        body = ScrolledText(
+            win,
+            wrap="word",
+            state="disabled",
+            font=("Consolas", 9),
+            background=LOG_BG,
+            foreground=LOG_FG,
+            insertbackground=LOG_FG,
+            padx=10,
+            pady=8,
+            relief="flat",
+        )
+        body.pack(fill="both", expand=True, padx=10, pady=(10, 6))
+        body.configure(state="normal")
+        body.insert("1.0", text)
+        body.configure(state="disabled")
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Label(
+            bar, text=f"启动记录：{napcat_mod.log_path(self.cfg)}", style="Hint.TLabel"
+        ).pack(side="left")
+        ttk.Button(
+            bar,
+            text="打开记录目录",
+            command=lambda: open_path(napcat_mod.log_path(self.cfg).parent),
+        ).pack(side="right")
+        win.body = body  # type: ignore[attr-defined]
+        self.napcat_log_win = win
 
     # ---------------- 登录二维码 ----------------
 
@@ -699,9 +1083,28 @@ class App:
         elif self.proc is None:
             self.v_peer.set("—")
             self.v_stored.set("—")
+            self.v_vision.set("—")
             self.v_cost.set("—")
+            self.v_total.set("—")
+            self.v_balance.set("—")
             self.v_llm.set("—")
         self.root.after(2000, self._tick_health)
+
+    def _tick_realtime(self) -> None:
+        """实时消息页的节拍器。
+
+        只在「实时消息」页处于前台且勾了自动刷新时才拉数据 —— 后台页没必要
+        每 3 秒打一次接口（用户看不见，纯浪费）。
+        """
+        try:
+            visible = self.nb.index(self.nb.select()) == 1
+        except Exception:  # noqa: BLE001  窗口销毁过程中可能取不到
+            visible = False
+        if visible and self.v_rt_auto.get() and self.proc is not None and not self._rt_busy:
+            self._rt_busy = True
+            self._rt_limit = self._read_rt_limit()
+            threading.Thread(target=self._fetch_messages, args=(self._rt_limit,), daemon=True).start()
+        self.root.after(3000, self._tick_realtime)
 
     def _fetch_health(self) -> None:
         port = int(self.cfg["onebot"]["http_port"])
@@ -732,6 +1135,11 @@ class App:
                 self.status.set(value)
             elif kind == "health":
                 self._apply_health(value)
+            elif kind == "billing":
+                self._apply_billing(value)
+                self.status.set("账单已刷新")
+            elif kind == "messages":
+                self._render_messages(value)
             elif kind == "qrcode":
                 self._show_qrcode(value)
             elif kind == "exit":
@@ -761,7 +1169,7 @@ class App:
             self.v_peer.set(f"已连接 · {', '.join(peers)}")
             self.qr_watching = False  # 已连上，没必要再盯着二维码
             self._close_qrcode()
-        elif self.napcat_script():
+        elif self.napcat_script() or self.napcat_dir():
             self.v_peer.set("未连接 —— 请点「启动协议端(NapCat)」")
         else:
             self.v_peer.set("未连接（NapCat 未启动）")
@@ -773,9 +1181,25 @@ class App:
             f"（本次运行新收 {c.get('received', 0)}，"
             f"其中已过滤 {c.get('filtered', 0)}）"
         )
-        cost = data.get("spent_today_cny", 0)
-        budget = data.get("budget_cny", 0)
-        self.v_cost.set(f"¥{cost:.4f} / ¥{budget:.2f}")
+        n_fail = int(s.get("vision_failed", 0) or 0)
+        n_retry = int(s.get("vision_retry", 0) or 0)
+        if not n_fail:
+            self.v_vision.set("0 张")
+        elif n_retry:
+            self.v_vision.set(f"{n_fail} 张（{n_retry} 张会自动补跑，最多 3 次）")
+        else:
+            self.v_vision.set(f"{n_fail} 张（已试满 3 次，不再重试）")
+
+        # 账单：优先用服务抓到的真实数据；没抓到就退回本地估算，并标明是估算。
+        budget = float(data.get("budget_cny") or 0)
+        b = data.get("billing") or {}
+        est_today = float(data.get("spent_today_cny") or 0)
+        if not b:
+            self.v_cost.set(f"¥{est_today:.4f}（估算）/ 预算 ¥{budget:.2f}")
+            self.v_total.set(f"¥{est_today:.4f}（估算）")
+            self.v_balance.set("（服务启动后自动抓取）")
+        else:
+            self._apply_billing(b)
 
         if not data.get("llm_available"):
             self.v_llm.set("未配置 API Key（仅规则模式，不生成摘要）")
@@ -797,6 +1221,7 @@ class App:
 
     def on_close(self) -> None:
         self.qr_watching = False  # 先停掉二维码监视线程，再关界面
+        self.v_rt_auto.set(False)  # 停掉实时消息轮询
         if self.proc is None:
             self.root.destroy()
             return
@@ -815,6 +1240,17 @@ class App:
     def _force_close_hint(self) -> None:
         if self.proc is not None and self.closing:
             self.status.set("服务仍在退出中…若长时间无响应，可在任务管理器结束 python.exe")
+
+
+def open_url(url: str) -> None:
+    """用系统默认浏览器打开链接。失败就静默 —— 不该因为打不开网页而打断任何操作。"""
+    try:
+        if os.name == "nt":
+            os.startfile(url)  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", url])
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def open_path(path: Path) -> None:

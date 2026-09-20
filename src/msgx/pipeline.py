@@ -5,10 +5,11 @@ import contextlib
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import date, datetime
 
 from aiohttp import WSCloseCode
 
+from . import billing
 from .config import api_key, load
 from .llm import BudgetExceeded, LLM
 from .media import MediaWorker
@@ -35,6 +36,10 @@ class Pipeline:
         self.scorer = Scorer(self.cfg, self.store, self.llm)
         self.summarizer = Summarizer(self.cfg, self.store, self.llm, self.notifier)
 
+        # 老库的历史金额回填（幂等、一次性）。放在这里而不是 start()：`msgx stats`
+        # 这类只读命令不会调 start()，但同样要显示「累计花费」，所以两条路都得走到。
+        self.llm.backfill_legacy_cost()
+
         self.watch = {str(g) for g in self.cfg["watch"].get("groups", [])}
         self.names = {str(k): str(v) for k, v in (self.cfg["watch"].get("names") or {}).items()}
         self.at_ids = {str(x) for x in (self.cfg["watch"].get("at_qq") or [])}
@@ -58,6 +63,11 @@ class Pipeline:
         self._peer_watch: asyncio.Task | None = None
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
+        # 账单快照缓存。界面每 2 秒轮询 /health，绝不能每次都打网络（1 次余额 + N 次
+        # 逐月消费）。所以：/health 只读缓存，真正的抓取由 _billing_loop 与 /billing 触发。
+        self._billing_ts = 0.0
+        self._billing_data: dict = {}
+        self._billing_lock: asyncio.Lock | None = None
         self.started_at = time.time()
         self.counters = {
             "received": 0,
@@ -94,12 +104,21 @@ class Pipeline:
             asyncio.create_task(self._summary_loop(), name="summary"),
             asyncio.create_task(self._daily_loop(), name="daily"),
             asyncio.create_task(self._prune_loop(), name="prune"),
+            asyncio.create_task(self._billing_loop(), name="billing"),
         ]
         # v0.4.0 的下载缺陷误伤了一批图片（标记 failed）。启动时重置一次：
         # URL 仍有效即被挽回，已过期则再次 failed，不会死循环。
         n = self.store.requeue_failed_media()
         if n:
             log.info("已把 %d 张上次下载失败的图片重新排入处理队列", n)
+        # v0.5.0 同类问题：图片语义提取曾把「失败」写成「完成」，导致 62 张图
+        # 永久不再重试。现在有独立的 vision_state 能区分了，那些老行会被
+        # `media.retry_vision()` 在空闲轮里自动捡回来（图片还在本地，只是重发一次推理）。
+        # 注意：不要在这里把 vision_state 清空 —— 清空后既不在 pending_media 里、
+        # 也不在 failed_vision 里，会变成谁也看不见的孤儿行。
+        n2 = self.store.stats().get("vision_retry", 0)
+        if n2:
+            log.info("有 %d 张图片的语义提取待补跑（失败过，但次数没用满）", n2)
 
     # ---------- OneBot API（反向 WS 通道） ----------
 
@@ -313,15 +332,29 @@ class Pipeline:
     # ---------- background loops ----------
 
     async def _media_loop(self) -> None:
-        """轮询待处理图片；处理完立刻打分（此时 OCR 结果已就绪）。"""
+        """轮询待处理图片；处理完立刻打分（此时 OCR 结果已就绪）。
+
+        空闲轮里顺带补跑历史失败的图片语义。为什么要放在这里：语义失败是
+        **瞬时连接抖动**造成的（本机到 api.deepseek.com 偶发被撤连接，约 1/8），
+        隔一会儿重发基本就能成 —— 但没人补跑的话，那张图的信息就永久丢了。
+        每 20 个空闲轮（≈60 秒）补一小批，避免一次网络恢复后对模型发起一堆并发。
+        """
+        idle_rounds = 0
         while not self._stop.is_set():
             try:
                 done = await self.media.process_pending(20)
-                if not done:
-                    await asyncio.sleep(3)
+                if done:
+                    idle_rounds = 0
+                    for row_id in done:
+                        await self._score(row_id)
                     continue
-                for row_id in done:
-                    await self._score(row_id)
+                idle_rounds += 1
+                if idle_rounds % 20 == 0:
+                    # 补跑成功的那些必须重新打分：报错截图的语义文本正是打分依据，
+                    # 第一遍提取失败 = 这一条从来没被正确评过。
+                    for row_id in await self.media.retry_vision(4):
+                        await self._score(row_id)
+                await asyncio.sleep(3)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -368,6 +401,154 @@ class Pipeline:
             except Exception as e:  # noqa: BLE001
                 log.warning("清理异常: %s", e)
 
+    # ---------- 账单 ----------
+
+    def _billing_start(self, bc: dict) -> tuple[int, int]:
+        """平台逐日消费的抓取起点（年, 月）。
+
+        平台接口只支持**按月**查，累计值只能靠逐月累加，所以起点越早请求越多。
+        默认取「库里最早有记录的那一天」—— 我们没开始用之前不可能有消费，
+        这样既不会漏也不会白问一堆空月份。
+        """
+        try:
+            y, m = int(bc.get("start_year") or 0), int(bc.get("start_month") or 0)
+            if 2000 < y < 2100 and 1 <= m <= 12:
+                return y, m
+        except (TypeError, ValueError):
+            pass
+        rows = self.store.usage_all()  # ORDER BY day DESC
+        if rows:
+            try:
+                d = date.fromisoformat(str(rows[-1]["day"]))
+                return d.year, d.month
+            except (ValueError, KeyError, IndexError):
+                pass
+        t = date.today()
+        return t.year, t.month
+
+    async def billing_snapshot(self, refresh: bool = False, min_interval: float = 60.0) -> dict:
+        """真实账单快照：官方余额 + 平台逐日消费；两者都拿不到才用本地估算。
+
+        为什么必须区分口径：本地只按 token 用量**估算**，和平台账单对不上是常态
+        （老库还有相当一段时间的行没有金额，见 store.USAGE_MIGRATIONS 的注释）。
+        用户看到的数字必须是「有出处的」：抓到了就标 platform，没抓到就标 estimate
+        并把失败原因带上 —— 不许把估算值伪装成真实值。
+
+        两张凭证互不通用（见 billing.py）：余额用 API Key，消费用平台 token。
+        任何一路失败都不影响另一路。
+        """
+        bc = self.cfg.get("billing") or {}
+        cache_s = float(bc.get("cache_seconds", 600) or 600)
+        now = time.time()
+        age = now - self._billing_ts
+        if self._billing_data and (
+            (refresh and age < min_interval) or (not refresh and age < cache_s)
+        ):
+            return self._billing_data
+
+        if self._billing_lock is None:
+            self._billing_lock = asyncio.Lock()
+        async with self._billing_lock:
+            # 等锁期间可能已被别的协程刷过
+            age = time.time() - self._billing_ts
+            if self._billing_data and age < min_interval:
+                return self._billing_data
+
+            est_total_row = self.store.cost_totals()
+            est_today = float(self.store.daily_cost_cny(date.today().isoformat()))
+            est_total = float(est_total_row.get("cost_cny", 0.0))
+
+            # --- 真实余额（官方接口，用 API Key）---
+            token_key = api_key(self.cfg)
+            timeout = float(bc.get("timeout_seconds", 20) or 20)
+            if token_key:
+                try:
+                    bal = await billing.fetch_balance(token_key, self.cfg["llm"]["base_url"], timeout)
+                except Exception as e:  # noqa: BLE001
+                    bal = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            else:
+                bal = {"ok": False, "error": "未配置 API Key"}
+
+            # --- 真实消费（平台前端接口，用登录态 token）---
+            plat_days: dict[str, float] = {}
+            plat_currency = "CNY"
+            plat_err = ""
+            plat_token = str(bc.get("platform_token") or "").strip()
+            if not bc.get("platform_enabled", True):
+                plat_err = "配置里已关闭平台数据（[billing] platform_enabled = false）"
+            elif not plat_token:
+                plat_err = "未配置 platform_token，只能显示本地估算（取法见 config.toml [billing]）"
+            else:
+                y, m = self._billing_start(bc)
+                try:
+                    r = await billing.fetch_platform_cost(plat_token, y, m, timeout)
+                except Exception as e:  # noqa: BLE001
+                    r = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                if r.get("ok"):
+                    plat_days = r.get("days") or {}
+                    plat_currency = r.get("currency") or "CNY"
+                else:
+                    plat_err = str(r.get("error") or "抓取失败")
+
+            today = date.today().isoformat()
+            if plat_days:
+                source = "platform"
+                today_cny = float(plat_days.get(today, 0.0))
+                total_cny = float(sum(plat_days.values()))
+            else:
+                source = "estimate"
+                today_cny = est_today
+                total_cny = est_total
+
+            data = {
+                "ts": int(time.time()),
+                "source": source,
+                "today_cny": round(today_cny, 4),
+                "total_cny": round(total_cny, 4),
+                "currency": plat_currency,
+                "days": len(plat_days),
+                "platform_error": plat_err,
+                "estimate": {
+                    "today_cny": round(est_today, 4),
+                    "total_cny": round(est_total, 4),
+                    "calls": int(est_total_row.get("calls", 0)),
+                },
+                "balance": {
+                    "ok": bool(bal.get("ok")),
+                    "total": round(float(bal.get("total") or 0), 4),
+                    "currency": bal.get("currency") or "CNY",
+                    "error": str(bal.get("error") or ""),
+                },
+            }
+            if plat_days:
+                data["from_day"] = min(plat_days)
+            self._billing_ts = time.time()
+            self._billing_data = data
+            log.info(
+                "账单快照（%s）：今日 %.4f / 累计 %.4f %s%s",
+                source, data["today_cny"], data["total_cny"], data["currency"],
+                f"（{plat_err}）" if plat_err else "",
+            )
+            return data
+
+    async def _billing_loop(self) -> None:
+        """定期刷新账单快照。界面每 2 秒轮询 /health，抓取动作绝不能挂在它上面。"""
+        try:
+            await asyncio.sleep(20)  # 让启动期的多模态探测先跑完
+        except asyncio.CancelledError:
+            raise
+        while not self._stop.is_set():
+            try:
+                await self.billing_snapshot(refresh=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.debug("账单刷新失败（不影响消息接收）: %s", e)
+            try:
+                await asyncio.sleep(max(60, int(self.cfg["billing"].get("cache_seconds", 600))))
+            except asyncio.CancelledError:
+                raise
+
     # ---------- introspection ----------
 
     def health(self) -> dict:
@@ -378,6 +559,8 @@ class Pipeline:
             "vision_supported": self.llm.vision_supported() if self.llm.available else False,
             "spent_today_cny": round(self.llm.spent_today_cny(), 4),
             "budget_cny": self.cfg["llm"]["max_daily_cost_cny"],
+            # 真实账单快照（可能为空：启动后 20 秒内还没抓第一次）。只读缓存，不打网络。
+            "billing": self._billing_data,
             "watch_groups": sorted(self.watch) or "全部",
             "ws_peers": sorted(self.ws_peers),
             "counters": self.counters,

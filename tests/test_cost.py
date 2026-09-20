@@ -111,6 +111,27 @@ r = old.conn.execute("SELECT * FROM usage WHERE day='2026-09-19'").fetchone()
 check("历史行保留原值（不追溯换算）", r["calls"] == 19 and abs(r["cost_cny"]) < 1e-9)
 old.add_usage("2026-09-20", 1000, 100, 0.001, 0, 1000)
 check("迁移后可正常写入", old.conn.execute("SELECT calls FROM usage WHERE day='2026-09-20'").fetchone()[0] == 1)
+
+# v0.5.0：历史金额回填。「累计花费」现在是显示给用户看的数字，让老库那几天
+# 停在 ¥0 会明显误导（用户原话就是「界面和平台账单对不上」）。
+print("\n=== 历史金额回填（老库那几天不能停在 ¥0）===")
+
+
+def _cost_llm(store_obj):
+    """造一个只用于算钱的 LLM（不联网）。"""
+    return LLM({"llm": dict(CFG["llm"])}, store_obj)
+
+
+n = _cost_llm(old).backfill_legacy_cost()
+check("回填了 1 个历史日期", n == 1, str(n))
+row19 = old.conn.execute("SELECT * FROM usage WHERE day='2026-09-19'").fetchone()
+# 空闲价：9093 未命中输入 + 3769 输出 = 0.009093 + 0.015076 ≈ 0.024169
+check("金额按空闲价算出（下限，不是 0）", abs(row19["cost_cny"] - 0.024169) < 1e-6,
+      f"{row19['cost_cny']:.6f}")
+check("回填是幂等的（再跑一次不动它）", _cost_llm(old).backfill_legacy_cost() == 0)
+check("已补偿的日期不被重复累加",
+      abs(old.conn.execute("SELECT cost_cny FROM usage WHERE day='2026-09-19'").fetchone()[0]
+          - 0.024169) < 1e-6)
 old.close()
 
 print("\n=== 摘要游标分轨（增量纪要的起点）===")

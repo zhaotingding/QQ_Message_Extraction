@@ -13,6 +13,11 @@
 *.bat -text
 *.cmd -text
 
+# 隐藏启动器：由 napcat.py 从源码常量按需重写（纯 ASCII + LF），
+# 必须**字节原样**存取 —— 一旦被规范化成 CRLF，每次启动都会发现「内容不一致」
+# 而重写一遍，白白产生噪音。wscript 读 LF 的 .vbs 没有问题（已实测）。
+*.vbs -text
+
 # 二进制资源
 *.png binary
 *.jpg binary

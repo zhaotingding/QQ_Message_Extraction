@@ -83,6 +83,22 @@ USAGE_MIGRATIONS = (
     ("cache_miss_tokens", "INTEGER DEFAULT 0"),
 )
 
+# v0.5.0：图片语义单独记状态。
+# 旧实现用「vision_text 是否为空」兼任「成功 / 失败」两种含义，失败后这条又被
+# 标成 media_state='done' → 这张图永远不会再被处理（实测丢掉 62 张）。
+# 有了独立状态才能「只重跑失败的语义提取」，不必重新下载和 OCR。
+#   '' = 未尝试或需重试 / 'ok' / 'failed' / 'skipped'（未启用或模型不支持图片）
+#
+# vision_tries 是**补跑次数**：没有它，一张永远读不出来的图会被每一轮补跑
+# 反复送去推理，安静地烧钱。到上限就停在 'failed'，不再重试。
+MESSAGE_MIGRATIONS = (
+    ("vision_state", "TEXT DEFAULT ''"),
+    ("vision_tries", "INTEGER DEFAULT 0"),
+)
+
+# 语义补跑的最大次数（attempts）。三次都失败基本可判定是图本身的问题。
+VISION_MAX_TRIES = 3
+
 
 class Store:
     def __init__(self, db_path: str | Path):
@@ -97,10 +113,22 @@ class Store:
 
     def _migrate(self) -> None:
         """幂等补齐老库缺失的列。"""
-        cols = {c[1] for c in self.conn.execute("PRAGMA table_info(usage)")}
-        for name, spec in USAGE_MIGRATIONS:
-            if name not in cols:
-                self.conn.execute(f"ALTER TABLE usage ADD COLUMN {name} {spec}")
+        for table, migs in (("usage", USAGE_MIGRATIONS), ("messages", MESSAGE_MIGRATIONS)):
+            cols = {c[1] for c in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, spec in migs:
+                if name not in cols:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
+
+        # 老库里已经处理完的图没有 vision_state。按「有没有语义文本」回填一次，
+        # 否则它们会被当成「未尝试」而被无意义地全量重跑。
+        self.conn.execute(
+            "UPDATE messages SET vision_state='ok'"
+            " WHERE vision_state='' AND media_state='done' AND vision_text<>''"
+        )
+        self.conn.execute(
+            "UPDATE messages SET vision_state='failed'"
+            " WHERE vision_state='' AND media_state='done' AND vision_text='' AND media_path<>''"
+        )
 
     def close(self) -> None:
         self.conn.close()
@@ -160,12 +188,25 @@ class Store:
         media_path: str = "",
         media_hash: str = "",
         state: str = "done",
+        vision_state: str | None = None,
     ) -> None:
-        self.conn.execute(
-            "UPDATE messages SET ocr_text=?, vision_text=?, media_path=?, media_hash=?, media_state=?"
-            " WHERE id=?",
-            (ocr_text, vision_text, media_path, media_hash, state, row_id),
-        )
+        """写入媒体处理结果。
+
+        ``vision_state=None``（默认）表示**不动**该列 —— 只更新 OCR 的场景不该
+        顺手把语义状态抹掉；要改就显式传 'ok' / 'failed' / 'skipped'。
+        """
+        if vision_state is None:
+            self.conn.execute(
+                "UPDATE messages SET ocr_text=?, vision_text=?, media_path=?, media_hash=?,"
+                " media_state=? WHERE id=?",
+                (ocr_text, vision_text, media_path, media_hash, state, row_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE messages SET ocr_text=?, vision_text=?, media_path=?, media_hash=?,"
+                " media_state=?, vision_state=? WHERE id=?",
+                (ocr_text, vision_text, media_path, media_hash, state, vision_state, row_id),
+            )
         self.conn.commit()
 
     def get_message(self, row_id: int):
@@ -198,6 +239,44 @@ class Store:
         )
         self.conn.commit()
         return cur.rowcount
+
+    def failed_vision(self, limit: int = 200, max_tries: int = VISION_MAX_TRIES) -> list:
+        """语义提取失败的图片（图片本身已落盘，只需重跑推理，不必重新下载）。
+
+        ``max_tries`` 之外的会被排除：那些已经试满次数，再跑只是白花钱。
+        """
+        return list(
+            self.conn.execute(
+                "SELECT * FROM messages WHERE vision_state='failed' AND media_path<>''"
+                " AND COALESCE(vision_tries,0) < ?"
+                " ORDER BY ts DESC LIMIT ?",
+                (int(max_tries), limit),
+            )
+        )
+
+    def bump_vision_tries(self, row_id: int) -> int:
+        """记一次语义尝试，返回累计次数。"""
+        self.conn.execute(
+            "UPDATE messages SET vision_tries=COALESCE(vision_tries,0)+1 WHERE id=?", (row_id,)
+        )
+        self.conn.commit()
+        row = self.conn.execute("SELECT vision_tries FROM messages WHERE id=?", (row_id,)).fetchone()
+        return int(row[0]) if row else 0
+
+    # ---------- 给界面「实时消息」页 ----------
+
+    def recent_messages(self, limit: int = 60) -> list:
+        """最近入库的消息（倒序）。带群名与图片处理状态，供界面直接展示。"""
+        return list(
+            self.conn.execute(
+                "SELECT m.id, m.group_id, m.sender_name, m.ts, m.text, m.msg_type,"
+                " m.media_state, m.vision_state, m.ocr_text, m.vision_text, m.at_me,"
+                " COALESCE(g.name, '') AS group_name"
+                " FROM messages m LEFT JOIN groups g ON g.id = m.group_id"
+                " ORDER BY m.ts DESC, m.id DESC LIMIT ?",
+                (limit,),
+            )
+        )
 
     def messages_between(self, group_id: str, start: int, end: int) -> list:
         return list(
@@ -327,6 +406,28 @@ class Store:
         row = self.conn.execute("SELECT cost_cny FROM usage WHERE day=?", (day,)).fetchone()
         return float(row["cost_cny"]) if row else 0.0
 
+    def set_usage_cost(self, day: str, cost_cny: float) -> None:
+        """改写某一天的金额。
+
+        只有「老库历史金额回填」会用（见 ``LLM.backfill_legacy_cost``）——
+        线上计费靠 ``add_usage`` 累加，不要用这个方法改当天的数。
+        """
+        self.conn.execute("UPDATE usage SET cost_cny=? WHERE day=?", (float(cost_cny), day))
+        self.conn.commit()
+
+    def cost_totals(self) -> dict:
+        """历史累计（本地估算口径）。"""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(cost_cny),0) AS c, COALESCE(SUM(calls),0) AS n,"
+            " COALESCE(SUM(in_tokens),0) AS i, COALESCE(SUM(out_tokens),0) AS o FROM usage"
+        ).fetchone()
+        return {
+            "cost_cny": float(row["c"]),
+            "calls": int(row["n"]),
+            "in_tokens": int(row["i"]),
+            "out_tokens": int(row["o"]),
+        }
+
     def usage_all(self) -> list:
         return list(self.conn.execute("SELECT * FROM usage ORDER BY day DESC"))
 
@@ -357,4 +458,12 @@ class Store:
             "summaries": q("SELECT COUNT(*) FROM summaries"),
             "alerts": q("SELECT COUNT(*) FROM alerts"),
             "alerts_p0": q("SELECT COUNT(*) FROM alerts WHERE level='P0'"),
+            "vision_failed": q(
+                "SELECT COUNT(*) FROM messages WHERE vision_state='failed' AND media_path<>''"
+            ),
+            # 还会被补跑的（次数没用满）—— 界面显示「还能自愈多少张」
+            "vision_retry": q(
+                f"SELECT COUNT(*) FROM messages WHERE vision_state='failed'"
+                f" AND media_path<>'' AND COALESCE(vision_tries,0) < {int(VISION_MAX_TRIES)}"
+            ),
         }

@@ -50,6 +50,12 @@ peak_multiplier               = 2.0    # 高峰 = 空闲 × 2
 peak_windows_utc              = "01:00-04:00,06:00-10:00"
 timeout_seconds         = 90
 
+# 图片上传前的压缩（v0.5.0）。请求里带的是 detail="low"，服务端本来就会把图
+# 大幅降采样（实测一张 2.8MB 的图进来只计 198 个 prompt token），客户端先缩到
+# 长边 1280 / JPEG q85 可把上传量降到 1/30，图像内容与提取质量无可感知差异。
+vision_max_side         = 1280
+vision_jpeg_quality     = 85
+
 [media]
 ocr_enabled        = true
 vision_enabled     = true     # 需 vision_model 实测支持图片，否则自动关闭
@@ -98,6 +104,40 @@ start_script = "tools/start_napcat.bat"
 # NapCat 需要登录时会把码写到 <dir>\cache\qrcode.png 就不管了，用户原本得
 # 自己去文件管理器里翻。留空 = 不自动弹（仍可自己去找那个文件扫）。
 dir = "D:\\App\\NapCat"
+
+# 隐藏控制台窗口启动（v0.5.0 默认 true）。
+# 为什么：NapCat 必须提权（往 QQ 进程注入 DLL），但提权之后的那个 cmd 窗口
+# **是可以不存在的**。老做法 os.startfile(批处理) 会留下一个永久挂着的黑框
+# （脚本末尾的 pause），既占任务栏又没信息量。
+#   true  = 经 wscript 隐藏启动；UAC 弹窗仍需点「是」；失败会弹消息框
+#   false = 回到老行为（可见控制台 + 完整输出），排障时用
+hidden = true
+
+# 界面「协议端日志」要展示的启动记录（含启动前预检结果）。相对项目根。
+log_file = "data/logs/napcat.log"
+
+# QQ.exe 路径。留空 = 从注册表 UninstallString 自动推导（推荐）。
+# 只有在注册表读不到 QQ 安装记录时才需要手填。
+qq_path = ""
+
+# ---- 真实账单数据源（v0.5.0）----
+# 「今日花费 / 累计花费」原来只按**本地 token 用量**估算，界面值和 DeepSeek
+# 平台的账单对不上。现在改成优先抓平台真实数据；抓不到才回退本地估算，
+# 并在界面上标明是哪一种口径。
+#
+# 注意：**余额和消费是两套凭证**，不能互换。
+#   * 余额  → 用 [llm] 里的 api_key 打官方 GET /user/balance（始终可用）
+#   * 消费  → 用下面的 platform_token 打平台前端接口（需手动复制一次，会过期）
+# platform_token 的取法：浏览器登录 platform.deepseek.com → F12 → Application
+# → Local Storage → 找 userToken，把值整段粘到这里（形如 sk-... 之外的一串 JWT）。
+# 留空 = 只看本地估算，界面会标注「估算」。
+[billing]
+platform_token   = ""
+platform_enabled = true
+cache_seconds    = 600    # 快照缓存（秒）。界面轮询不会每次都打网络。
+start_year       = 0      # 0 = 用库里最早有记录的那一天作为起点
+start_month      = 0
+timeout_seconds  = 20
 
 [retention]
 keep_days_raw   = 90

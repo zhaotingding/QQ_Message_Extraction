@@ -40,6 +40,10 @@ DEFAULTS: dict = {
         "peak_multiplier": 2.0,
         "peak_windows_utc": "01:00-04:00,06:00-10:00",
         "timeout_seconds": 90,
+        # 上传前把图片缩到长边不超过这个像素。请求里带的是 detail="low"，
+        # 服务端本来就会大幅降采样，客户端先缩可省 30 倍带宽且看不出差别。
+        "vision_max_side": 1280,
+        "vision_jpeg_quality": 85,
     },
     "media": {
         "ocr_enabled": True,
@@ -67,9 +71,33 @@ DEFAULTS: dict = {
         "webhook_type": "wecom",
     },
     # 协议端（NapCat）。本服务只监听协议端连入，**不负责启动它**，所以默认都是空的。
-    #   start_script —— 填上后界面出现「启动协议端(NapCat)」按钮
-    #   dir          —— NapCat 安装目录，用于自动弹出登录二维码（<dir>\cache\qrcode.png）
-    "napcat": {"start_script": "", "dir": ""},
+    #   start_script —— 填上后界面出现「启动协议端(NapCat)」按钮（可见排障模式用）
+    #   dir          —— NapCat 安装目录。隐藏启动靠它定位；登录二维码也从这里找
+    #                   （<dir>\cache\qrcode.png）；NapCat 自身日志在 <dir>\logs\
+    #   hidden       —— true = 隐藏控制台窗口启动（默认）。false / 界面勾「可见模式」时
+    #                   回到 os.startfile(批处理) 的老行为，能看到完整输出
+    #   log_file     —— 界面「协议端日志」展示的启动记录（相对项目根）
+    #   qq_path      —— QQ.exe 路径。留空 = 从注册表 UninstallString 自动推导
+    "napcat": {
+        "start_script": "",
+        "dir": "",
+        "hidden": True,
+        "log_file": "data/logs/napcat.log",
+        "qq_path": "",
+    },
+    # 真实账单数据源。余额和消费用的是**两套凭证**（见 billing.py）：
+    #   [llm] api_key  → 官方 GET /user/balance，查真实余额（始终可用）
+    #   platform_token → 平台前端接口 /api/v0/usage/cost，查逐日真实消费
+    #                    取自浏览器登录 platform.deepseek.com 后的 localStorage.userToken
+    # 拿不到 platform_token 时只显示本地估算，界面会明确标注数据来源。
+    "billing": {
+        "platform_token": "",
+        "platform_enabled": True,
+        "cache_seconds": 600,   # 快照缓存时长，避免界面每次轮询都打网络
+        "start_year": 0,        # 0 = 用库里最早有记录的那一天作为起点
+        "start_month": 0,
+        "timeout_seconds": 20,
+    },
     # 消息类型过滤。默认全部为 false —— 过滤是界面（0.2.0）引入的能力，
     # 默认值必须保持「与 0.1.0 行为完全一致」：什么都不丢。
     "filters": {

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -106,6 +107,48 @@ def main() -> int:
     check("health 含 filtered 计数", "filtered" in (health.get("counters") or {}))
     check("health 的 groups 计数正确（新库应为 0）", health.get("stats", {}).get("groups") == 0,
           str(health.get("stats")))
+
+    print("\n=== v0.5.0 界面新增接口契约 ===")
+    op0 = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def call(path: str, post: bool = False, timeout: float = 15.0) -> tuple[int, dict]:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{http_port}{path}", data=b"" if post else None,
+            method="POST" if post else "GET",
+        )
+        try:
+            with op0.open(req, timeout=timeout) as r:
+                return r.status, json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:  # 4xx 也要能读到 body，否则测不出错误码
+            try:
+                return e.code, json.loads(e.read().decode("utf-8") or "{}")
+            except Exception:  # noqa: BLE001
+                return e.code, {}
+        except Exception as exc:  # noqa: BLE001
+            return 0, {"error": str(exc)}
+
+    st, body = call("/messages/recent?limit=5")
+    check("/messages/recent 可达（实时消息页的数据源）",
+          st == 200 and body.get("ok") is True, f"{st} {str(body)[:90]}")
+    check("/messages/recent 返回 items 列表", isinstance(body.get("items"), list),
+          str(body.get("items")))
+    check("/health 带 billing 字段（界面据此显示真实账单）", "billing" in health,
+          str(sorted(health))[:120])
+
+    st, body = call("/billing")
+    check("/billing 可达且返回 source 口径", st == 200 and body.get("source") in ("platform", "estimate"),
+          f"{st} source={body.get('source')}")
+    # 没配 api_key / platform_token 时必须**如实说明**，而不是假装有数据
+    check("/billing 说明为什么是估算", bool(body.get("platform_error")),
+          str(body.get("platform_error"))[:80])
+
+    st, body = call("/summary/now?kind=range&hours=abc", post=True)
+    check("hours 非法时返回 400（不静默套默认值）", st == 400, f"{st} {str(body)[:80]}")
+    st, body = call("/summary/now?kind=range&hours=0", post=True)
+    check("hours=0 返回 400", st == 400, str(st))
+    st, body = call("/summary/now?kind=range&hours=72", post=True)
+    check("hours 合法时正常受理（未配模型 → created 为空）",
+          st == 200 and isinstance(body.get("created"), list), f"{st} {str(body)[:90]}")
 
     print("\n=== WebSocket 端点契约 ===")
     try:

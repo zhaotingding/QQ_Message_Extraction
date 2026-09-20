@@ -108,15 +108,23 @@ async def cmd_run(cfg: dict, stop_file: str | None = None) -> None:
             log.warning("管道收尾超时（15s），继续退出")
 
 
-async def cmd_summary(cfg: dict, kind: str) -> None:
+async def cmd_summary(cfg: dict, kind: str, hours: int = 24) -> None:
     pipe = Pipeline(cfg)
     try:
         if kind == "daily":
             path = await pipe.summarizer.run_daily()
             print(f"日报已生成: {path}" if path else "没有可汇总的内容")
         elif kind == "full":
-            item = await pipe.summarizer.run_digest(full=True)
-            print(f"全量纪要已生成: {item['path']}" if item else "没有可总结的消息")
+            # full = 按时间范围重做。目标字数由窗口长度决定（见 summarize.DIGEST_RANGES）
+            item = await pipe.summarizer.run_digest(full=True, hours=hours)
+            label = f"近 {hours} 小时" if hours < 24 else f"近 {hours // 24} 天"
+            if item:
+                print(
+                    f"{label}纪要已生成: {item['path']}"
+                    f"（{item['count']} 条消息 / {item['chars']} 字 / 目标 {item['target_chars']} 字）"
+                )
+            else:
+                print(f"{label}内没有可总结的消息")
         elif kind == "digest":
             item = await pipe.summarizer.run_digest()
             print(f"群消息纪要已生成: {item['path']}" if item else "自上次纪要以来没有新消息")
@@ -160,7 +168,25 @@ async def cmd_vision(cfg: dict, force: bool) -> None:
 async def cmd_stats(cfg: dict) -> None:
     pipe = Pipeline(cfg)
     try:
+        # 先主动抓一次账单：命令行走不到后台刷新循环，不抓的话 health 里的
+        # billing 永远是空的，用户会以为这功能没生效。
+        snap = await pipe.billing_snapshot(refresh=True)
         print(json.dumps(pipe.health(), ensure_ascii=False, indent=2))
+
+        src = "平台真实值" if snap.get("source") == "platform" else "本地估算"
+        print(
+            f"\n花费（{src}）：今日 ¥{float(snap.get('today_cny') or 0):.4f} · "
+            f"累计 ¥{float(snap.get('total_cny') or 0):.4f}"
+            + (f"（自 {snap['from_day']}）" if snap.get("from_day") else "")
+        )
+        if snap.get("platform_error"):
+            print(f"  平台数据不可用的原因：{snap['platform_error']}")
+        bal = snap.get("balance") or {}
+        if bal.get("ok"):
+            print(f"  账户余额：¥{float(bal.get('total') or 0):.4f} {bal.get('currency') or ''}")
+        else:
+            print(f"  账户余额：读取失败（{bal.get('error') or '不可用'}）")
+
         print("\n用量明细：")
         for r in pipe.store.usage_all()[:14]:
             print(
@@ -199,7 +225,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("gui", help="打开图形界面（配置 + 启停 + 实时日志）")
 
     p_sum = sub.add_parser("summary", help="立即生成摘要")
-    p_sum.add_argument("--kind", choices=["digest", "full", "periodic", "daily"], default="digest")
+    p_sum.add_argument(
+        "--kind", choices=["digest", "full", "periodic", "daily"], default="digest",
+        help="digest=增量纪要（默认）；full=按 --hours 范围重做；periodic/daily=按群摘要/日报",
+    )
+    p_sum.add_argument(
+        "--hours", type=int, default=24,
+        help="仅 kind=full 时生效：回看多少小时（24/72/168/720 分别对应界面上的 1 天~1 个月）",
+    )
 
     p_inj = sub.add_parser("inject", help="直接向管道注入 OneBot 事件（调试用）")
     p_inj.add_argument("json", help="事件 JSON 字符串")
@@ -223,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
 
     coro = {
         "run": lambda: cmd_run(cfg, args.stop_file),
-        "summary": lambda: cmd_summary(cfg, args.kind),
+        "summary": lambda: cmd_summary(cfg, args.kind, args.hours),
         "inject": lambda: cmd_inject(cfg, args.json),
         "vision": lambda: cmd_vision(cfg, args.force),
         "stats": lambda: cmd_stats(cfg),

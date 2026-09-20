@@ -33,6 +33,12 @@ DEFAULTS: dict = {
     },
     # 仅供参考展示，不入库
     "ui": {"last_tab": 0},
+    # 协议端启动方式：true = 隐藏控制台窗口（默认，用户明确不要任务栏里堆黑框）。
+    # 它是界面上的勾选框，所以必须走偏好；界面不改写 config.toml。
+    "napcat_hidden": True,
+    # DeepSeek 平台登录态 token（查真实消费用）。**留空 = 沿用 config.toml**。
+    # 说明：它是短期凭证，存在本地偏好文件里（.ui/ 不入版本库），不会进 Git。
+    "platform_token": "",
 }
 
 # 已知的消息占位符（models.py 生成的）。过滤判定要基于「去掉占位符后的实际文本」，
@@ -76,6 +82,23 @@ def _merge(base: dict, override: dict) -> dict:
         else:
             out[k] = v
     return out
+
+
+def load_raw(path: Path | str | None = None) -> dict:
+    """只读文件里**真实写了**的内容，不做默认值填充。
+
+    用途：区分「用户从没设置过」和「用户就是选了默认值」。界面靠它决定某个
+    开关要不要回退到 config.toml 里的团队默认值 —— 填了默认值的 `load()`
+    会把两种情形抹平成一样的，那样 config.toml 里的默认值就永远不生效。
+    """
+    p = Path(path) if path else None
+    if p is None or not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def load_from_env() -> dict | None:
@@ -125,6 +148,15 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
         out["filters"]["min_text_length"] = max(0, int(filters.get("min_text_length") or 0))
     except (TypeError, ValueError):
         out["filters"]["min_text_length"] = 0
+
+    # 协议端隐藏启动：勾选框是「明确表达」，所以 true/false 都写下去。
+    if "napcat_hidden" in prefs:
+        out.setdefault("napcat", {})["hidden"] = bool(prefs.get("napcat_hidden"))
+
+    # 平台 token：留空 = 沿用 config.toml（和关键词同一套「留空即沿用」语义）
+    token = str(prefs.get("platform_token") or "").strip()
+    if token:
+        out.setdefault("billing", {})["platform_token"] = token
 
     return out
 
