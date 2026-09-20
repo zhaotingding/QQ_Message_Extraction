@@ -167,6 +167,19 @@ class Store:
             )
         )
 
+    def requeue_failed_media(self) -> int:
+        """把上次运行中失败的图片重新置回待处理队列，返回重置条数。
+
+        v0.4.0 的下载缺陷（只读第一个 chunk 就判「不完整」）留下一批被误判
+        failed 的图片。服务启动时重置一次：URL 仍有效即被挽回；已过期会再次
+        failed，但只在本策略下每次启动重试一次，不会死循环刷 URL。
+        """
+        cur = self.conn.execute(
+            "UPDATE messages SET media_state='pending' WHERE media_state='failed' AND has_media=1"
+        )
+        self.conn.commit()
+        return cur.rowcount
+
     def messages_between(self, group_id: str, start: int, end: int) -> list:
         return list(
             self.conn.execute(

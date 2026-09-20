@@ -378,6 +378,20 @@ class App:
     # ---------------- 群列表 ----------------
 
     def refresh_groups(self) -> None:
+        # 先让服务经协议端调 get_group_list 拉真实群名（NapCat 就在线上，
+        # 没理由显示「(未命名)」）；服务没跑或协议端不在线时退回本地库。
+        fetched = False
+        if self.proc is not None:
+            try:
+                port = int(self.cfg["onebot"]["http_port"])
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/groups/refresh", data=b"", method="POST"
+                )
+                op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with op.open(req, timeout=15) as r:
+                    fetched = bool(json.loads(r.read().decode("utf-8")).get("ok"))
+            except Exception:  # noqa: BLE001
+                fetched = False
         saved = set(self.prefs.get("groups") or [])
         self._group_ids = []
         self.lst_groups.delete(0, "end")
@@ -399,7 +413,10 @@ class App:
         for i, gid in enumerate(self._group_ids):
             if gid in saved:
                 self.lst_groups.selection_set(i)
-        self.status.set(f"群列表已刷新，共 {len(self._group_ids)} 个群")
+        msg = f"群列表已刷新，共 {len(self._group_ids)} 个群"
+        if not fetched:
+            msg += "（未能连到协议端，群名来自本地库；启动服务与协议端后可拉到真实群名）"
+        self.status.set(msg)
 
     # ---------------- 服务进程 ----------------
 
@@ -476,14 +493,22 @@ class App:
 
         def work() -> None:
             try:
+                # kind=full：全量情报总结（最近 24h 全部消息交给模型归纳），
+                # 不受各群增量窗口与条数门槛限制 —— 旧的 periodic 路径曾出现
+                # 「明明收了几十条，点按钮却回 0 份」的死状态。
                 req = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/summary/now?kind=periodic", data=b"", method="POST"
+                    f"http://127.0.0.1:{port}/summary/now?kind=full", data=b"", method="POST"
                 )
                 op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                with op.open(req, timeout=120) as r:
+                with op.open(req, timeout=300) as r:
                     body = json.loads(r.read().decode("utf-8"))
                 n = len(body.get("created") or [])
-                self.events.put(("note", f"摘要请求完成，生成 {n} 份。详见 data/reports/"))
+                if n:
+                    self.events.put(("note", f"情报总结已生成 {n} 份，详见 data/reports/"))
+                else:
+                    self.events.put(
+                        ("note", "没有可总结的消息（最近 24 小时内数据库没有收到任何群消息）")
+                    )
             except Exception as exc:  # noqa: BLE001
                 self.events.put(("note", f"摘要请求失败：{exc}"))
 

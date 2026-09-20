@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import time
 from datetime import datetime
@@ -50,6 +51,11 @@ class Pipeline:
         # 日志里表现为等 15s 没收到 PONG 才报 WS 错误）。界面「停止服务」会一直
         # 停在「正在退出中…」。
         self.ws_conns: set = set()
+        # 反向 WS 上的 OneBot API 调用：请求沿连入的那条连接下行，响应带 echo 上行。
+        # 这是未配置 NapCat HTTP API 时调 get_group_list（拿真实群名）的唯一通道。
+        self._action_futs: dict[str, asyncio.Future] = {}
+        self._echo_seq = 0
+        self._peer_watch: asyncio.Task | None = None
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
         self.started_at = time.time()
@@ -89,6 +95,96 @@ class Pipeline:
             asyncio.create_task(self._daily_loop(), name="daily"),
             asyncio.create_task(self._prune_loop(), name="prune"),
         ]
+        # v0.4.0 的下载缺陷误伤了一批图片（标记 failed）。启动时重置一次：
+        # URL 仍有效即被挽回，已过期则再次 failed，不会死循环。
+        n = self.store.requeue_failed_media()
+        if n:
+            log.info("已把 %d 张上次下载失败的图片重新排入处理队列", n)
+
+    # ---------- OneBot API（反向 WS 通道） ----------
+
+    def resolve_action(self, resp: dict) -> None:
+        """WS 接入层收到 API 响应（带 echo、无 post_type）时转交到这里。"""
+        echo = str(resp.get("echo") or "")
+        fut = self._action_futs.pop(echo, None)
+        if fut is not None and not fut.done():
+            fut.set_result(resp)
+
+    async def call_action(self, action: str, params: dict | None = None, timeout: float = 8.0):
+        """通过反向 WS 向协议端（NapCat）发起 OneBot API 调用，返回 data 字段。"""
+        live = [ws for ws in self.ws_conns if not ws.closed]
+        if not live:
+            raise RuntimeError("协议端未连接")
+        self._echo_seq += 1
+        echo = f"msgx-{self._echo_seq}"
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._action_futs[echo] = fut
+        try:
+            await live[0].send_str(json.dumps({"action": action, "params": params or {}, "echo": echo}))
+            resp = await asyncio.wait_for(fut, timeout)
+        finally:
+            self._action_futs.pop(echo, None)
+        if not isinstance(resp, dict) or resp.get("retcode") != 0:
+            raise RuntimeError(f"{action} 调用失败: {resp!r}")
+        return resp.get("data")
+
+    async def refresh_group_names(self, timeout: float = 8.0) -> int:
+        """从协议端拉群列表，把真实群名写进 groups 表，返回群数。
+
+        groups 表的 name 此前只能靠 [watch] names 手填，没人填就永远是
+        「(未命名) 754842541」—— NapCat 就在线上，没理由不去问它。
+        """
+        data = await self.call_action("get_group_list", {}, timeout)
+        n = 0
+        for g in data or []:
+            gid = str((g or {}).get("group_id") or "")
+            if gid:
+                self.store.upsert_group(gid, str((g or {}).get("group_name") or ""))
+                n += 1
+        log.info("已从协议端拉取群列表：%d 个群", n)
+        return n
+
+    # ---------- 协议端连上 / 断开 ----------
+
+    def on_peer_connected(self) -> None:
+        t = self._peer_watch
+        if t is not None and not t.done():
+            t.cancel()
+        asyncio.create_task(self._auto_refresh_names())
+
+    async def _auto_refresh_names(self) -> None:
+        try:
+            await asyncio.sleep(2)  # 等 NapCat 完成初始化
+            await self.refresh_group_names()
+        except Exception as e:  # noqa: BLE001
+            log.debug("自动拉取群列表失败（不影响消息接收）: %s", e)
+
+    def on_peer_disconnected(self) -> None:
+        """最后一条协议端连接断开：60s 内没重连就 P0 告警。
+
+        实测案例：07:28 协议端断开后 6.6 小时无人察觉 —— NapCat 的 5s 自动重连
+        只在它自己活着时有效，QQ 会话掉线 / 进程退出后就永远不会再连，而服务侧
+        毫无异常，唯一征兆就是 ws_peers 变空。等 60s 是为了过滤「5 秒重连」的
+        正常抖动，不制造噪音。
+        """
+        if self._stop.is_set() or self.ws_peers:
+            return
+
+        async def _watch() -> None:
+            await asyncio.sleep(60)
+            if self._stop.is_set() or self.ws_peers:
+                return
+            log.warning("协议端已断开超过 60s 且未重连 —— 消息不再入库")
+            with contextlib.suppress(Exception):
+                await self.notifier.notify(
+                    "协议端已断开",
+                    "NapCat 超过 60 秒未重连，消息已停止入库。\n"
+                    "请在界面点「启动协议端(NapCat)」重新拉起。",
+                    level="P0",
+                    play_sound=True,
+                )
+
+        self._peer_watch = asyncio.create_task(_watch())
 
     async def close_ws_conns(self) -> int:
         """主动关闭所有反向 WS 连接，返回关闭条数。
@@ -109,6 +205,8 @@ class Pipeline:
 
     async def stop(self) -> None:
         self._stop.set()
+        if self._peer_watch is not None and not self._peer_watch.done():
+            self._peer_watch.cancel()
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)

@@ -11,20 +11,47 @@ from . import hotspot
 
 log = logging.getLogger("msgx.summarize")
 
-DIGEST_SYSTEM = """你在为一位科研 + 工程双线作战的用户做群聊信息萃取。
-把下面这段群聊记录压缩成结构化摘要。
+DIGEST_SYSTEM = """你在为一位科研 + 工程双线作战的用户做群聊情报总结。他的核心诉求：不错过业界最新动态。
+下面是某个群一段时间内的完整聊天记录。你的任务不是「把消息压短」，而是**总结关键信息**。
 
 要求：
-1. 按「话题」分组，把同一话题下的多条消息合并。寒暄、表情包、签到、接龙、纯情绪输出一律丢弃。
-2. 每个话题下写 1-4 条要点，只保留有信息量的内容：技术结论、方法、数据、版本号、报错原因、资源名。
-3. 凡是出现链接、命令、参数、仓库名、论文名、数据集名、联系方式，必须原样保留，不要改写或缩写 URL。
-4. 如果整段记录都没有值得保留的信息，只输出一行：本段无有效信息
-5. 直接输出 Markdown，不要任何开场白、客套话或总结性评价。
+1. 通读全部记录，识别真正有信息量的内容：技术结论、业界动态、版本发布、方法经验、
+   踩坑原因、资源（仓库 / 论文 / 工具 / 数据集）。
+2. 按「话题」组织。同一话题下多个人的发言必须**归纳成一条结论**，不要罗列「某用户说某句」。
+   每个话题给出：发生了什么 / 结论是什么；必要时补一句为什么值得注意（影响、适用场景）。
+3. 寒暄、表情包、签到、接龙、纯情绪输出一律丢弃。
+4. 凡是出现链接、命令、参数、仓库名、论文名、数据集名，必须原样保留，不要改写或缩写 URL。
+5. 如果整段记录都没有值得保留的信息，只输出一行：本段无有效信息
+6. 直接输出 Markdown，不要任何开场白、客套话或总结性评价。
 
 输出格式（严格遵守）：
 ### 话题：<不超过 15 字的标题>
+- <结论 / 要点>
 - <要点>
+> 可复用：<链接 / 命令 / 参数；没有则整行省略>
+"""
+
+FULL_SYSTEM = """你在为一位科研 + 工程双线作战的用户编写「群聊情报总结」。他的唯一目标：不错过业界最新动态和值得复用的技术信息。
+下面是多技术群一段时间内的全部聊天记录（带群名、时间与发言人）。
+
+你的任务：像写情报简报一样总结，而不是压缩转述。
+
+要求：
+1. 通读全部记录后，先输出「## 今日重点」：最多 5 条、每条一句话，选最有行业价值 /
+   时效性 / 影响面的信息（新品或版本发布、模型行为变化、大规模故障、平台规则变化等）。
+2. 之后按话题组织正文。同一话题分散在多个群、多个人的发言必须**归纳合并成一条结论**，
+   不要罗列「某某说某某」。
+3. 区分「事实」与「个人观点」：个人经验标注（个人经验），未经证实的消息标注（未经证实）。
+4. 链接、命令、参数、版本号、仓库名、论文名原样保留，URL 不许改写。
+5. 纯闲聊、寒暄、表情包、接龙一律丢弃；内容少就短，不要注水。
+6. 直接输出 Markdown，无开场白、无总结性评价。
+
+输出格式：
+## 今日重点
 - <要点>
+
+### 话题：<不超过 15 字的标题>
+- <结论 / 要点>
 > 可复用：<链接 / 命令 / 参数；没有则整行省略>
 """
 
@@ -79,6 +106,21 @@ def _rows_to_text(rows: list) -> str:
         elif r["vision_text"]:
             body += "  〔图片内容: " + r["vision_text"].replace("\n", " ")[:200] + "〕"
         lines.append(f"[{hhmm}] {r['sender_name']}: {body}")
+    return "\n".join(lines)
+
+
+def _rows_to_text_multi(rows: list, names: dict) -> str:
+    """全量总结用：每行带群名，让模型能做跨群归纳。"""
+    lines = []
+    for r in rows:
+        hhmm = time.strftime("%m-%d %H:%M", time.localtime(r["ts"]))
+        body = (r["text"] or "").replace("\n", " ").strip()
+        if r["ocr_text"]:
+            body += "  〔图中文字: " + r["ocr_text"].replace("\n", " / ")[:600] + "〕"
+        elif r["vision_text"]:
+            body += "  〔图片内容: " + r["vision_text"].replace("\n", " ")[:200] + "〕"
+        gname = names.get(r["group_id"]) or r["group_id"]
+        lines.append(f"[{gname} · {hhmm}] {r['sender_name']}: {body}")
     return "\n".join(lines)
 
 
@@ -267,6 +309,81 @@ class Summarizer:
         sid = self.store.add_summary(group_id, start, now, len(rows), content, "periodic", str(path))
         return {"id": sid, "group_id": group_id, "title": title, "path": str(path), "count": len(rows)}
 
+    async def run_full(self, hours: int = 24) -> dict | None:
+        """手动「立即生成摘要」入口：把最近一段时间**全部消息**交给模型做情报总结。
+
+        与周期摘要（增量窗口、每组不足 min_messages 条就跳过）刻意不同：
+        用户主动点击意味着「把手上已有的东西总结给我」，不受窗口推进与条数门槛
+        限制 —— 否则会出现「明明收了几十条，点按钮却回 0 份」的死状态。
+        """
+        if not self.llm.available:
+            log.warning("LLM 未配置，跳过全量总结")
+            return None
+        now = int(time.time())
+        start = now - hours * 3600
+        rows = self.store.messages_between_all(start, now)
+        if not rows:
+            first = self.store.first_ts_all()
+            if not first:
+                return None
+            start = first - 1  # 开区间下界，同第 10 条坑
+            rows = self.store.messages_between_all(start, now)
+        if not rows:
+            return None
+
+        names = self.store.group_names()
+        budget = int(self.scfg.get("chunk_char_budget", 6000))
+        chunks = _chunk(rows, budget)
+        parts: list[str] = []
+        for i, ch in enumerate(chunks, 1):
+            body = _rows_to_text_multi(ch, names)
+            head = f"（这是第 {i}/{len(chunks)} 段，先提炼关键信息点，之后会统一汇总。）\n\n"
+            try:
+                part = await self.llm.chat(
+                    FULL_SYSTEM, head + body, max_tokens=2000, temperature=0.2, think=False
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("全量总结分块调用失败: %s", e)
+                break
+            if part.strip():
+                parts.append(part.strip())
+
+        if not parts:
+            return None
+        if len(parts) == 1:
+            content = parts[0]
+        else:
+            try:
+                content = await self.llm.chat(
+                    "下面是对同一段时间群聊记录分段提炼出的要点。请合并成一份最终情报总结："
+                    "去掉重复，先输出「## 今日重点」（最多 5 条），再按话题组织；"
+                    "保留所有链接与命令原文。直接输出 Markdown。",
+                    "\n\n---\n\n".join(parts),
+                    max_tokens=3000,
+                    temperature=0.2,
+                    think=False,
+                )
+                content = (content or "").strip() or "\n\n".join(parts)
+            except Exception as e:  # noqa: BLE001
+                log.warning("全量总结合并失败，使用原始拼接: %s", e)
+                content = "\n\n".join(parts)
+
+        title = (
+            f"全量情报总结 {time.strftime('%m-%d %H:%M', time.localtime(start))}"
+            f"~{time.strftime('%H:%M', time.localtime(now))}"
+        )
+        path = self._write_report(title, content, "全部", start, now, len(rows))
+        sid = self.store.add_summary("full", start, now, len(rows), content, "full", str(path))
+        log.info("全量情报总结已生成（%d 条消息 / %d 块）", len(rows), len(chunks))
+        await self.notifier.notify(
+            title,
+            f"覆盖 {len(rows)} 条消息，点击查看",
+            level="P1",
+            action=path.as_uri(),
+            action_label="打开总结",
+        )
+        return {"id": sid, "group_id": "full", "title": title, "path": str(path), "count": len(rows)}
+
     def _write_report(self, title, content, group_name, start, end, count) -> Path:
         sub = self.report_dir / time.strftime("%Y%m%d")
         sub.mkdir(parents=True, exist_ok=True)
@@ -309,7 +426,12 @@ class Summarizer:
 
     async def run_daily(self) -> str | None:
         since = int(time.time()) - 86400
-        rows = [r for r in self.store.recent_summaries(300) if r["window_end"] >= since]
+        # kind='full' 的报告本身就是全天总结，再并进来只会整段重复
+        rows = [
+            r
+            for r in self.store.recent_summaries(300)
+            if r["window_end"] >= since and r["kind"] != "full"
+        ]
         if not rows:
             return None
         names = self.store.group_names()

@@ -36,6 +36,24 @@ def _sniff_ext(data: bytes) -> str:
     return ".jpg"
 
 
+async def fetch_full(session: aiohttp.ClientSession, url: str, cap: int) -> bytes:
+    """GET 一张图并**读到 EOF**。HTTP 非 200 / 超过 cap 时抛 ValueError，网络异常原样抛出。
+
+    ⚠️ v0.4.0 的教训：当时写的是 `r.content.read(cap + 1)` —— aiohttp 的
+    `read(n)`（n>0）语义是「至多 n 字节，**缓冲里有数据就立刻返回**」，不是
+    「读满 n 字节或到 EOF」。实际效果是每张图只拿到第一个 TCP chunk（实测恒为
+    16384 字节）就返回，长度校验于是恒报「收到 16384 / 应为 N」且重试同路径
+    永远失败 —— 校验生效了，下载没修。必须用 `r.read()` 读到流结束。
+    """
+    async with session.get(url) as r:
+        if r.status != 200:
+            raise ValueError(f"HTTP {r.status}")
+        expected = r.content_length
+        if expected is not None and expected > cap:
+            raise ValueError(f"over cap ({expected} bytes)")
+        return await r.read()
+
+
 def _decodable(data: bytes) -> bool:
     """用 Pillow 试着解码，确认内容完整。
 
@@ -136,36 +154,24 @@ class MediaWorker:
         return "\n".join(t for t in texts if t.strip()).strip()
 
     async def _fetch_complete(self, url: str, cap: int) -> bytes | None:
-        """下载并校验完整性：字节数必须与 Content-Length 一致，且能被 Pillow 解码。
+        """下载并校验完整性：整包读回 + Pillow 可解码，坏数据返回 None、绝不落盘。
 
-        原来的写法只做 `read(cap + 1)` 就写盘，从不校验长度 —— NapCat 的图床
-        偶发半途断流时，半张图会被存下来，随后 OCR 报 `image file is truncated`、
-        多模态接口报 `unsupported image`，两处都只是结果，根因在下载。
-        坏数据必须在源头拦下，**不落盘**，否则会污染 media 目录并反复报错。
+        重试策略：网络异常、解不开 → 重试一次（瞬时故障）；HTTP 错误、超过
+        上限 → 直接放弃（结果确定，重试无意义）。
         """
         s = await self.session()
         for attempt in (1, 2):
+            again = "重试一次" if attempt == 1 else "放弃"
             try:
-                async with s.get(url) as r:
-                    if r.status != 200:
-                        log.debug("图片下载失败 HTTP %s: %s", r.status, url[:80])
-                        return None
-                    expected = r.content_length  # chunked 传输时为 None
-                    data = await r.content.read(cap + 1)
+                data = await fetch_full(s, url, cap)
+            except ValueError as e:
+                log.debug("图片跳过: %s (%s)", e, url[:80])
+                return None
             except Exception as e:  # noqa: BLE001
-                log.debug("图片下载异常: %s", e)
-                return None
-            if len(data) > cap:
-                log.warning("图片超过 %sMB，跳过", self.mcfg.get("max_download_mb"))
-                return None
-            if expected is not None and len(data) != expected:
-                log.warning(
-                    "图片不完整（收到 %d / 应为 %d 字节），%s",
-                    len(data), expected, "重试一次" if attempt == 1 else "放弃",
-                )
+                log.warning("图片下载异常（%s）: %s", again, e)
                 continue
             if not _decodable(data):
-                log.warning("图片无法解码，%s", "重试一次" if attempt == 1 else "放弃")
+                log.warning("图片无法解码（%s）", again)
                 continue
             return data
         return None

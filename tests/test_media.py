@@ -47,6 +47,87 @@ check("JPEG 头 → .jpg", _sniff_ext(b"\xff\xd8\xff\xe0" + b"\0" * 20) == ".jpg
 check("WEBP 头 → .webp", _sniff_ext(b"RIFF\x00\x00\x00\x00WEBP" + b"\0" * 20) == ".webp")
 check("未知内容回落到 .jpg", _sniff_ext(b"\x01\x02\x03\x04") == ".jpg")
 
+# ---------- fetch_full：真实 HTTP 下载（本地 aiohttp 服务，不外联） ----------
+print("\n=== fetch_full（真实 HTTP 下载）===")
+
+import asyncio  # noqa: E402
+import os  # noqa: E402
+import tempfile  # noqa: E402
+
+from aiohttp import ClientSession, web  # noqa: E402
+
+import aiohttp  # noqa: E402
+
+from msgx.media import fetch_full  # noqa: E402
+
+
+def make_app(data: bytes, chunk: int, drop: bool):
+    async def handler(request):
+        resp = web.StreamResponse()
+        resp.content_length = len(data)  # 声明全长，模拟真实图床
+        await resp.prepare(request)
+        end = len(data) if not drop else len(data) // 2
+        for i in range(0, end, chunk):
+            await resp.write(data[i : i + chunk])
+            await asyncio.sleep(0)  # 让出事件循环，强制分多次 TCP 发送
+        if drop:
+            # 模拟图床半途断流：必须硬切 socket。仅 return 的话 aiohttp 会
+            # 让连接保持打开，客户端（无超时时）会永远等剩余字节。
+            request.transport.abort()
+            return resp
+        await resp.write_eof()
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/img", handler)
+    return app
+
+
+async def run_fetch_tests() -> None:
+    big = png("blue") * 200  # ~18KB：必须分多个 chunk，且 > 16384（旧 bug 的截断点）
+    timeout = aiohttp.ClientTimeout(total=10)
+    for label, drop in (("完整流", False), ("半途断流", True)):
+        runner = web.AppRunner(make_app(big, 1000, drop))
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            async with ClientSession(timeout=timeout) as s:
+                try:
+                    got = await fetch_full(s, f"http://127.0.0.1:{port}/img", 10 * 1024 * 1024)
+                    err = None
+                except Exception as e:  # noqa: BLE001
+                    got, err = None, e
+            if drop:
+                check("半途断流报错（半张图不会当完整图返回）", got is None and err is not None)
+            else:
+                check("完整流整包读回", got == big, f"{len(got)} 字节")
+        finally:
+            await runner.cleanup()
+
+
+asyncio.run(run_fetch_tests())
+
+# ---------- requeue_failed_media：启动时挽回误判 failed 的图片 ----------
+print("\n=== requeue_failed_media ===")
+
+from msgx.store import Store  # noqa: E402
+
+tmp = tempfile.mkdtemp()
+st = Store(os.path.join(tmp, "t.db"))
+st.conn.execute(
+    "INSERT INTO messages(group_id, msg_id, ts, has_media, media_state)"
+    " VALUES('g1','m1',1,1,'failed')"
+)
+st.conn.commit()
+n = st.requeue_failed_media()
+row = st.conn.execute("SELECT media_state FROM messages WHERE msg_id='m1'").fetchone()
+check("failed 图片被重新入队", n == 1)
+check("状态恢复为 pending", row["media_state"] == "pending")
+check("重复调用不产生副作用", st.requeue_failed_media() == 0)
+st.close()
+
 print()
 if fails:
     print(f"存在 {len(fails)} 项失败: {fails}")

@@ -114,6 +114,9 @@ async def cmd_summary(cfg: dict, kind: str) -> None:
         if kind == "daily":
             path = await pipe.summarizer.run_daily()
             print(f"日报已生成: {path}" if path else "没有可汇总的内容")
+        elif kind == "full":
+            item = await pipe.summarizer.run_full()
+            print(f"全量情报总结已生成: {item['path']}" if item else "没有可总结的消息（最近 24 小时无入库消息）")
         else:
             created = await pipe.summarizer.run_periodic(force=True)
             if not created:
@@ -193,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("gui", help="打开图形界面（配置 + 启停 + 实时日志）")
 
     p_sum = sub.add_parser("summary", help="立即生成摘要")
-    p_sum.add_argument("--kind", choices=["periodic", "daily"], default="periodic")
+    p_sum.add_argument("--kind", choices=["full", "periodic", "daily"], default="full")
 
     p_inj = sub.add_parser("inject", help="直接向管道注入 OneBot 事件（调试用）")
     p_inj.add_argument("json", help="事件 JSON 字符串")

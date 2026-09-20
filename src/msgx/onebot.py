@@ -73,6 +73,7 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
     # 一直等 WS 处理器返回（NapCat 不断线就永远不返回）。
     pipe.ws_conns.add(ws)
     log.info("协议端已连接: %s", request.remote)
+    pipe.on_peer_connected()
     accepted = 0
     try:
         async for raw in ws:
@@ -82,6 +83,12 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
                 except json.JSONDecodeError:
                     continue
                 if not isinstance(event, dict):
+                    continue
+                # OneBot API 响应（带 echo、无 post_type）不是事件：
+                # 它是对我们 call_action 的应答，必须先于事件处理拦截，否则
+                # 会被当成消息提交、然后被「非群消息」静默丢弃。
+                if "echo" in event and "post_type" not in event:
+                    pipe.resolve_action(event)
                     continue
                 if event.get("post_type") in ("meta_event", "notice", "request"):
                     continue
@@ -95,6 +102,7 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
         pipe.ws_peers.discard(peer)
         pipe.ws_conns.discard(ws)
         log.info("协议端断开（本次接收 %s 条事件）", accepted)
+        pipe.on_peer_disconnected()
     return ws
 
 
@@ -107,12 +115,27 @@ async def _alerts(request: web.Request) -> web.Response:
 
 async def _summary_now(request: web.Request) -> web.Response:
     pipe = request.app["pipe"]
-    kind = request.query.get("kind", "periodic")
+    kind = request.query.get("kind", "full")
     if kind == "daily":
         path = await pipe.summarizer.run_daily()
         return web.json_response({"ok": True, "path": path})
-    created = await pipe.summarizer.run_periodic(force=True)
-    return web.json_response({"ok": True, "created": created})
+    if kind == "periodic":
+        created = await pipe.summarizer.run_periodic(force=True)
+        return web.json_response({"ok": True, "created": created})
+    # 默认 full：手动点击意味着「把手上已有的东西总结给我」，
+    # 走全量情报总结，不受各群增量窗口与条数门槛的限制。
+    item = await pipe.summarizer.run_full()
+    return web.json_response({"ok": True, "created": [item] if item else []})
+
+
+async def _groups_refresh(request: web.Request) -> web.Response:
+    """通过协议端拉取真实群名并写库。协议端不在线时返回 502，由界面回退本地库。"""
+    pipe = request.app["pipe"]
+    try:
+        n = await pipe.refresh_group_names()
+    except Exception as e:  # noqa: BLE001
+        return web.json_response({"ok": False, "error": str(e)}, status=502)
+    return web.json_response({"ok": True, "groups": n})
 
 
 def build_app(cfg: dict, pipeline) -> web.Application:
@@ -126,4 +149,5 @@ def build_app(cfg: dict, pipeline) -> web.Application:
     app.router.add_post("/inject", _inject)
     app.router.add_get("/alerts", _alerts)
     app.router.add_post("/summary/now", _summary_now)
+    app.router.add_post("/groups/refresh", _groups_refresh)
     return app

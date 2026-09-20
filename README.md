@@ -310,7 +310,8 @@ llm_review_min_score = 2   # 规则分达到多少才交给模型复核（直接
 | 备用：命令行菜单 | `tools\START_HERE.cmd --cli` | — |
 | 备用：只跑服务（无界面） | `tools\启动服务.bat` | `python -m msgx.main run` |
 | 备用：查看状态与花费 | `tools\查看状态.bat` | `python -m msgx.main stats` |
-| 立即生成摘要 | — | `python -m msgx.main summary --kind periodic` |
+| 立即生成摘要 | — | `python -m msgx.main summary --kind full` |
+| 备用：增量周期摘要 | — | `python -m msgx.main summary --kind periodic` |
 | 生成日报 | — | `python -m msgx.main summary --kind daily` |
 | 清理过期数据 | — | `python -m msgx.main prune` |
 | 灌注演示数据 | — | `python tools/make_demo.py --post --reset` |
@@ -337,6 +338,9 @@ llm_review_min_score = 2   # 规则分达到多少才交给模型复核（直接
   - 「协议端」一项会明确区分 *服务在跑* 和 *NapCat 已连上* —— 这两件事经常被混淆，
     是排查「为什么没有消息」时最先要看的地方。未连接时会直接提示点哪个按钮
 - **按钮**：启动服务 / 停止服务 / 立即生成摘要 / 启动协议端(NapCat) / 打开数据目录
+  - **「立即生成摘要」是全量情报总结**：把最近 24 小时所有群的全部消息交给模型，
+    先提炼「今日重点」（≤5 条）再按话题归纳 —— 与周期摘要的增量窗口互不影响。
+    只要点的时候 24h 内有入库消息，就一定有产出
   - **「启动协议端(NapCat)」** 一键拉起 NapCat（QQ 会一并起来），等价于手动双击启动脚本。
     **会弹一次 UAC，必须点「是」** —— 向 QQ 进程注入 DLL 属于管理员操作，绕不过去。
     路径由 `config.toml` 的 `[napcat] start_script` 指定，**留空则该按钮不显示**。
@@ -590,8 +594,24 @@ python -m msgx.main vision --force
 **不是 OCR 的问题，是图片下载不完整。** NapCat 的图床偶发半途断流，半张图被写盘后
 OCR 和多模态接口会先后报错 —— 两处都只是结果，根因在下载。
 
-程序现在会比对 `Content-Length`、不一致则重试一次，再用 Pillow 校验可解码性，
-**坏图不落盘**。若仍频繁出现，多半是网络不稳，检查代理或重连。
+> 版本备注：v0.4.0 加了长度校验但**下载路径没修**（aiohttp 的 `read(n)` 是
+> 「有数据就立刻返回」，每张图只拿到第一个 chunk），日志表现为恒报
+> 「收到 16384 / 应为 N」然后放弃。v0.4.1 起改为读到 EOF + Pillow 校验，
+> 服务启动时还会把上次误判 failed 的图片自动重新入队。
+
+程序现在会整包读回再用 Pillow 校验可解码性，**坏图不落盘**。
+若仍频繁出现，多半是网络不稳，检查代理或重连。
+
+### 协议端断开后消息停了（日志见「协议端断开」）
+
+QQ 会话掉线 / NapCat 进程退出后，NapCat 不会再自动重连（5s 重连只在它自己活着时有效），
+而服务侧毫无异常，唯一征兆是状态卡片「协议端」变回未连接。
+v0.4.1 起断开超过 60 秒会弹 P0 气泡提醒；看到提醒后点「启动协议端(NapCat)」即可。
+
+### 界面群列表显示「(未命名) 754842541」
+
+群名之前只能靠 `config.toml` 的 `[watch] names` 手填。v0.4.1 起协议端连上后会自动
+调 `get_group_list` 拉真实群名；也可以在界面点「刷新群列表」（需服务与协议端都在线）。
 
 ### 摘要全是空的
 
