@@ -87,8 +87,13 @@ class App:
 
     def _build(self) -> None:
         self.root.title(f"{APP_TITLE}  v{__version__}")
-        self.root.geometry("1000x800")
-        self.root.minsize(860, 620)
+        # 默认尺寸按屏幕算：写死 800 高在 768p 屏上会顶出屏幕，
+        # 设置页底部的「保存设置」直接被切掉（用户得手动拉窗口才能看到）。
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        w = min(1040, max(900, sw - 80))
+        h = min(940, max(680, sh - 90))
+        self.root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+        self.root.minsize(820, 560)
 
         style = ttk.Style(self.root)
         style.theme_use("clam")
@@ -157,7 +162,9 @@ class App:
         self.btn_start.pack(side="left")
         self.btn_stop = ttk.Button(buttons, text="停止服务", command=self.stop_service, state="disabled")
         self.btn_stop.pack(side="left", padx=8)
-        self.btn_summary = ttk.Button(buttons, text="立即生成摘要", command=self.summary_now)
+        self.btn_summary = ttk.Button(
+            buttons, text="立即生成摘要", command=lambda: self.summary_now("digest")
+        )
         self.btn_summary.pack(side="left")
         ttk.Button(buttons, text="打开数据目录", command=self.open_data_dir).pack(side="right")
         # 协议端必须单独启动 —— 本服务只监听它连入。没配脚本就不显示这个按钮。
@@ -165,6 +172,10 @@ class App:
             ttk.Button(
                 buttons, text="启动协议端(NapCat)", command=self.start_napcat
             ).pack(side="right", padx=8)
+        # 增量纪要是默认动作，通常够用；这个按钮用于「忽略游标、把近 24h 全部重做一遍」。
+        ttk.Button(
+            buttons, text="全量重做", command=lambda: self.summary_now("full")
+        ).pack(side="right", padx=8)
 
         log_frame = ttk.LabelFrame(tab, text="服务日志", padding=8)
         log_frame.pack(fill="both", expand=True, pady=(6, 0))
@@ -186,8 +197,26 @@ class App:
     # ---- 标签页 2：设置 ----
 
     def _build_settings_tab(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb, padding=14)
-        nb.add(tab, text="设置")
+        # 设置项比一屏还高，窗口一矮底部（保存设置）就掉出可见区。套一层 Canvas 做滚动：
+        # 任何窗口高度都能滚到底，不必再手动拉窗口。
+        holder = ttk.Frame(nb)
+        nb.add(holder, text="设置")
+        canvas = tk.Canvas(holder, highlightthickness=0, borderwidth=0)
+        sb = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        tab = ttk.Frame(canvas, padding=14)
+        inner = canvas.create_window((0, 0), window=tab, anchor="nw")
+
+        def _fit(_evt=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(inner, width=canvas.winfo_width())
+
+        tab.bind("<Configure>", _fit)
+        canvas.bind("<Configure>", _fit)
+        self._scroll_canvas = canvas
 
         # --- 关键词 ---
         kw = ttk.LabelFrame(tab, text="关注关键词", padding=12)
@@ -291,6 +320,27 @@ class App:
                  "配置文件 config.toml 受版本管理，界面不会改写它。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(8, 0))
+        self._bind_wheel(tab, self._scroll_canvas)
+
+    @staticmethod
+    def _bind_wheel(widget, canvas: tk.Canvas) -> None:
+        """把滚轮事件绑到设置页的全部子控件上。
+
+        Tk 的滚轮事件由指针下的控件消费、不冒泡到 Canvas，必须逐个绑定。
+        必须在本页控件都建完之后调用，否则绑不到任何东西。
+        Text / Listbox 自带滚动语义，跳过，免得「滚内容」和「滚整页」互相打架。
+        """
+
+        def on_wheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        def walk(w) -> None:
+            if not isinstance(w, (tk.Text, tk.Listbox)):
+                w.bind("<MouseWheel>", on_wheel)
+            for child in w.winfo_children():
+                walk(child)
+
+        walk(widget)
 
     # ---------------- 偏好读写 ----------------
 
@@ -484,31 +534,33 @@ class App:
         finally:
             self.events.put(("exit", proc.wait()))
 
-    def summary_now(self) -> None:
+    def summary_now(self, kind: str = "digest") -> None:
         if self.proc is None:
             messagebox.showinfo("服务未运行", "请先启动服务，再生成摘要。", parent=self.root)
             return
         port = int(self.cfg["onebot"]["http_port"])
-        self.status.set("正在请求生成摘要…")
+        label = "全量重做" if kind == "full" else "增量纪要"
+        self.status.set(f"正在请求生成{label}…")
 
         def work() -> None:
             try:
-                # kind=full：全量情报总结（最近 24h 全部消息交给模型归纳），
-                # 不受各群增量窗口与条数门槛限制 —— 旧的 periodic 路径曾出现
-                # 「明明收了几十条，点按钮却回 0 份」的死状态。
+                # digest：接着上次已总结过的消息继续（默认）；full：近 24h 全部重做。
+                # 两条路径都不受「每组 ≥8 条」的增量门槛限制，避免点按钮却回 0 份。
                 req = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/summary/now?kind=full", data=b"", method="POST"
+                    f"http://127.0.0.1:{port}/summary/now?kind={kind}", data=b"", method="POST"
                 )
                 op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
                 with op.open(req, timeout=300) as r:
                     body = json.loads(r.read().decode("utf-8"))
-                n = len(body.get("created") or [])
-                if n:
-                    self.events.put(("note", f"情报总结已生成 {n} 份，详见 data/reports/"))
+                items = body.get("created") or []
+                if items:
+                    chars = items[0].get("chars")
+                    extra = f"（{chars} 字，{items[0]['count']} 条消息）" if chars else ""
+                    self.events.put(("note", f"{label}已生成{extra}，详见 data/reports/"))
+                elif kind == "full":
+                    self.events.put(("note", "没有可总结的消息（最近 24 小时内库中没有群消息）"))
                 else:
-                    self.events.put(
-                        ("note", "没有可总结的消息（最近 24 小时内数据库没有收到任何群消息）")
-                    )
+                    self.events.put(("note", "自上次纪要以来没有新消息，无需重复总结"))
             except Exception as exc:  # noqa: BLE001
                 self.events.put(("note", f"摘要请求失败：{exc}"))
 

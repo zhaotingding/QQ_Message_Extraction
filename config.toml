@@ -38,9 +38,16 @@ vision_model            = "deepseek-flash"   # 图片模型；实测不支持图
 api_key_env             = "DEEPSEEK_API_KEY"
 api_key                 = ""                 # 也可直接写在这里（不推荐，优先用环境变量）
 max_daily_cost_cny      = 10.0
-price_in_usd_per_mtok   = 0.22
-price_out_usd_per_mtok  = 0.66
-usd_to_cny              = 7.2
+# ---- 计费口径：对齐 DeepSeek 开放平台账单 ----
+# 官方对 deepseek-flash（V4.1-Flash）实行「峰谷 + 缓存命中」三档计价，
+# 单位：元 / 百万 token，以下填的是**空闲时段**价。
+# 来源：https://api-docs.deepseek.com/quick_start/pricing
+price_cache_hit_cny_per_mtok  = 0.02   # 输入 · 缓存命中
+price_cache_miss_cny_per_mtok = 1.00   # 输入 · 缓存未命中
+price_output_cny_per_mtok     = 4.00   # 输出
+peak_multiplier               = 2.0    # 高峰 = 空闲 × 2
+# 高峰时段（UTC，仅周一至周五）= 北京时间工作日 09:00-12:00 与 14:00-18:00
+peak_windows_utc              = "01:00-04:00,06:00-10:00"
 timeout_seconds         = 90
 
 [media]

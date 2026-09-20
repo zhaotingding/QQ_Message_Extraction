@@ -115,8 +115,11 @@ async def cmd_summary(cfg: dict, kind: str) -> None:
             path = await pipe.summarizer.run_daily()
             print(f"日报已生成: {path}" if path else "没有可汇总的内容")
         elif kind == "full":
-            item = await pipe.summarizer.run_full()
-            print(f"全量情报总结已生成: {item['path']}" if item else "没有可总结的消息（最近 24 小时无入库消息）")
+            item = await pipe.summarizer.run_digest(full=True)
+            print(f"全量纪要已生成: {item['path']}" if item else "没有可总结的消息")
+        elif kind == "digest":
+            item = await pipe.summarizer.run_digest()
+            print(f"群消息纪要已生成: {item['path']}" if item else "自上次纪要以来没有新消息")
         else:
             created = await pipe.summarizer.run_periodic(force=True)
             if not created:
@@ -161,8 +164,8 @@ async def cmd_stats(cfg: dict) -> None:
         print("\n用量明细：")
         for r in pipe.store.usage_all()[:14]:
             print(
-                f"  {r['day']}  调用 {r['calls']:>4}  输入 {r['in_tokens']:>8}  "
-                f"输出 {r['out_tokens']:>7}  ${r['cost_usd']:.4f}"
+                f"  {r['day']}  调用 {r['calls']:>4}  输入 {r['in_tokens']:>8}"
+                f"（命中 {r['cache_hit_tokens']:>7}）  输出 {r['out_tokens']:>7}  ¥{r['cost_cny']:.4f}"
             )
     finally:
         await pipe.stop()
@@ -196,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("gui", help="打开图形界面（配置 + 启停 + 实时日志）")
 
     p_sum = sub.add_parser("summary", help="立即生成摘要")
-    p_sum.add_argument("--kind", choices=["full", "periodic", "daily"], default="full")
+    p_sum.add_argument("--kind", choices=["digest", "full", "periodic", "daily"], default="digest")
 
     p_inj = sub.add_parser("inject", help="直接向管道注入 OneBot 事件（调试用）")
     p_inj.add_argument("json", help="事件 JSON 字符串")

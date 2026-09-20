@@ -51,15 +51,54 @@ class LLM:
 
     # ---------- budget ----------
 
-    def cost_usd(self, in_tokens: int, out_tokens: int) -> float:
-        return (
-            in_tokens / 1_000_000 * float(self.llm.get("price_in_usd_per_mtok", 0.22))
-            + out_tokens / 1_000_000 * float(self.llm.get("price_out_usd_per_mtok", 0.66))
+    def is_peak(self, ts: float | None = None) -> bool:
+        """调用时刻是否处于 DeepSeek 高峰时段。
+
+        官方定义：高峰 = UTC 01:00-04:00 与 06:00-10:00 的**周一至周五**，
+        其余时段（含整个周末）为空闲。折北京时间即工作日 09:00-12:00、14:00-18:00。
+        """
+        t = time.gmtime(time.time() if ts is None else ts)
+        if t.tm_wday >= 5:  # 5=周六 6=周日
+            return False
+        minutes = t.tm_hour * 60 + t.tm_min
+        for win in str(self.llm.get("peak_windows_utc", "")).split(","):
+            win = win.strip()
+            if "-" not in win:
+                continue
+            a, b = win.split("-", 1)
+            try:
+                ah, am = (int(x) for x in a.strip().split(":"))
+                bh, bm = (int(x) for x in b.strip().split(":"))
+            except ValueError:
+                continue
+            if ah * 60 + am <= minutes < bh * 60 + bm:
+                return True
+        return False
+
+    def cost_cny(
+        self,
+        in_tokens: int,
+        out_tokens: int,
+        cache_hit_tokens: int = 0,
+        ts: float | None = None,
+    ) -> float:
+        """按调用**发生的那一刻**的峰谷价计算人民币金额。
+
+        账单的三档计价：输入分「缓存命中 / 未命中」、输出单列；
+        高峰时段各项都是空闲时段的 peak_multiplier 倍。
+        缓存命中 token 由 API 返回；缺失时视为全部未命中（保守，宁高不低）。
+        """
+        mult = float(self.llm.get("peak_multiplier", 2.0)) if self.is_peak(ts) else 1.0
+        hit = max(0, min(int(cache_hit_tokens), int(in_tokens)))
+        miss = max(0, int(in_tokens) - hit)
+        return mult * (
+            hit / 1_000_000 * float(self.llm.get("price_cache_hit_cny_per_mtok", 0.02))
+            + miss / 1_000_000 * float(self.llm.get("price_cache_miss_cny_per_mtok", 1.00))
+            + int(out_tokens) / 1_000_000 * float(self.llm.get("price_output_cny_per_mtok", 4.00))
         )
 
     def spent_today_cny(self) -> float:
-        usd = self.store.daily_cost_usd(date.today().isoformat())
-        return usd * float(self.llm.get("usd_to_cny", 7.2))
+        return self.store.daily_cost_cny(date.today().isoformat())
 
     def budget_ok(self) -> bool:
         return self.spent_today_cny() < float(self.llm.get("max_daily_cost_cny", 10.0))
@@ -96,10 +135,12 @@ class LLM:
             # 摘要、图片描述这类「忠实提取」任务不需要推理，关掉可省去数倍输出成本。
             payload["reasoning_effort"] = "none"
 
+        started = time.time()  # 峰谷按调用发生的时刻判定
         data = await self._post(payload)
         usage = data.get("usage") or {}
         in_tok = int(usage.get("prompt_tokens", 0))
         out_tok = int(usage.get("completion_tokens", 0))
+        hit_tok = int(usage.get("prompt_cache_hit_tokens", 0))
 
         # 兜底：若思考占满预算被截断、正文为空，放大预算重试一次。
         # 没有这层保护会静默产出空摘要，用户完全察觉不到。
@@ -113,9 +154,12 @@ class LLM:
             usage = data.get("usage") or {}
             in_tok += int(usage.get("prompt_tokens", 0))
             out_tok += int(usage.get("completion_tokens", 0))
+            hit_tok += int(usage.get("prompt_cache_hit_tokens", 0))
 
-        cost = self.cost_usd(in_tok, out_tok)
-        self.store.add_usage(date.today().isoformat(), in_tok, out_tok, cost)
+        cost = self.cost_cny(in_tok, out_tok, hit_tok, ts=started)
+        self.store.add_usage(
+            date.today().isoformat(), in_tok, out_tok, cost, hit_tok, max(0, in_tok - hit_tok)
+        )
         try:
             return data["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError):
@@ -248,14 +292,20 @@ class LLM:
             "stream": False,
             "reasoning_effort": "none",
         }
+        started = time.time()
         try:
             data = await self._post(payload)
             usage = data.get("usage") or {}
+            in_tok = int(usage.get("prompt_tokens", 0))
+            out_tok = int(usage.get("completion_tokens", 0))
+            hit_tok = int(usage.get("prompt_cache_hit_tokens", 0))
             self.store.add_usage(
                 date.today().isoformat(),
-                int(usage.get("prompt_tokens", 0)),
-                int(usage.get("completion_tokens", 0)),
-                self.cost_usd(int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0))),
+                in_tok,
+                out_tok,
+                self.cost_cny(in_tok, out_tok, hit_tok, ts=started),
+                hit_tok,
+                max(0, in_tok - hit_tok),
             )
             return ((data.get("choices") or [{}])[0].get("message", {}).get("content") or "").strip()
         except Exception as e:  # noqa: BLE001

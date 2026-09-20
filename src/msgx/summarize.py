@@ -11,53 +11,49 @@ from . import hotspot
 
 log = logging.getLogger("msgx.summarize")
 
-DIGEST_SYSTEM = """你在为一位科研 + 工程双线作战的用户做群聊情报总结。他的核心诉求：不错过业界最新动态。
-下面是某个群一段时间内的完整聊天记录。你的任务不是「把消息压短」，而是**总结关键信息**。
+DIGEST_MAX_CHARS = 200
 
-要求：
-1. 通读全部记录，识别真正有信息量的内容：技术结论、业界动态、版本发布、方法经验、
-   踩坑原因、资源（仓库 / 论文 / 工具 / 数据集）。
-2. 按「话题」组织。同一话题下多个人的发言必须**归纳成一条结论**，不要罗列「某用户说某句」。
-   每个话题给出：发生了什么 / 结论是什么；必要时补一句为什么值得注意（影响、适用场景）。
-3. 寒暄、表情包、签到、接龙、纯情绪输出一律丢弃。
-4. 凡是出现链接、命令、参数、仓库名、论文名、数据集名，必须原样保留，不要改写或缩写 URL。
-5. 如果整段记录都没有值得保留的信息，只输出一行：本段无有效信息
-6. 直接输出 Markdown，不要任何开场白、客套话或总结性评价。
+DIGEST_SYSTEM = f"""你在为一位科研 + 工程双线作战的用户写一份「群消息纪要」。
+他的唯一诉求：不遗漏业界动向。下面是一段时间的群聊记录（带群名、时间、发言人）。
 
-输出格式（严格遵守）：
-### 话题：<不超过 15 字的标题>
-- <结论 / 要点>
-- <要点>
-> 可复用：<链接 / 命令 / 参数；没有则整行省略>
+写成**一段连贯的纪要**，像会后心得，不是信息压缩，更不是话题罗列。
+
+铁律：
+1. 用 **3~5 句话说清**，总长不超过 {DIGEST_MAX_CHARS} 字。宁可写不足，也不要凑字数。
+2. 写「发生了什么、结论是什么」，不写「谁说了什么」。
+3. **禁止分条、禁止小标题、禁止按话题分类**——直接写成一段话（最多两段）。
+4. 只留真正重要的：重要发布/更新、模型或工具行为变化、可复用的资源与结论。
+   闲聊、寒暄、表情包、接龙、纯情绪、广告、账号交易一律不写。
+   拿不准的内容标注（未证实）。
+5. 不写任何前缀（如「本期纪要」「以下为」）与结尾评价。
+6. 若本段确实没有值得知道的信息，只输出四个字：本段无有效信息
 """
 
-FULL_SYSTEM = """你在为一位科研 + 工程双线作战的用户编写「群聊情报总结」。他的唯一目标：不错过业界最新动态和值得复用的技术信息。
-下面是多技术群一段时间内的全部聊天记录（带群名、时间与发言人）。
-
-你的任务：像写情报简报一样总结，而不是压缩转述。
+MERGE_SYSTEM = """把下面几段同一时间段的群聊纪要合并成一份。
 
 要求：
-1. 通读全部记录后，先输出「## 今日重点」：最多 5 条、每条一句话，选最有行业价值 /
-   时效性 / 影响面的信息（新品或版本发布、模型行为变化、大规模故障、平台规则变化等）。
-2. 之后按话题组织正文。同一话题分散在多个群、多个人的发言必须**归纳合并成一条结论**，
-   不要罗列「某某说某某」。
-3. 区分「事实」与「个人观点」：个人经验标注（个人经验），未经证实的消息标注（未经证实）。
-4. 链接、命令、参数、版本号、仓库名、论文名原样保留，URL 不许改写。
-5. 纯闲聊、寒暄、表情包、接龙一律丢弃；内容少就短，不要注水。
-6. 直接输出 Markdown，无开场白、无总结性评价。
-
-输出格式：
-## 今日重点
-- <要点>
-
-### 话题：<不超过 15 字的标题>
-- <结论 / 要点>
-> 可复用：<链接 / 命令 / 参数；没有则整行省略>
+1. 去掉重复，只保留最重要的信息。
+2. 输出风格与输入一致：**一段连贯的纪要，禁止分条、禁止小标题、禁止按话题分类**。
+3. 不写前缀与结尾评价，直接输出正文。
 """
 
-MERGE_SYSTEM = """你在合并同一时间段内、来自同一群的多份摘要片段。
-把重复的话题合并成一个，按信息价值从高到低排序，保留所有链接、命令、参数、版本号原文。
-直接输出合并后的 Markdown，格式与输入一致，不要开场白。
+# 中间层：此时还没到最后一步，先别丢信息
+MERGE_MID_RULE = """
+4. 这一轮先不要丢信息：把所有要点都保留下来，可以写到 600 字左右。
+"""
+# 收口层：直接产出最终纪要
+MERGE_FINAL_RULE = f"""
+4. 总长不超过 {DIGEST_MAX_CHARS} 字，用 3~5 句话写完；只留最重要的事实与结论。
+"""
+
+COMPRESS_SYSTEM = f"""把下面这段群消息纪要压缩成一段极简纪要。
+
+规则：
+1. **只删不加**：只留最重要的事实与结论，删掉次要细节、举例、重复表述与铺垫。
+2. **把最重要的信息放在最前面**，越往后越次要。
+3. 用 3~5 句话写完，总长控制在 {DIGEST_MAX_CHARS} 字以内（不到更好）。
+4. 仍然是一段连贯的话，禁止分条、禁止小标题、禁止前缀与结尾评价。
+5. 直接输出压缩后的正文，不要说明你做了什么。
 """
 
 HOTSPOT_SYSTEM = """你在为一位科研 + 工程双线作战的用户做「跨群热点」归纳。
@@ -282,9 +278,11 @@ class Summarizer:
         chunks = _chunk(rows, budget)
         parts: list[str] = []
         for ch in chunks:
-            body = f"群名：{group_name or group_id}\n\n" + _rows_to_text(ch)
+            body = f"（下面是「{group_name or group_id}」这个群的记录）\n\n" + _rows_to_text(ch)
             try:
-                part = await self.llm.chat(DIGEST_SYSTEM, body, max_tokens=1500, temperature=0.2, think=False)
+                part = await self.llm.chat(
+                    DIGEST_SYSTEM, body, max_tokens=600, temperature=0.2, think=False
+                )
             except Exception as e:  # noqa: BLE001
                 log.warning("分块摘要调用失败: %s", e)
                 break
@@ -293,96 +291,176 @@ class Summarizer:
 
         if not parts:
             content = "本时段无有效信息。"
-        elif len(parts) == 1:
-            content = parts[0]
         else:
-            try:
-                content = await self.llm.chat(
-                    MERGE_SYSTEM, "\n\n---\n\n".join(parts), max_tokens=2000, temperature=0.2, think=False
-                )
-                content = content.strip() or parts[0]
-            except Exception:  # noqa: BLE001
-                content = "\n\n".join(parts)
+            content = await self._merge_all(parts)
+
+        content = await self._fit_length(content)
 
         title = f"{group_name or group_id} 摘要 {time.strftime('%m-%d %H:%M', time.localtime(start))}~{time.strftime('%H:%M', time.localtime(now))}"
         path = self._write_report(title, content, group_name, start, now, len(rows))
         sid = self.store.add_summary(group_id, start, now, len(rows), content, "periodic", str(path))
         return {"id": sid, "group_id": group_id, "title": title, "path": str(path), "count": len(rows)}
 
-    async def run_full(self, hours: int = 24) -> dict | None:
-        """手动「立即生成摘要」入口：把最近一段时间**全部消息**交给模型做情报总结。
+    async def run_digest(self, full: bool = False, hours: int = 24) -> dict | None:
+        """「群消息纪要」：跨群合并成一份 ≤200 字的精华总结。
 
-        与周期摘要（增量窗口、每组不足 min_messages 条就跳过）刻意不同：
-        用户主动点击意味着「把手上已有的东西总结给我」，不受窗口推进与条数门槛
-        限制 —— 否则会出现「明明收了几十条，点按钮却回 0 份」的死状态。
+        - 增量（默认）：接着**上次已经被总结过的消息**继续，游标是 kind='digest'，
+          与热点、各群周期摘要的游标互不干扰，因此不会重复总结同一批消息。
+        - 全量（full=True）：把最近 hours 小时的全部消息重来一遍。
+
+        两种模式都**不受 min_messages 门槛限制**：用户主动点击就意味着
+        「把手上已有的东西总结给我」，否则会出现「明明收了几十条、点按钮却回 0 份」。
         """
         if not self.llm.available:
-            log.warning("LLM 未配置，跳过全量总结")
+            log.warning("LLM 未配置，跳过纪要生成")
             return None
         now = int(time.time())
-        start = now - hours * 3600
+        first = self.store.first_ts_all()
+        if not first:
+            return None
+        if full:
+            start = max(first - 1, now - hours * 3600)
+        else:
+            start = self.store.window_end_by_kind("digest") or (first - 1)  # 开区间下界
         rows = self.store.messages_between_all(start, now)
         if not rows:
-            first = self.store.first_ts_all()
-            if not first:
-                return None
-            start = first - 1  # 开区间下界，同第 10 条坑
-            rows = self.store.messages_between_all(start, now)
-        if not rows:
+            log.info("纪要：窗口内没有新消息（起点 %s）", time.strftime("%m-%d %H:%M", time.localtime(start)))
             return None
 
         names = self.store.group_names()
-        budget = int(self.scfg.get("chunk_char_budget", 6000))
-        chunks = _chunk(rows, budget)
+        chunks = _chunk(rows, int(self.scfg.get("chunk_char_budget", 6000)))
         parts: list[str] = []
         for i, ch in enumerate(chunks, 1):
-            body = _rows_to_text_multi(ch, names)
-            head = f"（这是第 {i}/{len(chunks)} 段，先提炼关键信息点，之后会统一汇总。）\n\n"
+            head = f"（第 {i}/{len(chunks)} 段；先各自成稿，最后会合并成一份纪要。）\n\n"
             try:
                 part = await self.llm.chat(
-                    FULL_SYSTEM, head + body, max_tokens=2000, temperature=0.2, think=False
+                    DIGEST_SYSTEM, head + _rows_to_text_multi(ch, names),
+                    max_tokens=600, temperature=0.2, think=False,
                 )
             except Exception as e:  # noqa: BLE001
-                log.warning("全量总结分块调用失败: %s", e)
+                log.warning("纪要分块调用失败: %s", e)
                 break
-            if part.strip():
-                parts.append(part.strip())
-
+            part = (part or "").strip()
+            if part and "无有效信息" not in part[:20]:
+                parts.append(part)
         if not parts:
             return None
-        if len(parts) == 1:
-            content = parts[0]
-        else:
-            try:
-                content = await self.llm.chat(
-                    "下面是对同一段时间群聊记录分段提炼出的要点。请合并成一份最终情报总结："
-                    "去掉重复，先输出「## 今日重点」（最多 5 条），再按话题组织；"
-                    "保留所有链接与命令原文。直接输出 Markdown。",
-                    "\n\n---\n\n".join(parts),
-                    max_tokens=3000,
-                    temperature=0.2,
-                    think=False,
-                )
-                content = (content or "").strip() or "\n\n".join(parts)
-            except Exception as e:  # noqa: BLE001
-                log.warning("全量总结合并失败，使用原始拼接: %s", e)
-                content = "\n\n".join(parts)
 
+        content = await self._merge_all(parts)
+
+        if len(content) > DIGEST_MAX_CHARS * 2:
+            log.warning("纪要 %d 字，明显超出 %d 字上限（提示词未压住）", len(content), DIGEST_MAX_CHARS)
+        content = await self._fit_length(content)
+
+        kind_label = "全量纪要" if full else "群消息纪要"
         title = (
-            f"全量情报总结 {time.strftime('%m-%d %H:%M', time.localtime(start))}"
+            f"{kind_label} {time.strftime('%m-%d %H:%M', time.localtime(start))}"
             f"~{time.strftime('%H:%M', time.localtime(now))}"
         )
         path = self._write_report(title, content, "全部", start, now, len(rows))
-        sid = self.store.add_summary("full", start, now, len(rows), content, "full", str(path))
-        log.info("全量情报总结已生成（%d 条消息 / %d 块）", len(rows), len(chunks))
+        sid = self.store.add_summary("digest", start, now, len(rows), content, "digest", str(path))
+        log.info("%s 已生成（%d 条消息 / %d 块 / %d 字）", kind_label, len(rows), len(chunks), len(content))
         await self.notifier.notify(
             title,
-            f"覆盖 {len(rows)} 条消息，点击查看",
+            f"{len(rows)} 条消息 · {len(content)} 字",
             level="P1",
             action=path.as_uri(),
-            action_label="打开总结",
+            action_label="打开纪要",
         )
-        return {"id": sid, "group_id": "full", "title": title, "path": str(path), "count": len(rows)}
+        return {
+            "id": sid,
+            "group_id": "digest",
+            "title": title,
+            "path": str(path),
+            "count": len(rows),
+            "chars": len(content),
+        }
+
+    async def _merge_all(self, parts: list[str]) -> str:
+        """分层合并多段纪要，最后一层收口到 ≤DIGEST_MAX_CHARS。
+
+        为什么不分一次合并：一次把 20 段塞给模型、要求压到 200 字，压缩比接近 20:1，
+        模型必然做不到（实测只从 440 压到 415）。分层后每步只需压 4:1 左右，
+        成稿质量与长度都明显更可控。层数 = ceil(log_4(段数))，代价可忽略。
+        """
+        level = [p for p in parts if p and p.strip()]
+        if not level:
+            return ""
+        if len(level) == 1:
+            return level[0]
+
+        GROUP = 4
+        while True:
+            last_round = len(level) <= GROUP
+            nxt: list[str] = []
+            for i in range(0, len(level), GROUP):
+                batch = level[i : i + GROUP]
+                if len(batch) == 1:
+                    nxt.append(batch[0])
+                    continue
+                sys_prompt = MERGE_SYSTEM + (MERGE_FINAL_RULE if last_round else MERGE_MID_RULE)
+                try:
+                    out = await self.llm.chat(
+                        sys_prompt, "\n\n---\n\n".join(batch),
+                        max_tokens=600, temperature=0.2, think=False,
+                    )
+                    out = (out or "").strip()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("纪要分层合并失败，使用拼接: %s", e)
+                    out = ""
+                nxt.append(out or "\n\n".join(batch))
+            level = nxt
+            if last_round:
+                return level[0]
+
+    async def _fit_length(self, content: str) -> str:
+        """把纪要硬性收敛到 DIGEST_MAX_CHARS 以内。
+
+        实测：提示词写明「不超过 200 字」，模型仍会写到 350~700 字 ——
+        提示词只能「引导」，不能「约束」，靠调措辞去赌长度是不收敛的。
+        因此这里做两道**确定性**收敛：
+          1) 让模型重写一轮，并把 max_tokens 卡到写不出超长文本（物理上限）；
+          2) 若仍超（或调用失败 / 反而更长），按句子边界硬截断。
+        绝不放行超长原稿 —— 那等于这道工序不存在。
+        """
+        if len(content) <= DIGEST_MAX_CHARS:
+            return content
+
+        # 最多压两轮：单轮实测只能压掉 ~15%，两轮能明显接近目标；
+        # 轮数再多收益递减，且每一步都是额外调用，不值得。
+        for attempt in range(1, 3):
+            try:
+                shorter = await self.llm.chat(
+                    COMPRESS_SYSTEM,
+                    content,
+                    max_tokens=DIGEST_MAX_CHARS + 60,
+                    temperature=0.1,
+                    think=False,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("纪要压缩第 %d 轮调用失败，改走硬截断: %s", attempt, e)
+                break
+            shorter = (shorter or "").strip()
+            # 只在「确实更短」时采纳：模型偶尔会把压缩写成扩写
+            if not shorter or len(shorter) >= len(content):
+                break
+            content = shorter
+            if len(content) <= DIGEST_MAX_CHARS:
+                return content
+
+        # 硬截断：优先在句末（。！？；）断开，避免把句子切成两半
+        cut = content[:DIGEST_MAX_CHARS]
+        m = re.search(r"[。！？；!?;][^。！？；!?;]*$", cut)
+        if m and m.start() >= int(DIGEST_MAX_CHARS * 0.6):
+            cut = cut[: m.start() + 1]
+        else:
+            # 要给省略号留一个字符位，否则 200 + "…" 会变成 201 字
+            cut = content[: DIGEST_MAX_CHARS - 1].rstrip("，,、；;：: \n\t") + "…"
+        log.warning(
+            "纪要仍超 %d 字（压缩后 %d 字），已硬截断至 %d 字",
+            DIGEST_MAX_CHARS, len(content), len(cut),
+        )
+        return cut
 
     def _write_report(self, title, content, group_name, start, end, count) -> Path:
         sub = self.report_dir / time.strftime("%Y%m%d")
@@ -426,11 +504,11 @@ class Summarizer:
 
     async def run_daily(self) -> str | None:
         since = int(time.time()) - 86400
-        # kind='full' 的报告本身就是全天总结，再并进来只会整段重复
+        # kind='digest'/'full' 的报告本身就是跨群总结，再并进来只会整段重复
         rows = [
             r
             for r in self.store.recent_summaries(300)
-            if r["window_end"] >= since and r["kind"] != "full"
+            if r["window_end"] >= since and r["kind"] not in ("full", "digest")
         ]
         if not rows:
             return None

@@ -68,9 +68,20 @@ CREATE TABLE IF NOT EXISTS usage (
   calls      INTEGER DEFAULT 0,
   in_tokens  INTEGER DEFAULT 0,
   out_tokens INTEGER DEFAULT 0,
-  cost_usd   REAL DEFAULT 0
+  cost_cny   REAL DEFAULT 0,
+  cache_hit_tokens  INTEGER DEFAULT 0,
+  cache_miss_tokens INTEGER DEFAULT 0
 );
 """
+
+# v0.4.2：计费口径改为 DeepSeek 官方的「峰谷 + 缓存命中」三档计价，金额单位由
+# 美元改为人民币。老库的 usage 表没有这三列，这里幂等补齐（历史行的 cost_cny
+# 为 0，不追溯换算 —— 旧金额是按已作废的价目表算的，换算反而会失真）。
+USAGE_MIGRATIONS = (
+    ("cost_cny", "REAL DEFAULT 0"),
+    ("cache_hit_tokens", "INTEGER DEFAULT 0"),
+    ("cache_miss_tokens", "INTEGER DEFAULT 0"),
+)
 
 
 class Store:
@@ -81,7 +92,15 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """幂等补齐老库缺失的列。"""
+        cols = {c[1] for c in self.conn.execute("PRAGMA table_info(usage)")}
+        for name, spec in USAGE_MIGRATIONS:
+            if name not in cols:
+                self.conn.execute(f"ALTER TABLE usage ADD COLUMN {name} {spec}")
 
     def close(self) -> None:
         self.conn.close()
@@ -206,12 +225,20 @@ class Store:
         row = self.conn.execute("SELECT MIN(ts) AS t FROM messages").fetchone()
         return int(row["t"]) if row and row["t"] else 0
 
-    def window_end_all(self) -> int:
-        """跨群热点视角的窗口上界：最近一份热点报告覆盖到的时间点。"""
+    def window_end_by_kind(self, kind: str) -> int:
+        """某条摘要轨道（periodic 的按群游标之外）最近覆盖到的时间点。
+
+        热点（kind='hotspot'）与纪要（kind='digest'）各有独立游标：
+        两者的生成节奏不同，共用一个游标会互相顶掉对方的窗口起点。
+        """
         row = self.conn.execute(
-            "SELECT MAX(window_end) AS e FROM summaries WHERE kind='hotspot'"
+            "SELECT MAX(window_end) AS e FROM summaries WHERE kind=?", (kind,)
         ).fetchone()
         return int(row["e"]) if row and row["e"] else 0
+
+    def window_end_all(self) -> int:
+        """跨群热点视角的窗口上界：最近一份热点报告覆盖到的时间点。"""
+        return self.window_end_by_kind("hotspot")
 
     def messages_between_all(self, start: int, end: int, limit: int = 8000) -> list:
         """窗口内全部群的消息，按时间升序。供跨群热点统计使用。"""
@@ -274,20 +301,31 @@ class Store:
 
     # ---------- usage ----------
 
-    def add_usage(self, day: str, in_tokens: int, out_tokens: int, cost_usd: float) -> None:
+    def add_usage(
+        self,
+        day: str,
+        in_tokens: int,
+        out_tokens: int,
+        cost_cny: float,
+        cache_hit_tokens: int = 0,
+        cache_miss_tokens: int = 0,
+    ) -> None:
         self.conn.execute(
-            "INSERT INTO usage(day, calls, in_tokens, out_tokens, cost_usd) VALUES(?,1,?,?,?)"
+            "INSERT INTO usage(day, calls, in_tokens, out_tokens, cost_cny,"
+            " cache_hit_tokens, cache_miss_tokens) VALUES(?,1,?,?,?,?,?)"
             " ON CONFLICT(day) DO UPDATE SET calls=calls+1,"
             " in_tokens=in_tokens+excluded.in_tokens,"
             " out_tokens=out_tokens+excluded.out_tokens,"
-            " cost_usd=cost_usd+excluded.cost_usd",
-            (day, in_tokens, out_tokens, cost_usd),
+            " cost_cny=cost_cny+excluded.cost_cny,"
+            " cache_hit_tokens=cache_hit_tokens+excluded.cache_hit_tokens,"
+            " cache_miss_tokens=cache_miss_tokens+excluded.cache_miss_tokens",
+            (day, in_tokens, out_tokens, cost_cny, cache_hit_tokens, cache_miss_tokens),
         )
         self.conn.commit()
 
-    def daily_cost_usd(self, day: str) -> float:
-        row = self.conn.execute("SELECT cost_usd FROM usage WHERE day=?", (day,)).fetchone()
-        return float(row["cost_usd"]) if row else 0.0
+    def daily_cost_cny(self, day: str) -> float:
+        row = self.conn.execute("SELECT cost_cny FROM usage WHERE day=?", (day,)).fetchone()
+        return float(row["cost_cny"]) if row else 0.0
 
     def usage_all(self) -> list:
         return list(self.conn.execute("SELECT * FROM usage ORDER BY day DESC"))

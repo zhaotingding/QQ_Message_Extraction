@@ -17,6 +17,7 @@ sys.path.insert(0, str(PROJ / "src"))
 
 try:
     import tkinter as tk
+    from tkinter import ttk
 except ImportError:
     print("当前 Python 解释器不带 tkinter，无法运行界面测试。")
     print(f"  解释器：{sys.executable}")
@@ -57,6 +58,27 @@ check(
     str(sorted(data.get("filters", {}))),
 )
 check("保存内容不含辅助键", "skip_min" not in data.get("filters", {}))
+
+print("\n=== 设置页可滚动（窗口矮时「保存设置」不再被切掉）===")
+allw: list = []
+
+
+def walk_all(w) -> None:
+    for c in w.winfo_children():
+        allw.append(c)
+        walk_all(c)
+
+
+walk_all(root)
+canvases = [w for w in allw if isinstance(w, tk.Canvas)]
+check("设置页有滚动容器", len(canvases) >= 1, f"{len(canvases)} 个 Canvas")
+check("滚动容器已设滚动区域", bool(canvases and canvases[0].cget("scrollregion")),
+      str(canvases[0].cget("scrollregion")) if canvases else "")
+wheel_bound = [w for w in allw if w.bind("<MouseWheel>") and not isinstance(w, (tk.Text, tk.Listbox))]
+check("滚轮已绑到设置页控件上", len(wheel_bound) >= 5, f"{len(wheel_bound)} 个控件")
+buttons = [str(w.cget("text")) for w in allw if isinstance(w, ttk.Button)]
+check("有增量摘要按钮", any("生成摘要" in b for b in buttons), str(buttons))
+check("有全量重做按钮", any("全量" in b for b in buttons))
 
 print("\n=== 显示刷新（用假数据）===")
 app._apply_health(None)

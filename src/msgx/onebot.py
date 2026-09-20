@@ -115,16 +115,15 @@ async def _alerts(request: web.Request) -> web.Response:
 
 async def _summary_now(request: web.Request) -> web.Response:
     pipe = request.app["pipe"]
-    kind = request.query.get("kind", "full")
+    kind = request.query.get("kind", "digest")
     if kind == "daily":
         path = await pipe.summarizer.run_daily()
         return web.json_response({"ok": True, "path": path})
     if kind == "periodic":
         created = await pipe.summarizer.run_periodic(force=True)
         return web.json_response({"ok": True, "created": created})
-    # 默认 full：手动点击意味着「把手上已有的东西总结给我」，
-    # 走全量情报总结，不受各群增量窗口与条数门槛的限制。
-    item = await pipe.summarizer.run_full()
+    # digest（默认）= 接着上次已总结过的消息做增量纪要；full = 近 24h 全量重做
+    item = await pipe.summarizer.run_digest(full=(kind == "full"))
     return web.json_response({"ok": True, "created": [item] if item else []})
 
 

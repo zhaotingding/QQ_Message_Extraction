@@ -33,9 +33,12 @@ DEFAULTS: dict = {
         "api_key_env": "DEEPSEEK_API_KEY",
         "api_key": "",
         "max_daily_cost_cny": 10.0,
-        "price_in_usd_per_mtok": 0.22,
-        "price_out_usd_per_mtok": 0.66,
-        "usd_to_cny": 7.2,
+        # DeepSeek 官方峰谷 + 缓存命中的三档计价（元/百万 token，空闲时段价）
+        "price_cache_hit_cny_per_mtok": 0.02,
+        "price_cache_miss_cny_per_mtok": 1.00,
+        "price_output_cny_per_mtok": 4.00,
+        "peak_multiplier": 2.0,
+        "peak_windows_utc": "01:00-04:00,06:00-10:00",
         "timeout_seconds": 90,
     },
     "media": {
