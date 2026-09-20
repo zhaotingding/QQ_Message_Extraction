@@ -1012,6 +1012,36 @@ class App:
         想看完整输出就在设置页取消勾选「隐藏控制台窗口启动」。
         """
         visible = not bool(self.v_napcat_hidden.get())
+
+        # 启动前先问一句「是不是已经在跑了」。
+        # 点一次 = 注入一份 NapCat **并且再拉起一份 QQ**；用户看到「没反应」很容易反复点，
+        # 于是多份实例并存、各自往 cache/qrcode.png 写二维码互相覆盖 ——
+        # 扫哪一次都可能立刻被下一次覆盖掉，谁也登不上。表现恰好就是
+        # 「点了很多次，消息一直不来」。所以这里必须拦一下，而不是默默再注入一份。
+        try:
+            ri = napcat_mod.running_instances()
+        except Exception:  # noqa: BLE001  查不到就当没有，不要因此拦住正常启动
+            ri = {"injectors": 0, "qq": 0, "any": False}
+        if ri.get("injectors"):
+            n = int(ri["injectors"])
+            tail = (
+                "已经有 %d 个了，说明之前点过多次。\n"
+                "多份实例会互相覆盖二维码，导致扫码无效、消息一直不来。\n"
+                "建议：先把它们全部关掉，再启动一次、只扫一次码。" % n
+                if n >= 2
+                else "如果你只是想重新扫码，更好的做法是先关掉这一份，再启动。"
+            )
+            if not messagebox.askyesno(
+                "协议端似乎已经在运行",
+                "检测到已有 %d 个 NapCat 注入器、%d 个 QQ.exe 进程。\n\n"
+                "再启动会再注入一份 NapCat，并再拉起一份 QQ。\n\n%s\n\n仍要再启动一个吗？"
+                % (n, int(ri.get("qq") or 0), tail),
+                parent=self.root,
+            ):
+                self._log_ui("[界面] 已取消启动（检测到已有 %d 个协议端实例）\n" % n)
+                self.status.set("已取消：协议端看起来已在运行，无需重复启动")
+                return
+
         self._log_ui(f"[界面] 正在启动协议端（{'可见' if visible else '隐藏'}模式）…\n")
         self.status.set("已请求启动 NapCat —— 请在 UAC 窗口点「是」，再完成扫码登录")
         try:

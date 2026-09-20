@@ -38,10 +38,14 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 from pathlib import Path
 
 from .config import ROOT
+
+# 起子进程查进程表时不要闪出控制台窗口（本模块整个存在的意义就是「没有黑框」）
+_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 # 关键文件清单（缺任何一个都说明 NapCat 解压不完整）
 REQUIRED_FILES = (
@@ -194,6 +198,52 @@ def preflight(dir_: Path | None, cfg: dict) -> dict:
     return out
 
 
+# ---------------------------------------------------------------- 已在运行？
+
+def _tasklist_count(image: str) -> int:
+    """``tasklist`` 数一下某个进程名有多少个实例。查不到就返回 0（不抛异常）。
+
+    用 ``tasklist`` 而不是 ``wmic``：本机 ``wmic.exe`` 已被安全策略拉黑。
+    ``/FI`` 过滤 + ``/FO CSV /NH`` 便于解析；输出为空时 tasklist 会打印一行
+    ``INFO: No tasks are running…``（中文系统是「信息: 没有运行的任务…」），
+    这类行里不含进程名，过滤掉即可。
+    """
+    try:
+        p = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    n = 0
+    for line in (p.stdout or "").splitlines():
+        if image.lower() in line.lower():
+            n += 1
+    return n
+
+
+def running_instances() -> dict:
+    """检测**此刻**是否已有协议端实例在跑。返回 ``{"injectors", "qq", "any"}``。
+
+    为什么需要它：点一次「启动协议端」= 注入一份 ``NapCatWinBootMain.exe`` **并且再拉起
+    一份 QQ**。用户看到「没反应」时很自然的反应是反复点 —— 于是变成多份实例并存。
+    多份实例各自往 ``<dir>/cache/qrcode.png`` 写二维码、互相覆盖，
+    结果是**扫哪一次都可能立刻被下一份覆盖掉，谁也登不上去**，
+    表现恰好就是「点了很多次，消息一直不来」。
+
+    所以界面在启动前先问一句，而不是默默再注入一份。
+
+    ``injectors`` = ``NapCatWinBootMain.exe`` 的实例数：
+      0 = 还没启动过；1 = 正常；**≥2 = 重复启动过，建议先清理**。
+    """
+    injectors = _tasklist_count("NapCatWinBootMain.exe")
+    qq = _tasklist_count("QQ.exe")
+    return {"injectors": injectors, "qq": qq, "any": injectors > 0}
+
+
 # ---------------------------------------------------------------- 日志
 
 def _append_log(path: Path, text: str) -> None:
@@ -246,10 +296,44 @@ def log_tail(cfg: dict, lines: int = 400) -> str:
         out.append(f"（还没有启动记录：{lp} 不存在 —— 说明还没从界面启动过协议端）")
 
     d = resolve_dir(cfg)
-    own = napcat_own_log(d)
     out.append("")
+    # 先给出**当前进程**实况。它比日志有用得多，也是判断「是否重复启动过」的唯一依据。
+    try:
+        ri = running_instances()
+        note = ""
+        if ri["injectors"] >= 2:
+            note = "  ← 重复启动过多份！建议全部关掉后只启动一次（多份会互相覆盖二维码）"
+        elif ri["injectors"] == 1:
+            note = "  ← 正常"
+        out.append(
+            "===== 当前进程 =====\n"
+            f"  NapCat 注入器（NapCatWinBootMain.exe）: {ri['injectors']} 个{note}\n"
+            f"  QQ.exe                              : {ri['qq']} 个"
+        )
+    except Exception as e:  # noqa: BLE001
+        out.append(f"===== 当前进程 =====\n（查询失败：{type(e).__name__}: {e}）")
+
+    out.append("")
+    own = napcat_own_log(d)
     if own is None:
-        out.append(f"===== NapCat 自身日志 =====\n（未找到 {d or '?'}\\logs\\ —— 协议端可能从未成功启动过）")
+        # ⚠️ 这里**绝不能**下「协议端从未启动过」的结论。
+        # NapCat 4.x 默认不把运行日志落盘，所以 logs\ 空着是常态。之前写成
+        # 「未找到 logs\ —— 协议端可能从未成功启动过」，把一个「没有证据」当成了
+        # 「否定的证据」，直接误导用户（消息明明一直在进，却让他以为协议端没起来）。
+        # 判断「是否在跑」只该看进程与实际入库的消息，不该看日志文件在不在。
+        if d is None:
+            why = "（未配置 [napcat] dir，无法定位 NapCat 目录）"
+        elif not (d / "logs").is_dir():
+            why = f"（{d}\\logs\\ 目录不存在）"
+        else:
+            why = f"（{d}\\logs\\ 是空目录）"
+        out.append(
+            "===== NapCat 自身日志 =====\n"
+            + why
+            + "\nNapCat 4.x 默认不往这里写日志 —— 看不到日志 **不等于** 协议端没启动。\n"
+            "判断协议端是否正常，请看上面的「当前进程」「启动记录」，"
+            "以及运行状态页的「协议端(NapCat)」是否已连接。"
+        )
     else:
         out.append(f"===== NapCat 自身日志（{own}）=====")
         try:
@@ -310,12 +394,23 @@ def launch(cfg: dict, visible: bool = False) -> dict:
 
     # --- 隐藏模式（默认）---
     pf = preflight(d, cfg)
+    # 把「启动前已经有多少个实例」记进日志。事后回看时，这一行能直接解释
+    # 「为什么消息一直不来」——重复启动的每一次都留了痕。
+    try:
+        ri = running_instances()
+        prior = (
+            f"  启动前 : 已有 {ri['injectors']} 个 NapCat 注入器 / {ri['qq']} 个 QQ.exe"
+            + ("  ⚠️ 这是重复启动\n" if ri["injectors"] >= 1 else "\n")
+        )
+    except Exception:  # noqa: BLE001
+        prior = ""
     detail = (
         header
         + "  模式   : 隐藏（无控制台窗口）\n"
         + f"  目录   : {pf['dir'] or '(未配置)'}\n"
         + f"  QQ     : {pf['qq'] or '(未能从注册表推导出 QQ.exe)'}\n"
         + f"  缺失   : {', '.join(pf['missing']) if pf['missing'] else '无'}\n"
+        + prior
     )
     _append_log(lp, detail)
 

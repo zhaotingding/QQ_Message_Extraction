@@ -350,6 +350,109 @@ check("明确配了目录就原样返回（不猜测）",
       N.resolve_dir({"napcat": {"dir": r"Z:\__msgx_nope__"}}) == Path(r"Z:\__msgx_nope__"),
       str(N.resolve_dir({"napcat": {"dir": r"Z:\__msgx_nope__"}})))
 
+# ---------------------------------------------------------------------------
+# v0.5.2：点一次「启动协议端」= 注入一份 NapCat **并且再拉起一份 QQ**。
+# 用户看到「没反应」很容易反复点 → 多份实例并存、各自写 cache/qrcode.png 互相覆盖
+# → 扫哪一次都被覆盖，谁也登不上，表现恰好是「点了很多次、消息一直不来」。
+# 所以：① 启动前要能查「是不是已经在跑了」；② 界面要拦一下；③ 日志页不能再拿
+# 「logs 目录是空的」当成「协议端从未启动过」的证据（这个错误结论真的误导过用户）。
+# ---------------------------------------------------------------------------
+print("\n=== 检测「协议端是否已在运行」（v0.5.2）===")
+import subprocess as _sp  # noqa: E402
+
+_orig_sp_run = _sp.run
+_orig_running = N.running_instances
+_orig_launch = N.launch
+
+
+class _FakeProc:
+    def __init__(self, stdout: str) -> None:
+        self.stdout = stdout
+        self.returncode = 0
+
+
+def _patch_tasklist(stdout: str) -> None:
+    _sp.run = lambda *a, **k: _FakeProc(stdout)  # type: ignore[assignment]
+
+
+# 没有匹配进程时 tasklist 会打印一行「INFO: ...」/「信息: ...」——那不是进程
+_patch_tasklist("INFO: No tasks are running which match the specified criteria.\n")
+check("没有匹配进程时计数为 0（不把 INFO 行当进程）", N._tasklist_count("QQ.exe") == 0, "")
+_patch_tasklist("信息: 没有运行的任务匹配指定标准。\n")
+check("中文系统的「信息:」行同样不计数", N._tasklist_count("QQ.exe") == 0, "")
+_patch_tasklist('"QQ.exe","11","Console","1","1 K"\n"QQ.exe","22","Console","1","1 K"\n')
+check("两行进程就数出 2 个", N._tasklist_count("QQ.exe") == 2, str(N._tasklist_count("QQ.exe")))
+_patch_tasklist('"NapCatWinBootMain.exe","9","Console","1","1 K"\n')
+_ri = N.running_instances()
+check("running_instances 报告注入器数量", _ri["injectors"] == 1, str(_ri))
+check("running_instances 的 any 由注入器决定", _ri["any"] is True, str(_ri))
+_patch_tasklist("")
+_ri0 = N.running_instances()
+check("没有实例时 injectors=0 且 any=False", _ri0["injectors"] == 0 and _ri0["any"] is False, str(_ri0))
+_sp.run = _orig_sp_run  # type: ignore[assignment]
+
+print("\n=== 日志页：不得把「logs 空着」当成「协议端没启动」的证据 ===")
+N.running_instances = lambda: {"injectors": 0, "qq": 0, "any": False}  # type: ignore[assignment]
+_empty = tempfile.mkdtemp()
+os.makedirs(os.path.join(_empty, "logs"), exist_ok=True)
+_txt = N.log_tail({"napcat": {"dir": _empty, "log_file": os.path.join(tmpd, "n2.log")}})
+check("不再断言「协议端可能从未成功启动过」", "从未成功启动" not in _txt, _txt[-160:])
+check("解释「看不到日志 ≠ 没启动」", "不等于" in _txt, _txt[-200:])
+check("给出当前进程实况（重复启动一眼可见）", "当前进程" in _txt, _txt[-260:])
+check("区分「空目录」这一情形", "空目录" in _txt, _txt[-200:])
+_gone = os.path.join(tempfile.mkdtemp(), "__nope__")
+_txt2 = N.log_tail({"napcat": {"dir": _gone, "log_file": os.path.join(tmpd, "n3.log")}})
+check("目录不存在时说的是「目录不存在」而不是「空目录」",
+      "目录不存在" in _txt2 and "空目录" not in _txt2, _txt2[-200:])
+# 注意：dir 留空时 resolve_dir 会去探测常见安装位置，所以这里不一定是「未配置」分支。
+# 要保证的只是「给出可读说明」且「不把日志缺失当成没启动的证据」。
+_txt3 = N.log_tail({"napcat": {"dir": "", "log_file": os.path.join(tmpd, "n4.log")}})
+check("dir 留空时仍给出可读说明且不下否定结论",
+      ("未配置" in _txt3 or "logs" in _txt3) and "从未成功启动" not in _txt3, _txt3[-160:])
+N.running_instances = _orig_running  # type: ignore[assignment]
+
+print("\n=== 启动前拦截重复注入（v0.5.2）===")
+app.cfg["napcat"] = {"dir": ""}  # 不监视二维码，避免测试里弹窗
+_calls = {"n": 0}
+
+
+def _fake_launch(*a, **k):
+    _calls["n"] += 1
+    return {"ok": True, "note": "stub"}
+
+
+N.launch = _fake_launch  # type: ignore[assignment]
+import tkinter.messagebox as _mb  # noqa: E402
+
+_orig_ask = _mb.askyesno
+_asked = {"n": 0}
+
+
+def _ask_no(*a, **k):
+    _asked["n"] += 1
+    return False
+
+
+N.running_instances = lambda: {"injectors": 3, "qq": 12, "any": True}  # type: ignore[assignment]
+_mb.askyesno = _ask_no  # type: ignore[assignment]
+app.start_napcat()
+check("检测到已有实例时先问一句", _asked["n"] == 1, str(_asked))
+check("用户选「否」时不再注入一份", _calls["n"] == 0, str(_calls))
+check("取消时状态栏说清原因", "已在运行" in app.status.get() or "取消" in app.status.get(),
+      app.status.get())
+
+_mb.askyesno = lambda *a, **k: True  # type: ignore[assignment]
+app.start_napcat()
+check("用户确认「是」时照旧启动（不挡用户）", _calls["n"] == 1, str(_calls))
+
+N.running_instances = lambda: {"injectors": 0, "qq": 0, "any": False}  # type: ignore[assignment]
+app.start_napcat()
+check("没有实例时不打扰用户、直接启动", _calls["n"] == 2, str(_calls))
+
+_mb.askyesno = _orig_ask  # type: ignore[assignment]
+N.running_instances = _orig_running  # type: ignore[assignment]
+N.launch = _orig_launch  # type: ignore[assignment]
+
 root.update()
 root.destroy()
 
