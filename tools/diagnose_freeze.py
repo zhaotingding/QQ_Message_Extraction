@@ -155,8 +155,11 @@ def probe() -> tuple[str, str]:
         time.sleep(0.5)
         c1 = (health() or {}).get("counters") or {}
         if c1.get("received", 0) > c0["received"]:
-            extra = "（判定为重复消息，未新增记录）" if c1.get("duplicate", 0) > c0["duplicate"] \
-                else "（新增 1 条记录）"
+            first = c1.get("stored", 0) > c0["stored"]
+            extra = ("（新增 1 条记录 —— 这是**唯一**一次：探针的 msg_id 固定，"
+                     "之后重复运行会被判为重复消息而不再入库；不想留这条就把 "
+                     f"群 {ev['group_id']} 里那条【链路自检】删掉）"
+                     if first else "（判定为重复消息，未新增记录）")
             return ("alive", f"received {c0['received']} → {c1['received']}{extra} ⇒ ingest 消费者【活着】")
     return ("dead", "6 秒内 received / stored / filtered 全都没动 ⇒ 事件进了队列但【没有消费者】")
 
