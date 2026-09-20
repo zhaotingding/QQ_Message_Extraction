@@ -1031,9 +1031,12 @@ class App:
                 if n >= 2
                 else "如果你只是想重新扫码，更好的做法是先关掉这一份，再启动。"
             )
+            # QQ.exe 天然会有 3~4 个（1 个主进程 + 渲染/GPU 等辅助进程），单看这个数字
+            # 会让人以为「怎么这么多」，所以只在注入器数上做判断，并把后者写明。
             if not messagebox.askyesno(
                 "协议端似乎已经在运行",
-                "检测到已有 %d 个 NapCat 注入器、%d 个 QQ.exe 进程。\n\n"
+                "检测到已有 %d 个 NapCat 注入器、%d 个 QQ.exe 进程"
+                "（QQ.exe 通常有 3~4 个辅助进程，属正常）。\n\n"
                 "再启动会再注入一份 NapCat，并再拉起一份 QQ。\n\n%s\n\n仍要再启动一个吗？"
                 % (n, int(ri.get("qq") or 0), tail),
                 parent=self.root,

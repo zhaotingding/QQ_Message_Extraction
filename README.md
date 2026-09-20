@@ -382,6 +382,8 @@ llm_review_min_score = 2   # 规则分达到多少才交给模型复核（直接
 | 生成日报 | — | `python -m msgx.main summary --kind daily` |
 | 清理过期数据 | — | `python -m msgx.main prune` |
 | 灌注演示数据 | — | `python tools/make_demo.py --post --reset` |
+| **诊断「消息不来了」** | — | `python tools\diagnose_freeze.py` |
+| 清理重复的协议端实例 | — | `python tools\kill_dup_napcat.py --elevate` |
 | 跑测试 | — | `python tests/run_all.py` |
 
 > 命令行方式需要先 `set PYTHONPATH=src`，或执行一次 `pip install -e .`（之后就不用管 PYTHONPATH 了）。
@@ -566,7 +568,7 @@ llm_review_min_score = 2   # 规则分达到多少才交给模型复核（直接
 .venv\Scripts\python.exe tests\run_all.py
 ```
 
-八组测试，**291 项检查**，零额外依赖（不需要 pytest）：
+八组测试，**298 项检查**，零额外依赖（不需要 pytest）：
 
 | 测试 | 覆盖内容 |
 |---|---|
@@ -631,6 +633,8 @@ python tools/make_demo.py --post --reset
 │   ├── start_napcat.bat      ← NapCat 启动包装器（可见排障模式，带自检 + pause）
 │   ├── napcat_hidden.vbs     ← 隐藏启动器（由 napcat.py 按需重写，纯 ASCII）
 │   ├── check_napcat_env.py   ← NapCat 环境体检（只读）
+│   ├── diagnose_freeze.py    ← 「消息不来了」一条命令诊断（进程/连接/队列探针/二维码/库）
+│   ├── kill_dup_napcat.py    ← 清理重复启动的协议端实例（--elevate 自提权）
 │   ├── START_HERE.cmd/.vbs   ← 备用入口（默认开界面，--cli 进菜单）
 │   ├── 启动服务.bat          ← 备用：只跑服务，无界面
 │   └── 查看状态.bat          ← 备用：查看状态与用量
@@ -749,14 +753,30 @@ curl http://127.0.0.1:6701/health
 
 ### 消息好像冻结了 / 实时消息页不再更新
 
-先按这个顺序看（**别急着反复点「启动协议端」**）：
+**先跑这一条命令**，它会自己按顺序排除，并给出「结论 + 处置」：
+
+```powershell
+python tools\diagnose_freeze.py
+```
+
+它依次看：进程归属（注入器几份、`QQ.exe` 是不是全由注入器拉起）、
+连接条数、**队列探针**（往 `/onebot` 发一条固定 id 的事件，看 `received` 涨不涨 ——
+这一步能区分「事件没从协议端出来」和「事件进了队列但没人取」）、
+二维码是否在刷新、数据库最后一条消息的时间。约 10 秒出结果。
+
+想自己对照着看时，按这个顺序（**别急着反复点「启动协议端」**）：
 
 | 看哪里 | 正常 | 说明什么 |
 |---|---|---|
 | 运行状态页「协议端(NapCat)」 | 已连接 | 已连接**也可能没有消息** —— 见下 |
 | 实时消息页「更新于 HH:MM:SS」 | 时间在走 | 时间不动 = 界面与服务失联，不是消息的问题 |
 | 协议端日志 →「当前进程」 | 注入器 1 个 | **≥2 个 = 之前连点过，先全部关掉** |
+| `http://127.0.0.1:6701/health` | `ws_conns` 与 `ws_peers` 个数相等 | **`ws_conns` 更大 = 有重复实例在连** |
 | `python -m msgx.main stats` | `received` 在增长 | `received` 长时间为 0 就是真的没事件进来 |
+
+> ⚠️ `ws_peers` 是**去重后的 IP 集合**：多份 NapCat 都从 `127.0.0.1` 连进来时
+> 它也只有一个元素，看起来和「1 份正常连接」一模一样。**要看 `ws_conns`（连接条数）。**
+> 这是 v0.5.2 那次「消息冻结」最费时间的一个盲点。
 
 最常见的形态是：**状态显示「已连接」，消息却停了** —— 这多半是 **QQ 登录态掉了**，
 NapCat 退回「等扫码」。确认方法：看 `<NapCat 目录>\cache\qrcode.png` 的修改时间，
@@ -768,16 +788,24 @@ NapCat 退回「等扫码」。确认方法：看 `<NapCat 目录>\cache\qrcode.
 > 扫哪一次都可能立刻被下一份覆盖掉，结果**谁也登不上去**，看起来就是「点了很多次都没用」。
 > v0.5.2 起，界面检测到已有实例时会先弹确认框拦住你；协议端日志页也会直接列出实例个数。
 
-要清理重复实例：
+要清理重复实例（**需要管理员权限** —— 这些进程由提权后的 NapCat 拉起，普通权限杀不掉）：
 
 ```powershell
-python tools\kill_dup_napcat.py          # 先看有多少个（不动任何东西）
-python tools\kill_dup_napcat.py --yes    # 确认后结束它们
+python tools\kill_dup_napcat.py            # 先看有多少个（不动任何东西）
+python tools\kill_dup_napcat.py --elevate  # 自己请求管理员权限再干（弹一次 UAC，点「是」）
 ```
 
-（也可以自己到任务管理器里结束**所有** `NapCatWinBootMain.exe` 与 `QQ.exe`。）
+（也可以在管理员终端里用 `--yes`，或直接到任务管理器结束**所有**
+`NapCatWinBootMain.exe` 与 `QQ.exe`。顺序无所谓于结果，但脚本会**先杀注入器再杀 QQ** ——
+反过来的话注入器还活着会把 QQ 重新拉起来。）
+
 清空后只启动**一次**、只扫**一次**码。
 本项目从不发消息，重新扫码登录只是重建接收通道，代价约一分钟。
+
+> 正常状态下 `QQ.exe` 本来就有 **3~4 个**（1 主进程 + 渲染/GPU 等辅助进程），
+> 只有 `NapCatWinBootMain.exe` 的个数才有诊断意义（0 = 没启动过 / 1 = 正常 / ≥2 = 连点过）。
+> 顺带说一句：`<NapCat 目录>\logs\` 原本一直是空的 —— NapCat 4.x **默认不落盘**。
+> 现在 `config\napcat.json` 里已把 `fileLog` 打开（级别 `info`），协议端自己的日志才查得到。
 
 ### NapCat 窗口一闪而过
 

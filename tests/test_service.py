@@ -104,6 +104,13 @@ def main() -> int:
 
     check("服务启动且 /health 可达", bool(health), f"耗时 {time.time() - started:.1f}s")
     check("health 含 ws_peers（供界面显示协议端状态）", "ws_peers" in health, str(health.get("ws_peers")))
+    # ws_peers 是**去重后的 IP 集合**：7 份 NapCat 都从 127.0.0.1 连进来时它也只有一个元素，
+    # 看起来和「1 份正常连接」一模一样 —— 2026-09-21 那次「消息冻结」就卡在这个盲点上。
+    # 连接**条数**必须单独给出：两个数不等 ⇒ 有重复实例。
+    check("health 含 ws_conns（连接条数，排查重复实例的关键）",
+          isinstance(health.get("ws_conns"), int), str(health.get("ws_conns")))
+    check("health 含 queue（队列积压；消费者死了它会一直涨而 received 不动）",
+          isinstance(health.get("queue"), int), str(health.get("queue")))
     check("health 含 filtered 计数", "filtered" in (health.get("counters") or {}))
     check("health 的 groups 计数正确（新库应为 0）", health.get("stats", {}).get("groups") == 0,
           str(health.get("stats")))
@@ -200,19 +207,20 @@ def main() -> int:
     # 所有活动连接结束，WS 处理器 `async for raw in ws` 在 NapCat 不断线时永不返回
     # —— 曾导致停止服务卡 39 秒（直到心跳报 No PONG 才解开）。
     # 所以这里必须**握着一条连接**去停，才能测出该缺陷。
-    holder: subprocess.Popen | None = None
-    if proc.poll() is None:
-        holder_code = (
-            "import asyncio, sys, aiohttp\n"
-            "async def m():\n"
-            "    async with aiohttp.ClientSession(trust_env=False) as s:\n"
-            "        async with s.ws_connect(sys.argv[1], timeout=5) as ws:\n"
-            "            print('HOLDING', flush=True)\n"
-            "            async for msg in ws:\n"
-            "                pass\n"
-            "asyncio.run(m())\n"
-        )
-        holder = subprocess.Popen(
+    holders: list[subprocess.Popen] = []
+    holder_code = (
+        "import asyncio, sys, aiohttp\n"
+        "async def m():\n"
+        "    async with aiohttp.ClientSession(trust_env=False) as s:\n"
+        "        async with s.ws_connect(sys.argv[1], timeout=5) as ws:\n"
+        "            print('HOLDING', flush=True)\n"
+        "            async for msg in ws:\n"
+        "                pass\n"
+        "asyncio.run(m())\n"
+    )
+
+    def spawn_holder() -> subprocess.Popen:
+        return subprocess.Popen(
             [str(PY), "-u", "-c", holder_code, f"ws://127.0.0.1:{ws_port}/onebot/ws"],
             cwd=str(PROJ),
             env=env,
@@ -222,18 +230,41 @@ def main() -> int:
             encoding="utf-8",
             errors="replace",
         )
-        op2 = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        peers: list = []
-        for _ in range(20):
+
+    def wait_conns(target: int, tries: int = 24) -> dict:
+        """等 /health 的 ws_conns 到 target，返回最后一次拿到的 health。"""
+        h: dict = {}
+        for _ in range(tries):
             time.sleep(0.5)
             try:
-                with op2.open(f"http://127.0.0.1:{http_port}/health", timeout=1.5) as r:
-                    peers = json.loads(r.read().decode("utf-8")).get("ws_peers") or []
+                with urllib.request.build_opener(
+                    urllib.request.ProxyHandler({})
+                ).open(f"http://127.0.0.1:{http_port}/health", timeout=1.5) as r:
+                    h = json.loads(r.read().decode("utf-8"))
             except Exception:  # noqa: BLE001
-                pass
-            if peers:
-                break
-        check("测试客户端已挂上 WS（模拟 NapCat 在线）", bool(peers), str(peers))
+                continue
+            if (h.get("ws_conns") or 0) >= target:
+                return h
+        return h
+
+    if proc.poll() is None:
+        holders.append(spawn_holder())
+        h1 = wait_conns(1)
+        check("测试客户端已挂上 WS（模拟 NapCat 在线）",
+              bool(h1.get("ws_peers")), str(h1.get("ws_peers")))
+
+        # ⚠️ 这次「消息冻结」的真正盲点：ws_peers 是**去重后的 IP 集合**，
+        # 第二份 NapCat（同样来自 127.0.0.1）不会让它变长 —— 7 份实例和 1 份
+        # 在界面上显示得一模一样。所以契约必须是「连接条数」看得见。
+        holders.append(spawn_holder())
+        h2 = wait_conns(2)
+        check("两条 WS 连接时 ws_conns == 2",
+              h2.get("ws_conns") == 2, str(h2.get("ws_conns")))
+        check("同源 IP 的连接不会撑大 ws_peers（正是它会掩盖重复实例）",
+              len(h2.get("ws_peers") or []) == 1, str(h2.get("ws_peers")))
+        check("ws_conns > len(ws_peers) 可据此判定「有重复实例」",
+              (h2.get("ws_conns") or 0) > len(h2.get("ws_peers") or []),
+              f"conns={h2.get('ws_conns')} peers={h2.get('ws_peers')}")
 
     if proc.poll() is None:
         t0 = time.time()
@@ -251,7 +282,7 @@ def main() -> int:
     else:
         check("服务不应提前退出", False, f"提前退出，码 {proc.poll()}")
 
-    if holder is not None:
+    for holder in holders:
         if holder.poll() is None:
             holder.kill()
         try:

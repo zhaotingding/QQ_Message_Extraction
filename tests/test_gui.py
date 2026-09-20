@@ -425,18 +425,25 @@ N.launch = _fake_launch  # type: ignore[assignment]
 import tkinter.messagebox as _mb  # noqa: E402
 
 _orig_ask = _mb.askyesno
-_asked = {"n": 0}
+_asked = {"n": 0, "msg": ""}
 
 
 def _ask_no(*a, **k):
     _asked["n"] += 1
+    # 记下弹窗正文：文案本身也是契约的一部分（见下面的检查）
+    parts = [str(x) for x in a] + [str(v) for v in k.values()]
+    _asked["msg"] = "\n".join(parts)
     return False
 
 
 N.running_instances = lambda: {"injectors": 3, "qq": 12, "any": True}  # type: ignore[assignment]
 _mb.askyesno = _ask_no  # type: ignore[assignment]
 app.start_napcat()
-check("检测到已有实例时先问一句", _asked["n"] == 1, str(_asked))
+check("检测到已有实例时先问一句", _asked["n"] == 1, str(_asked["n"]))
+# 正常状态下 QQ.exe 就有 3~4 个（1 主进程 + 辅助进程），单看它会让人以为「怎么这么多」。
+# 判定只看注入器数，QQ.exe 的数量必须在文案里说明白，否则弹窗本身就成了新的误导源。
+check("弹窗说明了 QQ.exe 有辅助进程、数量多属正常",
+      "辅助进程" in _asked["msg"], _asked["msg"][:160])
 check("用户选「否」时不再注入一份", _calls["n"] == 0, str(_calls))
 check("取消时状态栏说清原因", "已在运行" in app.status.get() or "取消" in app.status.get(),
       app.status.get())
