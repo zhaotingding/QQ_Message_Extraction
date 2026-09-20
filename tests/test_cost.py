@@ -13,6 +13,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 PROJ = Path(__file__).resolve().parent.parent
@@ -133,6 +134,113 @@ check("已补偿的日期不被重复累加",
       abs(old.conn.execute("SELECT cost_cny FROM usage WHERE day='2026-09-19'").fetchone()[0]
           - 0.024169) < 1e-6)
 old.close()
+
+print("\n=== 余额差值法（v0.5.1：官方余额的下降量 = 真实消费）===")
+from msgx.billing import consumption_from_readings, daily_from_readings  # noqa: E402
+
+check("空读数 → 算不出，且明说不够", consumption_from_readings([])["enough"] is False)
+one = [{"ts": 100, "total": 20.0}]
+check("只有一个读数 → 够不着（一个点只能说明「当时有多少钱」）",
+      consumption_from_readings(one)["enough"] is False)
+check("只有一个读数 → 消费算作 0（不是负数）",
+      consumption_from_readings(one)["spent"] == 0)
+
+down = [{"ts": 1, "total": 20.0}, {"ts": 2, "total": 19.4}, {"ts": 3, "total": 19.1}]
+d = consumption_from_readings(down)
+check("余额下降被累加成消费", abs(d["spent"] - 0.9) < 1e-9, f"{d['spent']}")
+check("两个以上读数即可算", d["enough"] is True)
+
+up = [{"ts": 1, "total": 20.0}, {"ts": 2, "total": 30.0}]
+u = consumption_from_readings(up)
+check("余额上升不算消费（那是充值）", u["spent"] == 0)
+check("充值被单独记成 added", abs(u["added"] - 10.0) < 1e-9, f"{u['added']}")
+
+mixed = [
+    {"ts": 1, "total": 20.0},
+    {"ts": 2, "total": 19.5},   # 花 0.5
+    {"ts": 3, "total": 29.5},   # 充值 10
+    {"ts": 4, "total": 28.5},   # 花 1.0
+    {"ts": 5, "total": 28.5},   # 持平（余额只到分，可能读不出变化）
+]
+m = consumption_from_readings(mixed)
+check("充值夹在中间时不污染消费（只看下降量）", abs(m["spent"] - 1.5) < 1e-9, f"{m['spent']}")
+check("充值总额也算得出", abs(m["added"] - 10.0) < 1e-9, f"{m['added']}")
+check("读数个数被如实报告（界面据此标注）", m["points"] == 5)
+check("分辨率如实暴露为 0.01", m["resolution"] == 0.01)
+
+# 「今日」只统计当天读数：跨午夜那段含昨天的尾巴，算进来会让今天虚增
+rows = [
+    {"ts": 100, "total": 20.0, "day": "2026-09-19"},
+    {"ts": 200, "total": 18.0, "day": "2026-09-19"},
+    {"ts": 300, "total": 17.5, "day": "2026-09-20"},
+    {"ts": 400, "total": 17.0, "day": "2026-09-20"},
+]
+t = daily_from_readings(rows, "2026-09-20")
+check("今日只取当天读数", abs(t["spent"] - 0.5) < 1e-9, f"{t['spent']}")
+check("昨日那一大段下降不被算进今天", t["spent"] < 1.0)
+check("今日覆盖起点 = 当天第一条读数（界面据此标「自 HH:MM 起」）",
+      t["from_ts"] == 300, str(t["from_ts"]))
+
+
+def local_ts(y, m, d, hh, mm=0):
+    return int(time.mktime((y, m, d, hh, mm, 0, 0, 0, -1)))
+
+
+DAY = "2026-09-20"
+# 首次安装那天：程序 14:00 才起来，当天读数只覆盖半天
+half = [
+    {"ts": local_ts(2026, 9, 20, 14, 0), "total": 20.0, "day": DAY},
+    {"ts": local_ts(2026, 9, 20, 14, 10), "total": 19.6, "day": DAY},
+]
+h = daily_from_readings(half, DAY)
+check("中途才启动 → 算得出但不算「完整一天」", h["enough"] is True and h["full_day"] is False,
+      f"delay={h['anchor_delay']}s")
+check("锚点延迟被如实暴露（界面/上层据此回落估算）", h["anchor_delay"] >= 13 * 3600,
+      str(h["anchor_delay"]))
+
+full = [
+    {"ts": local_ts(2026, 9, 20, 0, 5), "total": 20.0, "day": DAY},
+    {"ts": local_ts(2026, 9, 20, 23, 55), "total": 19.0, "day": DAY},
+]
+f = daily_from_readings(full, DAY)
+check("全天在跑（起点 00:05）→ 视为完整一天", f["full_day"] is True, f"delay={f['anchor_delay']}s")
+check("完整一天时今日消费即真实值", abs(f["spent"] - 1.0) < 1e-9, f"{f['spent']}")
+check("当天没有读数 → 不完整", daily_from_readings([], DAY)["full_day"] is False)
+check("完整性的宽限可调（给 20 小时宽限时半天也算满）",
+      daily_from_readings(half, DAY, anchor_slack=20 * 3600)["full_day"] is True)
+check("当天只有一条读数的日期算不出", daily_from_readings(rows[:3], "2026-09-21")["enough"] is False)
+check("当天只有一条读数时也不算完整一天",
+      daily_from_readings([{"ts": 300, "total": 17.5, "day": DAY}], DAY)["full_day"] is False)
+
+print("\n=== 把差值补成完整区间（否则首日「累计」会显示 ¥0.00）===")
+cb = Store(os.path.join(tmp, "prior.db"))
+cb.add_usage("2026-09-18", 1000, 100, 0.5, 0, 1000)
+cb.add_usage("2026-09-19", 1000, 100, 0.25, 0, 1000)
+cb.add_usage("2026-09-20", 1000, 100, 0.9, 0, 1000)
+check("cost_before 只累加指定日期之前的估算", abs(cb.cost_before("2026-09-20") - 0.75) < 1e-9,
+      f"{cb.cost_before('2026-09-20')}")
+check("cost_before 不含当天（当天由差值覆盖）", abs(cb.cost_before("2026-09-20") - 0.75) < 1e-9)
+check("cost_before 对最早一天返回 0", cb.cost_before("2026-09-18") == 0)
+check("cost_before 对未知日期返回全部历史", abs(cb.cost_before("2030-01-01") - 1.65) < 1e-9,
+      f"{cb.cost_before('2030-01-01')}")
+check("累积口径：差值 + 起点前的估算 = 更完整的累计",
+      abs(cb.cost_before("2026-09-19") + 0.4 - 0.9) < 1e-9,
+      f"{cb.cost_before('2026-09-19')} + 0.4")
+cb.close()
+
+print("\n=== 读数落库（差值法的原料）===")
+bs = Store(os.path.join(tmp, "bal.db"))
+check("首次写入成功", bs.record_balance(1000, 20.0, 20.0, 0.0) is True)
+check("同一秒重复写入被主键挡掉（幂等）", bs.record_balance(1000, 20.0, 20.0, 0.0) is False)
+bs.record_balance(2000, 19.4, 19.4, 0.0)
+bs.record_balance(3000, 19.1, 19.1, 0.0)
+rl = bs.balance_readings()
+check("读数按时间升序返回", [r["ts"] for r in rl] == [1000, 2000, 3000], str([r["ts"] for r in rl]))
+check("落库后能直接算出消费", abs(consumption_from_readings(rl)["spent"] - 0.9) < 1e-9)
+check("balance_last 取最新一条", bs.balance_last()["ts"] == 3000)
+check("按天过滤可用", len(bs.balance_readings(time.strftime("%Y-%m-%d", time.localtime(1000)))) == 3)
+check("剪枝有返回且不报错", isinstance(bs.prune_balance(keep_days=400), int))
+bs.close()
 
 print("\n=== 摘要游标分轨（增量纪要的起点）===")
 s = Store(os.path.join(tmp, "cur.db"))

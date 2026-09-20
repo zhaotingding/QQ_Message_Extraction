@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 PROJ = Path(__file__).resolve().parent.parent
@@ -174,6 +175,77 @@ app._apply_billing({
 check("拿不到平台数据时标注估算", "估算" in app.v_cost.get(), app.v_cost.get())
 check("拿不到余额时说明原因而不是留空", "API Key" in app.v_balance.get(), app.v_balance.get())
 check("抓取失败原因呈现在状态栏", "platform_token" in app.status.get(), app.status.get())
+
+# v0.5.1 差值法：没有 platform_token 时，日/累计应是**真实值**而不是估算。
+# 这是用户直接质疑过的那句「只能显示本地估算」——它当时说得太满。
+print("\n=== 账单显示：余额差值法（v0.5.1）===")
+_TODAY_FROM = int(time.time()) - 6 * 3600     # 今天 6 小时前 = 覆盖起点
+_TOTAL_FROM = int(time.time()) - 3 * 86400    # 累计从 3 天前开始
+app._apply_billing({
+    "source": "balance_diff", "today_source": "balance_diff", "total_source": "balance_diff",
+    "today_cny": 0.64, "total_cny": 0.66,
+    "platform_error": "未配置 platform_token（消费明细拿不到；今日/累计已改用余额差值推算）",
+    "balance_diff": {
+        "today_cny": 0.64, "total_cny": 0.66, "enough": True, "today_enough": True,
+        "points": 37, "resolution": 0.01,
+        "today_from": _TODAY_FROM, "total_from": _TOTAL_FROM,
+    },
+    "balance": {"ok": True, "total": 15.83, "error": ""},
+})
+check("今日花费用余额差值口径", "0.64" in app.v_cost.get() and "余额差值" in app.v_cost.get(),
+      app.v_cost.get())
+check("不再标成「估算」", "估算" not in app.v_cost.get(), app.v_cost.get())
+check("起点不是 00:00 时标出「自 HH:MM 起」（否则半天会被当成一整天）",
+      "自" in app.v_cost.get(), app.v_cost.get())
+check("累计花费同样标余额差值并给出起点日期",
+      "0.66" in app.v_total.get() and "自" in app.v_total.get(), app.v_total.get())
+check("状态栏说清「明细没取到但日/累计是真实的」（不再一杆子打成都估算）",
+      "余额差值" in app.status.get() and "明细" in app.status.get(), app.status.get())
+check("状态栏给出读数个数（便于判断可信度）", "37" in app.status.get(), app.status.get())
+
+# 刚装上的时候读数不够两个：今日必须老实回落到估算，累计若够则仍可显示真实。
+app._apply_billing({
+    "source": "balance_diff", "today_source": "estimate", "total_source": "balance_diff",
+    "today_cny": 0.12, "total_cny": 0.66,
+    "platform_error": "未配置 platform_token",
+    "balance_diff": {
+        "today_cny": 0.0, "total_cny": 0.66, "enough": True, "today_enough": False,
+        "points": 9, "resolution": 0.01, "today_from": 0, "total_from": _TOTAL_FROM,
+    },
+    "balance": {"ok": True, "total": 15.83, "error": ""},
+})
+check("今日读数不够时今日单独回落估算（两个数字各标各的口径）",
+      "估算" in app.v_cost.get() and "余额差值" in app.v_total.get(),
+      f"{app.v_cost.get()} | {app.v_total.get()}")
+
+# 累计的起点之前没有读数，那段只能用估算补齐 —— 此时整个数字是「真实 + 估算」，
+# 不能再标成纯「余额差值」（这是同一类"说得太满"的错误）。
+app._apply_billing({
+    "source": "balance_diff", "today_source": "balance_diff", "total_source": "balance_diff",
+    "today_cny": 0.64, "total_cny": 0.99,
+    "platform_error": "未配置 platform_token",
+    "balance_diff": {
+        "today_cny": 0.64, "total_cny": 0.24, "enough": True, "today_enough": True,
+        "today_full_day": True, "points": 37, "resolution": 0.01,
+        "today_from": _TODAY_FROM, "total_from": _TOTAL_FROM,
+        "prior_est_cny": 0.75, "mixed": True, "from_day": "2026-09-17",
+    },
+    "balance": {"ok": True, "total": 15.83, "error": ""},
+})
+check("累计由真实+估算拼成时标明「差值+估算」",
+      "差值+估算" in app.v_total.get(), app.v_total.get())
+check("今日是完整的差值口径时不带 mixed 标",
+      "余额差值" in app.v_cost.get(), app.v_cost.get())
+check("状态栏交代「起点之前用估算补齐」并给出金额",
+      "补齐" in app.status.get() and "0.75" in app.status.get(), app.status.get())
+
+app._apply_billing({
+    "source": "estimate", "today_source": "estimate", "total_source": "estimate",
+    "today_cny": 0.47, "total_cny": 0.47,
+    "platform_error": "未配置 platform_token，只能显示本地估算",
+    "balance_diff": {"enough": False, "points": 1, "resolution": 0.01},
+    "balance": {"ok": False, "total": 0, "error": "未配置 API Key"},
+})
 
 # 无 API Key 时不能崩，且要给出可理解的说明
 app._apply_health({

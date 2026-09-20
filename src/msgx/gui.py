@@ -435,14 +435,32 @@ class App:
         # --- 账单 ---
         bl = ttk.LabelFrame(tab, text="账单（真实数据）", padding=12)
         bl.pack(fill="x", pady=(12, 0))
+        # 这段原来是「余额用 API Key；消费必须用平台 token；留空 = 只显示本地估算」，
+        # 把两件事挤在一句里，读起来像「查账要两个钥匙」，而且「只能估算」说得太满
+        # （余额既然是官方实时数字，消费就能由它的下降量推出来）。v0.5.1 拆成两段。
         ttk.Label(
             bl,
-            text="余额用 API Key 查（自动）；消费明细必须用平台登录态 token，取法见下。"
-                 "留空 = 只显示本地估算，界面会标注「估算」。",
+            text="余额：自动（用 [llm] 的 API Key 打官方接口，不需要你做什么）。",
             style="Hint.TLabel",
             wraplength=760,
             justify="left",
-        ).pack(anchor="w", pady=(0, 6))
+        ).pack(anchor="w")
+        ttk.Label(
+            bl,
+            text="今日/累计花费：默认已用「余额差值法」推算 —— 取相邻两次余额读数的下降量，"
+                 "是官方数字的减法，不需要额外凭据。",
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Label(
+            bl,
+            text="下面的 token 只用来多拿一份「消费明细」（哪个模型花了多少）。"
+                 "不需要明细可以完全留空，日/累计花费照样是真实的。",
+            style="Hint.TLabel",
+            wraplength=760,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 6))
         self.txt_platform_token = tk.Text(
             bl, height=3, wrap="char", font=("Consolas", 9), relief="solid", borderwidth=1
         )
@@ -884,18 +902,51 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
+    # 账单口径的显示名。**每个数字都必须带口径**：用户没法从数值本身分辨
+    # 它是官方数字还是本地估算，含糊显示等于骗人。
+    BILL_SOURCES = {
+        "platform": "平台",
+        "balance_diff": "余额差值",
+        "estimate": "估算",
+    }
+    # 累计由差值算时，起点**之前**那段没有读数、只能用估算补齐。这时整个数字
+    # 「真实 + 估算」拼成，不能标成纯「余额差值」。
+    BILL_MIXED = "差值+估算"
+
+    def _bill_origin(self, src: str, mixed: bool = False) -> str:
+        if src == "balance_diff" and mixed:
+            return self.BILL_MIXED
+        return self.BILL_SOURCES.get(str(src or ""), "未知")
+
     def _apply_billing(self, b: dict) -> None:
         if not b:
             # 服务刚起来还没抓过：只显示本地估算，并说清这是估算
             self.v_total.set("—")
             self.v_balance.set("—")
             return
-        src = "平台" if b.get("source") == "platform" else "估算"
-        self.v_cost.set(f"¥{float(b.get('today_cny') or 0):.2f}（{src}）")
-        tot = f"¥{float(b.get('total_cny') or 0):.2f}（{src}）"
-        if b.get("source") == "platform" and b.get("from_day"):
-            tot += f" 自 {b['from_day']}"
-        self.v_total.set(tot)
+        bd = b.get("balance_diff") or {}
+        # 兼容：老快照只有 source，没有 today_source / total_source
+        t_src = str(b.get("today_source") or b.get("source") or "")
+        s_src = str(b.get("total_source") or b.get("source") or "")
+
+        today = f"¥{float(b.get('today_cny') or 0):.2f}（{self._bill_origin(t_src)}）"
+        # 差值法的「今日」= 当天第一条读数之后的下降量之和。程序当天中途才启动时
+        # 起点会明显晚于 00:00，这时必须写出来 —— 否则用户会把半天当成一整天。
+        if t_src == "balance_diff" and bd.get("today_from"):
+            hhmm = time.strftime("%H:%M", time.localtime(int(bd["today_from"])))
+            if hhmm > "00:10":
+                today += f" 自 {hhmm} 起"
+        self.v_cost.set(today)
+
+        total = (
+            f"¥{float(b.get('total_cny') or 0):.2f}"
+            f"（{self._bill_origin(s_src, bool(bd.get('mixed')))}）"
+        )
+        if s_src == "platform" and b.get("from_day"):
+            total += f" 自 {b['from_day']}"
+        elif s_src == "balance_diff" and bd.get("total_from"):
+            total += f" 自 {time.strftime('%m-%d', time.localtime(int(bd['total_from'])))}"
+        self.v_total.set(total)
 
         bal = b.get("balance") or {}
         if bal.get("ok"):
@@ -905,10 +956,39 @@ class App:
             self.v_balance.set(f"—（{err[:26]}{'…' if len(err) > 26 else ''}）")
 
         err = str(b.get("platform_error") or "")
-        if err and b.get("source") != "platform":
-            # 拿不到平台数据时必须说清原因，否则用户只会觉得「数字不对但不知道为啥」
-            self.v_cost.set(f"¥{float(b.get('today_cny') or 0):.2f}（估算）")
-            self.status.set(f"账单：{err}")
+        if s_src == "estimate":
+            # 一路真实数据都拿不到：数字确实是纯估算，说清原因即可
+            self.status.set(f"账单：{err}" if err else "账单：只能显示本地估算（读数还不够）")
+            return
+        if s_src == "platform":
+            self.status.set(f"账单：{err}" if err else "账单：平台明细已更新")
+            return
+        # 累计已经是余额差值算出来的真实值。今日可能还不行（读数不够两个，
+        # 或起点离 00:00 太远）—— 必须解释，否则用户会以为功能没生效。
+        parts: list[str] = []
+        if err:
+            parts.append(f"消费明细未取到（{err}）")
+        if bd.get("points"):
+            parts.append(
+                f"累计由余额差值推算（{int(bd['points'])} 个读数，分辨率 ¥0.01）"
+            )
+        if bd.get("mixed"):
+            # 起点之前差值看不到，那一段是估算补的 —— 必须讲，否则用户以为整个数
+            # 都来自官方余额。
+            parts.append(
+                f"{bd.get('from_day') or '起点'} 之前的历史用估算补齐"
+                f"（¥{float(bd.get('prior_est_cny') or 0):.2f}）"
+            )
+        if t_src == "estimate":
+            if bd.get("today_from"):
+                hhmm = time.strftime("%H:%M", time.localtime(int(bd["today_from"])))
+                parts.append(
+                    f"今日的读数起点是 {hhmm}、还不满一天，先给估算值；"
+                    f"明日 00:00 起今日花费也会变成真实值"
+                )
+            else:
+                parts.append("今日读数还不够两个，先给估算值")
+        self.status.set("账单：" + ("；".join(parts) if parts else "已用余额差值推算"))
 
     # ---------------- 协议端 ----------------
 

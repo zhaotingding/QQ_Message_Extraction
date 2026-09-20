@@ -72,6 +72,19 @@ CREATE TABLE IF NOT EXISTS usage (
   cache_hit_tokens  INTEGER DEFAULT 0,
   cache_miss_tokens INTEGER DEFAULT 0
 );
+
+-- v0.5.1：账户余额读数流水，用来「用官方数字做减法」推算**真实**消费。
+-- 官方只提供 GET /user/balance（只给余额、不给消费明细），所以消费只能靠
+-- 相邻两次读数的差值累加得到。见 billing.consumption_from_readings。
+-- ts 用 INTEGER 主键（秒）并加唯一约束：同一秒重复读数只留一条，天然幂等。
+CREATE TABLE IF NOT EXISTS balance_readings (
+  ts       INTEGER PRIMARY KEY,
+  total    REAL DEFAULT 0,
+  topped_up REAL DEFAULT 0,
+  granted  REAL DEFAULT 0,
+  day      TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_balance_day ON balance_readings(day, ts);
 """
 
 # v0.4.2：计费口径改为 DeepSeek 官方的「峰谷 + 缓存命中」三档计价，金额单位由
@@ -428,8 +441,64 @@ class Store:
             "out_tokens": int(row["o"]),
         }
 
+    def cost_before(self, day: str) -> float:
+        """``day`` **之前**那些天的本地估算金额合计。
+
+        用途：余额差值只能看到「开始记读数之后」的消费，看不到历史。直接把差值
+        当作「累计花费」会在刚装上的那天显示 ¥0.00 —— 比原来的估算还离谱。
+        用它把区间补齐：``累计 ≈ 读数起点之前的历史估算 + 读数起点之后的差值``。
+        只有起点那天 00:00 到第一条读数之间那一小段是估的，误差可以忽略。
+        """
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(cost_cny),0) AS c FROM usage WHERE day < ?", (day,)
+        ).fetchone()
+        return float(row["c"] if row else 0.0)
+
     def usage_all(self) -> list:
         return list(self.conn.execute("SELECT * FROM usage ORDER BY day DESC"))
+
+    # ---------- 余额读数（v0.5.1 差值法）----------
+
+    def record_balance(
+        self, ts: int, total: float, topped_up: float = 0.0, granted: float = 0.0
+    ) -> bool:
+        """落一条余额读数。同一秒重复写会被主键挡掉（返回 False），天然幂等。
+
+        为什么要把读数**存下来**而不是只显示当下值：官方只给「还剩多少」，
+        不给「花了多少」。想拿到真实消费，只能靠相邻两次读数的**下降量**累加，
+        所以必须留下历史。（见 ``billing.consumption_from_readings``）
+        """
+        day = time.strftime("%Y-%m-%d", time.localtime(int(ts)))
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO balance_readings(ts,total,topped_up,granted,day)"
+            " VALUES(?,?,?,?,?)",
+            (int(ts), float(total), float(topped_up), float(granted), day),
+        )
+        self.conn.commit()
+        return bool(cur.rowcount)
+
+    def balance_readings(self, day: str | None = None) -> list[dict]:
+        """按时间升序返回读数；给 day 则只返回那一天的。"""
+        if day:
+            rows = self.conn.execute(
+                "SELECT * FROM balance_readings WHERE day=? ORDER BY ts ASC", (day,)
+            )
+        else:
+            rows = self.conn.execute("SELECT * FROM balance_readings ORDER BY ts ASC")
+        return [dict(r) for r in rows]
+
+    def balance_last(self) -> dict | None:
+        r = self.conn.execute(
+            "SELECT * FROM balance_readings ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        return dict(r) if r else None
+
+    def prune_balance(self, keep_days: int = 400) -> int:
+        """读数只是小行（几十字节），但别无限涨。保留足够长的历史给「累计」用。"""
+        cut = int(time.time()) - max(1, int(keep_days)) * 86400
+        cur = self.conn.execute("DELETE FROM balance_readings WHERE ts < ?", (cut,))
+        self.conn.commit()
+        return cur.rowcount
 
     # ---------- maintenance ----------
 

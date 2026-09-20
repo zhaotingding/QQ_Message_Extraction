@@ -9,9 +9,13 @@
 | 有效期 | 长期 | 短期，过期要重新登录取 |
 | 互换 | **互不通用** —— 用 API Key 打用量接口返回 `code=40003 Authorization Failed` |
 
-所以本模块分两条独立通路：
+所以本模块分三条独立通路：
   * `fetch_balance()` —— 用 API Key，拿**真实余额**（始终可用）
-  * `fetch_platform_cost()` —— 用平台 token，拿**真实消费**（需用户粘贴一次 token）
+  * `fetch_platform_cost()` —— 用平台 token，拿**真实消费明细**（需用户粘贴一次 token）
+  * `consumption_from_readings()` —— **不需要任何新凭据**：把余额读数存下来，
+    用相邻读数的下降量累加出真实消费。见该函数的 docstring。
+    这条路是 v0.5.1 补的 —— 之前界面对「消费」一律标「估算」，是**说得太满**：
+    余额既然是实时官方数字，消费就能从它推出来。
 
 > 平台那两个用量接口是**前端内部接口**，未对外承诺、字段随时可能变。
 > 因此这里做两件事：① 解析层尽量容错；② 拿不到就明确返回失败原因，
@@ -217,6 +221,80 @@ def parse_cost_response(raw: dict) -> tuple[dict[str, float], str]:
             total = _num(day.get("cost") or day.get("amount"))
         days[date] = round(days.get(date, 0.0) + total, 6)
     return days, currency
+
+
+# ---------------------------------------------------------------- 余额差值法
+
+def consumption_from_readings(readings: list[dict]) -> dict:
+    """**用官方余额做减法**，推算真实消费。这是本模块能拿到的最硬的数据。
+
+    为什么可行：官方 `GET /user/balance` 只给「还剩多少」，不给「花了多少」；
+    消费明细只有平台前端接口有，而那个要浏览器登录态。但余额是**官方实时数字**——
+    所以只要留下读数历史：
+
+        余额下降 = 消费          （账号里唯一会让钱变少的事）
+        余额上升 = 充值 / 赠送     （忽略，不算消费）
+
+    「所有下降量之和」即真实消费额。**不需要任何额外凭据**，余额接口本来就在跑。
+
+    代价（必须如实告知上层，别让它冒充精确值）：
+      * 分辨率 = 余额的小数位。官方只给两位小数 → 相邻两次读数的最小刻度 ¥0.01。
+        日消费量级 ¥0.5 以上时误差 ~2%；某天只花几分钱时，差值就是噪声。
+      * 只能给**总额**，给不了「哪个模型花了多少」——那部分只有平台接口有。
+      * 程序没运行时读数会断档。**断档本身不丢消费**（中间的下降在前后两条读数
+        之间照样算得出来），但如果断档期间恰好充了值，充值与消费会互相抵消而少算。
+        所以要把 ``points`` 与时间跨度一并交出去，由界面决定敢不敢标「真实」。
+
+    入参须按 ts 升序（``Store.balance_readings`` 已保证）。
+    """
+    pts = [r for r in readings if r.get("total") is not None]
+    spent = 0.0
+    added = 0.0
+    for prev, cur in zip(pts, pts[1:]):
+        delta = round(float(cur["total"]) - float(prev["total"]), 6)
+        if delta < 0:
+            spent += -delta
+        elif delta > 0:
+            added += delta
+    return {
+        "spent": round(spent, 6),
+        "added": round(added, 6),
+        "from_ts": int(pts[0]["ts"]) if pts else 0,
+        "to_ts": int(pts[-1]["ts"]) if pts else 0,
+        "points": len(pts),
+        # 至少两个点才能算出一次差值；一个点只能说明「当时有多少钱」
+        "enough": len(pts) >= 2,
+        "resolution": 0.01,
+    }
+
+
+def daily_from_readings(readings: list[dict], day: str, anchor_slack: int = 1800) -> dict:
+    """取``day``（YYYY-MM-DD）当天的消费推算结果。
+
+    只统计**当天**的读数，因此覆盖起点 = 当天第一条读数的时刻。
+    故意**不**把「昨天最后一条 → 今天第一条」那段跨午夜的下降算进来：
+    那段里含昨天的尾巴，算进来会让今天虚增。
+
+    ``anchor_slack`` 用来判断今天的覆盖是否**完整**（``full_day``）：
+      * 程序全天在跑 → 起点是 00:0x，``full_day=True``，今日消费就是真实的；
+      * 程序当天中途才启动（**首次安装的那一天就是这个情形**）→ 起点明显晚于
+        00:00，``full_day=False``。此时**不要**把它当成「今日」报出去：
+        它只覆盖了几小时，数值会明显偏小，用户看到「今天才花 5 分钱」只会以为
+        程序坏了。上层应回落到估算，并说明「明日 00:00 起今日即为真实值」。
+    """
+    out = consumption_from_readings([r for r in readings if r.get("day") == day])
+    out["day"] = day
+    from_ts = int(out.get("from_ts") or 0)
+    if from_ts:
+        # 「距当地 00:00 多少秒」直接用 time-of-day 算，不走 mktime：
+        # mktime 在 Windows 上对 1970 附近的时刻会 OverflowError，而读数的时间戳
+        # 完全可能是构造出来的（测试里就是）。两者在无夏令时的时区等价。
+        lt = time.localtime(from_ts)
+        out["anchor_delay"] = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+    else:
+        out["anchor_delay"] = 0
+    out["full_day"] = bool(from_ts) and out["anchor_delay"] <= int(anchor_slack)
+    return out
 
 
 # ---------------------------------------------------------------- 内部工具

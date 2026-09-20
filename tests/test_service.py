@@ -136,11 +136,24 @@ def main() -> int:
           str(sorted(health))[:120])
 
     st, body = call("/billing")
-    check("/billing 可达且返回 source 口径", st == 200 and body.get("source") in ("platform", "estimate"),
+    check("/billing 可达且返回 source 口径",
+          st == 200 and body.get("source") in ("platform", "balance_diff", "estimate"),
           f"{st} source={body.get('source')}")
     # 没配 api_key / platform_token 时必须**如实说明**，而不是假装有数据
-    check("/billing 说明为什么是估算", bool(body.get("platform_error")),
+    check("/billing 说明为什么拿不到平台明细", bool(body.get("platform_error")),
           str(body.get("platform_error"))[:80])
+    # v0.5.1 差值法：快照必须带上读数信息，界面才能决定敢不敢标「真实」。
+    # 只验结构 —— 数值取决于本机能不能连上余额接口，不能拿来当断言。
+    bd = body.get("balance_diff")
+    check("/billing 带 balance_diff 段（差值法）", isinstance(bd, dict),
+          str(bd)[:100])
+    check("balance_diff 带读数个数与分辨率",
+          isinstance(bd, dict) and "points" in bd and bd.get("resolution") == 0.01,
+          str(bd)[:100])
+    check("今日与累计各有自己的口径字段（可能一个真实一个估算）",
+          body.get("today_source") in ("platform", "balance_diff", "estimate")
+          and body.get("total_source") in ("platform", "balance_diff", "estimate"),
+          f"{body.get('today_source')} / {body.get('total_source')}")
 
     st, body = call("/summary/now?kind=range&hours=abc", post=True)
     check("hours 非法时返回 400（不静默套默认值）", st == 400, f"{st} {str(body)[:80]}")

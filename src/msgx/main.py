@@ -173,14 +173,25 @@ async def cmd_stats(cfg: dict) -> None:
         snap = await pipe.billing_snapshot(refresh=True)
         print(json.dumps(pipe.health(), ensure_ascii=False, indent=2))
 
-        src = "平台真实值" if snap.get("source") == "platform" else "本地估算"
+        _names = {"platform": "平台真实值", "balance_diff": "余额差值（真实）", "estimate": "本地估算"}
         print(
-            f"\n花费（{src}）：今日 ¥{float(snap.get('today_cny') or 0):.4f} · "
+            f"\n花费：今日 ¥{float(snap.get('today_cny') or 0):.4f}"
+            f"（{_names.get(str(snap.get('today_source') or snap.get('source')), '未知')}）· "
             f"累计 ¥{float(snap.get('total_cny') or 0):.4f}"
+            f"（{_names.get(str(snap.get('total_source') or snap.get('source')), '未知')}）"
             + (f"（自 {snap['from_day']}）" if snap.get("from_day") else "")
         )
+        bd = snap.get("balance_diff") or {}
+        if bd:
+            print(
+                f"  余额差值法：读数 {int(bd.get('points') or 0)} 个"
+                f"（分辨率 ¥{float(bd.get('resolution') or 0.01):.2f}）· "
+                f"推算今日 ¥{float(bd.get('today_cny') or 0):.4f} / "
+                f"累计 ¥{float(bd.get('total_cny') or 0):.4f}"
+                + ("" if bd.get("enough") else "  ← 读数还不够两个，暂不能算差值")
+            )
         if snap.get("platform_error"):
-            print(f"  平台数据不可用的原因：{snap['platform_error']}")
+            print(f"  平台明细不可用的原因：{snap['platform_error']}")
         bal = snap.get("balance") or {}
         if bal.get("ok"):
             print(f"  账户余额：¥{float(bal.get('total') or 0):.4f} {bal.get('currency') or ''}")

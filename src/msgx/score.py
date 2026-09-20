@@ -151,6 +151,11 @@ class Scorer:
         if ocr_text:
             body += f"该消息附带图片，图片中识别出的文字：\n{ocr_text[:1500]}\n"
         try:
+            # 刻意**保留思考**（不传 think=False）：打分是判定类任务，需要权衡。
+            # 但因此必须注意：思考 token 与正文共用 max_tokens，400 这种小预算
+            # 会被思考吃光 → finish_reason=length 且正文为空（=静默丢掉一次打分的
+            # 机会）。所以 chat() 里对 think=True 的调用有 THINK_MIN_TOKENS 下限兜底，
+            # 实际发出的预算不会小于它。这里的 400 只是「我期望的正文长度」。
             out = await self.llm.chat(SCORE_SYSTEM, body, max_tokens=400, temperature=0.1)
         except Exception as e:  # noqa: BLE001
             log.debug("打分模型调用失败，降级为规则结果: %s", e)

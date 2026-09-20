@@ -40,6 +40,13 @@ DEFAULTS: dict = {
         "peak_multiplier": 2.0,
         "peak_windows_utc": "01:00-04:00,06:00-10:00",
         "timeout_seconds": 90,
+        # 连接层失败的重试次数。实测到 api.deepseek.com 会偶发 ServerDisconnectedError
+        # （与请求体大小无关，是链路中间的问题），只能靠重试扛过去。
+        # 重试**不会**重置共享会话 —— 那会把并发请求一起掐死，见 llm.py 的注释。
+        "post_retries": 4,
+        # 思考开启时的最小 max_tokens。思考 token 与正文共用这个额度，给少了会
+        # 「思考吃光预算 → 正文为空」。max_tokens 是上限不是预扣，抬高几乎零成本。
+        "think_min_tokens": 1200,
         # 上传前把图片缩到长边不超过这个像素。请求里带的是 detail="low"，
         # 服务端本来就会大幅降采样，客户端先缩可省 30 倍带宽且看不出差别。
         "vision_max_side": 1280,
