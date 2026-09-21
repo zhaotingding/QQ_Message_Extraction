@@ -302,6 +302,46 @@ print("\n=== 日志区 ===")
 app._log_ui("测试日志行\n")
 check("日志可写入", "测试日志行" in app.log.get("1.0", "end"))
 
+print("\n=== 日志按行上色（v0.5.5）===")
+# 用户的原话：「正常状态时白色，一旦进入连接状态收听消息就变成绿色，
+# 一旦出现问题就是红色」。这是可解释的关键词规则，不是猜 —— 每条都得锁死。
+check("WARNING ⇒ 红", App._log_tag("10:49:31 WARNING msgx.pipeline 协议端已断开超过 60s") == "warn")
+check("「失败」⇒ 红", App._log_tag("[界面] 启动协议端失败：xxx") == "warn")
+check("「消息不再入库」⇒ 红（哪怕行里也有『入库』）",
+      App._log_tag("10:49:31 WARNING msgx.pipeline 消息不再入库") == "warn")
+check("协议端已连入 ⇒ 绿", App._log_tag("10:48:35 INFO msgx.napcat 协议端已连入（账号 123）") == "good")
+check("普通 INFO ⇒ 白", App._log_tag("10:48:35 INFO msgx.media OCR 引擎就绪: rapidocr") == "")
+check("界面提示提到「已连接」不染绿（那是提示，不是事件）",
+      App._log_tag("[界面] 连上后「协议端(NapCat)」会自己变成「已连接」") == "")
+check("先判红再判绿：同一行两个词都出现时红压过绿",
+      App._log_tag("10:00:00 INFO msgx 入库失败") == "warn")
+app._log_ui("10:48:35 INFO msgx.napcat 协议端已连入（账号 123）\n")
+app._log_ui("10:49:31 WARNING msgx.pipeline 消息不再入库\n")
+tags = [t for t in app.log.tag_names()]
+check("Text 控件注册了 warn/good 两个 tag", {"warn", "good"} <= set(tags), str(tags))
+
+print("\n=== 日志切换（v0.5.5：服务/协议端日志在主界面切，不再弹窗）===")
+check("有日志来源下拉", list(app.cb_log_src.cget("values")) == ["服务日志", "协议端日志"],
+      str(list(app.cb_log_src.cget("values"))))
+check("有两块文本区（切换不清空历史）", app.log is not None and app.alt_log is not None)
+root.update()
+check("默认显示服务日志、协议端日志隐藏",
+      app.log.winfo_ismapped() and not app.alt_log.winfo_ismapped(),
+      f"mapped={app.log.winfo_ismapped()}/{app.alt_log.winfo_ismapped()}")
+check("没有弹窗式「协议端日志」按钮了",
+      not any("协议端日志" in b for b in buttons), str(buttons))
+app.v_log_src.set("协议端日志")
+app._switch_log_source()
+root.update()
+check("切到协议端日志：两块文本区换位",
+      app.alt_log.winfo_ismapped() and not app.log.winfo_ismapped(),
+      f"mapped={app.log.winfo_ismapped()}/{app.alt_log.winfo_ismapped()}")
+app.v_log_src.set("服务日志")
+app._switch_log_source()
+root.update()
+check("切回服务日志：内容还在（没有被清屏）",
+      "测试日志行" in app.log.get("1.0", "end"))
+
 print("\n=== v0.5.0 新增开关的读写往返 ===")
 data2 = app._collect()
 check("保存内容含协议端隐藏开关", "napcat_hidden" in data2, str(sorted(data2)))

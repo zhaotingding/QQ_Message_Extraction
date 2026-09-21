@@ -351,13 +351,18 @@ def log_tail(cfg: dict, lines: int = 400) -> str:
 
 # ---------------------------------------------------------------- 启动
 
-def _shell_execute_runas(exe: str, params: str) -> int:
-    """以管理员身份启动 exe，返回 ShellExecuteW 的返回值（>32 即成功）。"""
+def _shell_execute_runas(exe: str, params: str, show: int = 1) -> int:
+    """以管理员身份启动 exe，返回 ShellExecuteW 的返回值（>32 即成功）。
+
+    ``show`` 是 Win32 的 SW_* 常量：1 = 正常显示，0 = 隐藏。
+    「重启协议端」用 0 —— 用户要的是**二维码图片自动弹出**，
+    不是又一个往任务栏里塞的黑框（那是本项目立项时就答应过要消灭的东西）。
+    """
     import ctypes
 
     return int(
         ctypes.windll.shell32.ShellExecuteW(  # type: ignore[attr-defined]
-            None, "runas", exe, params, None, 1  # 1 = SW_SHOWNORMAL（wscript 无窗口，无影响）
+            None, "runas", exe, params, None, show
         )
     )
 
@@ -504,17 +509,21 @@ def restart(cfg: dict) -> dict:
     #   2. 环境变量 NAPCAT_HOME —— 提权后的子进程会继承它，完全不经过引号解析
     # 任一条通了就够；两条都给，能省掉一类「点了没反应」的悬案。
     os.environ["NAPCAT_HOME"] = str(d)
+    # 静默模式：窗口隐藏 + 跳过 bat 末尾的 pause（隐藏窗口里没人能按键，不跳过
+    # 就是一个看不见的僵尸进程）。二维码不靠控制台里的 ASCII 画 —— 那个根本没法扫 ——
+    # 而是照旧写 cache\qrcode.png，由界面监听到新码后弹出图片窗口。
+    os.environ["MSGX_RESTART_SILENT"] = "1"
     params = f'/c ""{script}" "{d}""'
-    rc = _shell_execute_runas("cmd.exe", params)
+    rc = _shell_execute_runas("cmd.exe", params, show=0)
     if rc <= 32:
         hint = "（很可能是 UAC 授权窗口被取消了）" if rc == 5 else ""
         return {"ok": False, "error": f"提权启动失败，ShellExecuteW 返回 {rc}{hint}"}
-    _append_log(lp, "  结果 : 已请求提权并启动（会有一个控制台窗口显示进度）\n")
+    _append_log(lp, "  结果 : 已请求提权并启动（无窗口；二维码由界面自动弹出）\n")
     return {
         "ok": True,
         "dir": str(d),
         "log": str(lp),
-        "note": "已请求重置：会弹一次 UAC，点「是」后控制台里会依次显示「结束注入器 / 结束 QQ / 复查 / 重新拉起」。完成后请扫码登录。",
+        "note": "已请求重置：点一次 UAC 的「是」即可，全程无黑框。二维码图片会在几秒到半分钟后自动弹出，直接扫它。",
     }
 
 

@@ -17,6 +17,10 @@ rem  落盘格式：GBK + CRLF（.gitattributes 给 *.bat 标了 -text，保住字节原样）。
 rem ============================================================
 
 setlocal
+rem 静默模式（界面调它时设 MSGX_RESTART_SILENT=1）：窗口是隐藏的，
+rem 末尾的 pause 没人能按键 → 会变成一个看不见的僵尸进程。必须跳过。
+set "SILENT="
+if /i "%MSGX_RESTART_SILENT%"=="1" set "SILENT=1"
 set "TARGET=%~1"
 if not defined TARGET set "TARGET=%NAPCAT_HOME%"
 if not defined TARGET if exist "D:\App\NapCat\launcher.bat" set "TARGET=D:\App\NapCat"
@@ -68,9 +72,11 @@ tasklist /FI "IMAGENAME eq QQ.exe" /FO CSV /NH
 
 echo.
 echo [5/5] 重新注入并拉起 QQ —— NapCat 稍后会写下二维码，请扫码登录
+if defined SILENT echo     静默模式：二维码会由界面自动弹出（%%TARGET%%\cache\qrcode.png）
 echo.
 call "%TARGET%\launcher.bat"
 
 echo.
 echo #### 重置流程结束。请扫码登录，然后回界面看「实时消息」是否开始滚动。####
+if defined SILENT exit /b 0
 pause

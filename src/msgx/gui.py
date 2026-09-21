@@ -38,6 +38,9 @@ CREATE_NO_WINDOW = 0x08000000  # Windows: 子进程不弹控制台窗口
 # 日志框配色：沿用终端的深底浅字，长时间盯着不刺眼
 LOG_BG = "#1b1f27"
 LOG_FG = "#d6dbe5"
+# 行级颜色（v0.5.5）：暗底上要够亮才看得清。红 = 出问题，绿 = 在收消息/链路正常。
+LOG_RED = "#ff7b72"
+LOG_GREEN = "#7ee787"
 OK_COLOR = "#1a7f37"
 BAD_COLOR = "#b42318"
 MUTED = "#6b6b68"
@@ -75,7 +78,6 @@ class App:
         # 实时消息页：拉取是否在进行中（避免慢响应时叠请求）、上次用的条数
         self._rt_busy = False
         self._rt_limit = 80
-        self.napcat_log_win: tk.Toplevel | None = None
         # 登录二维码弹窗。Tkinter 只能在主线程碰控件，所以监视线程只把路径
         # 丢进 events 队列，由 _drain 在主线程里弹窗。
         self.qr_win: tk.Toplevel | None = None
@@ -213,7 +215,8 @@ class App:
         ttk.Label(buttons2, textvariable=self.v_range_desc, style="Hint.TLabel").pack(side="left")
         # 协议端必须单独启动 —— 本服务只监听它连入。没配置就不显示这几个按钮。
         # pack(side="right") 是「先 pack 的在最右」，所以下面的书写顺序 = 界面从右往左，
-        # 看的时候请从下往上读：刷新账单 | 协议端日志 | 启动协议端(NapCat) | 重启协议端。
+        # 看的时候请从下往上读：刷新账单 | 启动协议端(NapCat) | 重启协议端。
+        # （「协议端日志」按钮已取消 —— 日志在下方直接切换，不再弹独立窗口。）
         if self.napcat_script() or self.napcat_dir():
             # 「重启」紧挨着「启动」：两者只差一个「先清场」，而这正是排障时最容易搞错的一点。
             # 「启动」只是再注入一份（会和卡住的那份并存）；「重启」才是先全退再重登。
@@ -222,15 +225,52 @@ class App:
             ttk.Button(
                 buttons2, text="启动协议端(NapCat)", command=self.start_napcat
             ).pack(side="right")
-            ttk.Button(buttons2, text="协议端日志", command=self.show_napcat_log).pack(
-                side="right", padx=8
-            )
         ttk.Button(buttons2, text="刷新账单", command=self.refresh_billing).pack(side="right", padx=8)
 
-        log_frame = ttk.LabelFrame(tab, text="服务日志", padding=8)
+        # ---- 日志区（v0.5.5：服务日志 / 协议端日志在这里切换，不再弹独立窗口）----
+        # 用户的原话：「我希望这个 UI 界面就是所有的程序载体，什么功能都能在上面，
+        # 而不需要我去别的地方再找寻浪费时间。」弹窗式日志正好是反面教材 ——
+        # 它把信息放到了一个用户不知道何时会出现、还得专门去点的另一个窗口里。
+        log_frame = ttk.LabelFrame(tab, text="日志", padding=8)
         log_frame.pack(fill="both", expand=True, pady=(6, 0))
-        self.log = ScrolledText(
-            log_frame,
+        bar = ttk.Frame(log_frame)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Label(bar, text="看哪个").pack(side="left")
+        self.v_log_src = tk.StringVar(value="服务日志")
+        self.cb_log_src = ttk.Combobox(
+            bar, textvariable=self.v_log_src, state="readonly",
+            values=["服务日志", "协议端日志"], width=11, font=(FONT, 10),
+        )
+        self.cb_log_src.pack(side="left", padx=(6, 0))
+        self.cb_log_src.bind("<<ComboboxSelected>>", lambda _e: self._switch_log_source())
+        ttk.Button(bar, text="刷新", width=5, command=self._refresh_alt_log).pack(
+            side="left", padx=6
+        )
+        ttk.Button(
+            bar, text="打开记录目录",
+            command=lambda: open_path(napcat_mod.log_path(self.cfg).parent),
+        ).pack(side="right")
+        self.v_log_hint = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self.v_log_hint, style="Hint.TLabel").pack(
+            side="right", padx=8
+        )
+        # 两块**独立**的文本区，切换用 pack / pack_forget —— 这样两边的滚动位置
+        # 与历史内容都保得住。做成一个控件 + 清屏重灌的话，切回来服务日志就空了。
+        self.log = self._make_log_text(log_frame)
+        self.log.pack(fill="both", expand=True)
+        self.alt_log = self._make_log_text(log_frame)  # 协议端日志（默认不显示）
+
+    @staticmethod
+    def _range_desc(label: str) -> str:
+        for text, hours, chars in DIGEST_RANGES:
+            if text == label:
+                return f"目标约 {chars} 字（窗口越长允许写越长），数据源为最近 {hours // 24} 天"
+        return ""
+
+    @staticmethod
+    def _make_log_text(parent) -> ScrolledText:
+        w = ScrolledText(
+            parent,
             height=16,
             wrap="word",
             state="disabled",
@@ -242,14 +282,63 @@ class App:
             pady=8,
             relief="flat",
         )
-        self.log.pack(fill="both", expand=True)
+        # 行级颜色（v0.5.5）：白 = 平常，绿 = 在收消息/链路正常，红 = 出问题了。
+        w.tag_configure("warn", foreground=LOG_RED)
+        w.tag_configure("good", foreground=LOG_GREEN)
+        return w
 
-    @staticmethod
-    def _range_desc(label: str) -> str:
-        for text, hours, chars in DIGEST_RANGES:
-            if text == label:
-                return f"目标约 {chars} 字（窗口越长允许写越长），数据源为最近 {hours // 24} 天"
+    # ---- 日志行的颜色判定 ----
+    # 用户的原话：「正常状态时白色，一旦进入连接状态收听消息就变成绿色，
+    # 一旦出现问题就是红色」。规则必须**可解释**，所以是关键词而不是猜：
+    _RED_KEYS = ("WARNING", "ERROR", "CRITICAL", "失败", "异常", "错误", "不再入库", "无法")
+    _GREEN_SERVICE_KEYS = ("已连入", "已连接", "已恢复", "接收", "入库")
+
+    @classmethod
+    def _log_tag(cls, line: str) -> str:
+        """返回 tag 名（'' = 默认白）。**先判红再判绿**：同一行可能两个词都出现
+        （如「……消息不再入库」里也有「入库」），出了问题必须压过一切。"""
+        for k in cls._RED_KEYS:
+            if k in line:
+                return "warn"
+        # 绿色只给**服务日志**（带 HH:MM:SS 时间戳）里确实在干活的行；
+        # 界面自己的提示行不染绿 —— 提示里提到「已连接」三个字不该让它变绿。
+        if line[:8].count(":") == 2:
+            for k in cls._GREEN_SERVICE_KEYS:
+                if k in line:
+                    return "good"
         return ""
+
+    def _switch_log_source(self) -> None:
+        show_alt = self.v_log_src.get() == "协议端日志"
+        if show_alt:
+            self.log.pack_forget()
+            self.alt_log.pack(fill="both", expand=True)
+            self.v_log_hint.set("启动/重置记录 + NapCat 自身日志（每 2 秒自动刷新）")
+            self._refresh_alt_log()
+        else:
+            self.alt_log.pack_forget()
+            self.log.pack(fill="both", expand=True)
+            self.v_log_hint.set("")
+
+    def _refresh_alt_log(self) -> None:
+        """把协议端日志尾部灌进第二块文本区（含预检结果 + NapCat 自身日志）。"""
+        if self.v_log_src.get() != "协议端日志":
+            return
+        text = napcat_mod.log_tail(self.cfg)
+        self.alt_log.configure(state="normal")
+        self.alt_log.delete("1.0", "end")
+        for line in text.splitlines():
+            self._append_log_line(self.alt_log, line)
+        self.alt_log.see("end")
+        self.alt_log.configure(state="disabled")
+
+    @classmethod
+    def _append_log_line(cls, widget, line: str) -> None:
+        tag = cls._log_tag(line)
+        if tag:
+            widget.insert("end", line + "\n", tag)
+        else:
+            widget.insert("end", line + "\n")
 
     def _on_range_change(self) -> None:
         self.v_range_desc.set(self._range_desc(self.v_range.get()))
@@ -1137,14 +1226,13 @@ class App:
             messagebox.showerror("启动失败", str(r.get("error") or "未知错误"), parent=self.root)
             return
         self._log_ui(f"[界面] {r.get('note') or ''}\n")
-        self._log_ui(f"[界面] 启动记录：{r.get('log')}（界面「协议端日志」按钮可查看）\n")
+        self._log_ui(f"[界面] 启动记录：{r.get('log')}（运行状态页下方「日志」可切换到「协议端日志」查看）\n")
         self._log_ui(
             "[界面] NapCat 要先注入 QQ 再登录，通常需要 10~30 秒。\n"
             "[界面] 连上后上方「协议端(NapCat)」会自己变成「已连接」，无需重启服务。\n"
         )
         if self.napcat_dir():
-            self.qr_watching = True
-            threading.Thread(target=self._watch_qrcode, daemon=True).start()
+            self._start_qrcode_watch()
 
     def restart_napcat(self) -> None:
         """一键重置协议端：把所有注入器与 QQ.exe **全退掉**，再重新拉起。
@@ -1191,61 +1279,12 @@ class App:
             messagebox.showerror("重置失败", str(r.get("error") or "未知错误"), parent=self.root)
             return
         self._log_ui(f"[界面] {r.get('note') or ''}\n")
-        self._log_ui(f"[界面] 重置记录：{r.get('log')}（界面「协议端日志」按钮可查看）\n")
+        self._log_ui(f"[界面] 重置记录：{r.get('log')}（运行状态页下方「日志」可切换到「协议端日志」查看）\n")
         # 重置过程中协议端会断、再连回来；把行/二维码监听起来，别让用户自己去找二维码。
+        # 重置过程中协议端会断、再连回来。二维码**必须**只认重置之后新写的码：
+        # cache 里那个旧码早失效了，弹出来用户一扫就是「怎么扫都登不上」。
         if self.napcat_dir():
-            self.qr_watching = True
-            threading.Thread(target=self._watch_qrcode, daemon=True).start()
-
-    def show_napcat_log(self) -> None:
-        """协议端日志窗口：我们的启动记录（含预检）+ NapCat 自己的日志尾部。"""
-        text = napcat_mod.log_tail(self.cfg)
-        win = self.napcat_log_win
-        if win is not None:
-            try:
-                if win.winfo_exists():
-                    body = getattr(win, "body", None)
-                    if body is not None:
-                        body.configure(state="normal")
-                        body.delete("1.0", "end")
-                        body.insert("1.0", text)
-                        body.configure(state="disabled")
-                    win.lift()
-                    return
-            except Exception:  # noqa: BLE001  窗口可能已被销毁
-                pass
-
-        win = tk.Toplevel(self.root)
-        win.title("协议端日志")
-        win.geometry("940x560")
-        body = ScrolledText(
-            win,
-            wrap="word",
-            state="disabled",
-            font=("Consolas", 9),
-            background=LOG_BG,
-            foreground=LOG_FG,
-            insertbackground=LOG_FG,
-            padx=10,
-            pady=8,
-            relief="flat",
-        )
-        body.pack(fill="both", expand=True, padx=10, pady=(10, 6))
-        body.configure(state="normal")
-        body.insert("1.0", text)
-        body.configure(state="disabled")
-        bar = ttk.Frame(win)
-        bar.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Label(
-            bar, text=f"启动记录：{napcat_mod.log_path(self.cfg)}", style="Hint.TLabel"
-        ).pack(side="left")
-        ttk.Button(
-            bar,
-            text="打开记录目录",
-            command=lambda: open_path(napcat_mod.log_path(self.cfg).parent),
-        ).pack(side="right")
-        win.body = body  # type: ignore[attr-defined]
-        self.napcat_log_win = win
+            self._start_qrcode_watch(fresh_only=True)
 
     # ---------------- 登录二维码 ----------------
 
@@ -1257,18 +1296,38 @@ class App:
         p = Path(raw)
         return p if p.is_absolute() else ROOT / p
 
-    def _watch_qrcode(self) -> None:
+    def _start_qrcode_watch(self, fresh_only: bool = False) -> None:
+        """启动二维码监视线程（已在跑就不重复开 —— 多个线程会互相抢，还都弹窗）。"""
+        if self.qr_watching:
+            return
+        self.qr_watching = True
+        threading.Thread(target=self._watch_qrcode, args=(fresh_only,), daemon=True).start()
+
+    def _watch_qrcode(self, fresh_only: bool = False) -> None:
         """子线程：盯住 NapCat 的登录二维码文件。
 
         NapCat 需要登录时会把二维码写到「安装目录/cache/qrcode.png」就完事了，
         从不主动展示 —— 用户原本得自己去文件管理器里翻。这里检测到新二维码
         就把路径丢进事件队列，交给主线程弹窗。
+
+        ``fresh_only``：**只认本线程启动之后新写的码**。
+        「重启协议端」必须用它 —— 重置那一刻 cache 里很可能还躺着**上一轮的旧码**，
+        它早失效了；若照旧弹出，用户扫一张死码，下一张新码又把它顶掉，
+        表现恰好是「怎么扫都登不上」。正常「启动」不用它：界面刚开时弹一个
+        已经在等的旧码反而是用户想要的。
         """
         d = self.napcat_dir()
         if d is None:
             return
         qr = d / "cache" / "qrcode.png"
         seen = 0.0
+        if fresh_only:
+            # 基线取「现在」：之后 NapCat 要登录就一定会重写这个文件。
+            # 若文件在但已经是旧的，绝不拿它当新码。
+            try:
+                seen = qr.stat().st_mtime
+            except OSError:
+                seen = 0.0
         while self.qr_watching and not self.closing:
             try:
                 mtime = qr.stat().st_mtime
@@ -1332,6 +1391,10 @@ class App:
             self.v_balance.set("—")
             self.v_llm.set("—")
         self.root.after(2000, self._tick_health)
+        # 协议端日志是**快照**，不像服务日志那样有流 —— 显示着它就顺手刷新一下。
+        # 读的是本地文件尾部，2 秒一次的开销可以忽略；不显示时一个字节都不读。
+        if self.v_log_src.get() == "协议端日志":
+            self._refresh_alt_log()
 
     def _tick_realtime(self) -> None:
         """实时消息页的节拍器。
@@ -1452,8 +1515,13 @@ class App:
             self.v_llm.set("正常 · 图片走本地 OCR")
 
     def _log_ui(self, text: str) -> None:
+        # 按**行**插入才能按行上色（v0.5.5）。所有调用方传进来的都是完整行
+        # （服务 stdout 按 readline、界面侧都带换行），所以这里不做跨块缓冲。
         self.log.configure(state="normal")
-        self.log.insert("end", text)
+        for line in text.split("\n"):
+            if line == "" and text.endswith("\n"):
+                continue  # 只是结尾那个换行，不值得为它插入一个空行
+            self._append_log_line(self.log, line)
         # 只裁剪控件里的早期文本，服务侧的日志与数据库不受影响
         if int(self.log.index("end-1c").split(".")[0]) > 3000:
             self.log.delete("1.0", "501.0")
