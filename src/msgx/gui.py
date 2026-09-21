@@ -86,8 +86,8 @@ class App:
         #                      旧线程发现代数对不上就自行退出。此前用「在跑就不重开」的
         #                      单例守卫，重置时的新基线请求会被旧线程吞掉。
         #   qr_hold_until   —— 保护窗截止时刻。重置/启动后的 2 分钟内，健康轮询
-        #                      **不许**因为「协议端已连接」而停掉监视线程：冻结形态
-        #                      恰恰是「连着但不推」，旧连接会在重置后还存活十几秒，
+        #                      不许因旧连接还在而停掉监视线程；新连接可提前结束保护。
+        #                      冻结形态恰恰是「连着但不推」，旧连接在重置后还存活十几秒，
         #                      没有这道窗，刚武装的线程 2 秒内就会被健康轮询掐死，
         #                      等 bat 清场重登写出新码时已经没人在盯文件 ——
         #                      表现就是「点了重置，二维码从不弹出」。
@@ -96,9 +96,11 @@ class App:
         #                      下一秒同一张码再试，直到弹出来为止。
         self.qr_gen = 0
         self.qr_hold_until = 0.0
+        self.qr_started_at = 0.0
         self.qr_shown_mtime = 0.0
         self._qr_fail_logged = 0.0
         self.qr_watching = False
+        self._trace_gui(f"启动 version={__version__} python={sys.executable} napcat={self.napcat_dir()}")
 
         self._group_ids: list[str] = []
         self._build()
@@ -511,7 +513,7 @@ class App:
         ft.pack(fill="x", pady=(12, 0))
         ttk.Label(
             ft,
-            text="过滤在入库前生效，被丢弃的消息不占存储、也不产生模型费用。默认全部不过滤。",
+            text="过滤的图片/表情仅留简要记录，不下载、不识别、不进摘要；其他命中过滤的消息直接丢弃。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(0, 6))
         self.v_filters = {
@@ -972,6 +974,8 @@ class App:
     def _media_label(row) -> str:
         m = str(row.get("media_state") or "")
         v = str(row.get("vision_state") or "")
+        if m == "filtered":
+            return "已过滤"
         if m in ("", "none"):
             return "—"
         if m == "pending":
@@ -1232,6 +1236,7 @@ class App:
 
         self._log_ui(f"[界面] 正在启动协议端（{'可见' if visible else '隐藏'}模式）…\n")
         self.status.set("已请求启动 NapCat —— 请在 UAC 窗口点「是」，再完成扫码登录")
+        qr_since = time.time()
         try:
             r = napcat_mod.launch(self.cfg, visible=visible)
         except Exception as exc:  # noqa: BLE001
@@ -1249,7 +1254,7 @@ class App:
             "[界面] 连上后上方「协议端(NapCat)」会自己变成「已连接」，无需重启服务。\n"
         )
         if self.napcat_dir():
-            self._start_qrcode_watch()
+            self._start_qrcode_watch(since=qr_since)
 
     def restart_napcat(self) -> None:
         """一键重置协议端：把所有注入器与 QQ.exe **全退掉**，再重新拉起。
@@ -1285,6 +1290,9 @@ class App:
 
         self._log_ui("[界面] 正在请求重置协议端（会弹一次 UAC，请点「是」）…\n")
         self.status.set("已请求重置 —— 请在 UAC 窗口点「是」，然后扫码登录")
+        # v0.5.7：在提权调用前记下起点，避免返回时新码已写好却被当成旧基线。
+        qr_since = time.time()
+        self._trace_gui("请求重置协议端")
         try:
             r = napcat_mod.restart(self.cfg)
         except Exception as exc:  # noqa: BLE001
@@ -1301,44 +1309,55 @@ class App:
         # 重置过程中协议端会断、再连回来。二维码**必须**只认重置之后新写的码：
         # cache 里那个旧码早失效了，弹出来用户一扫就是「怎么扫都登不上」。
         if self.napcat_dir():
-            self._start_qrcode_watch(fresh_only=True)
+            self._start_qrcode_watch(fresh_only=True, since=qr_since)
 
     # ---------------- 登录二维码 ----------------
 
     def napcat_dir(self) -> Path | None:
-        """NapCat 安装目录（config.toml 的 [napcat] dir），未配置返回 None。"""
-        raw = str((self.cfg.get("napcat") or {}).get("dir") or "").strip()
-        if not raw:
-            return None
-        p = Path(raw)
-        return p if p.is_absolute() else ROOT / p
+        """v0.5.7：与启动器共用目录解析，否则自动发现能启动却不会监听二维码。"""
+        return napcat_mod.resolve_dir(self.cfg)
 
-    def _start_qrcode_watch(self, fresh_only: bool = False) -> None:
+    def _trace_gui(self, message: str) -> None:
+        """pythonw 没有控制台，关键链路单独落盘供现场核对。"""
+        try:
+            path = ROOT / "data" / "logs" / "gui.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} "
+                        f"thread={threading.current_thread().name} {message}\n")
+        except OSError:
+            pass  # 日志不可写不能阻止扫码
+
+    def _start_qrcode_watch(self, fresh_only: bool = False, since: float | None = None) -> None:
         """（重新）武装二维码监视线程。**每次调用都换代**，不是「在跑就不重开」。
 
         为什么不能用单例守卫：守卫会把「重置时要求换新基线」的请求整个吞掉 ——
         旧线程带着旧基线继续跑，看起来还在监视，实际语义已经错了。
         现在每次调用都换代 + 起新线程，旧线程下一秒发现代数对不上自行退出；
-        重叠的这 1 秒里最多重复弹一次同一个码，``_show_qrcode`` 自己会先关旧窗，无害。
+        排队中的旧代事件也会被丢弃，避免旧码盖住新码。
 
         同时设 2 分钟保护窗（见 ``__init__`` 里 ``qr_hold_until`` 的注释）。
         """
         self.qr_gen += 1
+        self.qr_shown_mtime = 0.0
+        since = time.time() if since is None else since
+        self.qr_started_at = since
         self.qr_hold_until = time.time() + 120
         if not self.qr_watching:
             self.qr_watching = True
+        self._trace_gui(f"监视启动 gen={self.qr_gen} fresh_only={fresh_only} since={since} dir={self.napcat_dir()}")
         threading.Thread(
-            target=self._watch_qrcode, args=(fresh_only, self.qr_gen), daemon=True
+            target=self._watch_qrcode, args=(fresh_only, self.qr_gen, since), daemon=True
         ).start()
 
-    def _watch_qrcode(self, fresh_only: bool = False, gen: int = 0) -> None:
+    def _watch_qrcode(self, fresh_only: bool = False, gen: int = 0, since: float = 0.0) -> None:
         """子线程：盯住 NapCat 的登录二维码文件。
 
         NapCat 需要登录时会把二维码写到「安装目录/cache/qrcode.png」就完事了，
         从不主动展示 —— 用户原本得自己去文件管理器里翻。这里检测到新二维码
         就把路径丢进事件队列，交给主线程弹窗。
 
-        ``fresh_only``：**只认本线程启动之后新写的码**。
+        ``fresh_only``：只认本次启动/重置请求之后新写的码（起点由主线程传入）。
         「重启协议端」必须用它 —— 重置那一刻 cache 里很可能还躺着**上一轮的旧码**，
         它早失效了；若照旧弹出，用户扫一张死码，下一张新码又把它顶掉，
         表现恰好是「怎么扫都登不上」。正常「启动」不用它：界面刚开时弹一个
@@ -1352,28 +1371,24 @@ class App:
         """
         d = self.napcat_dir()
         if d is None:
+            self._trace_gui(f"监视退出 gen={gen} 原因=未找到安装目录")
             return
         qr = d / "cache" / "qrcode.png"
-        seen = 0.0
-        if fresh_only:
-            # 基线取「现在」：之后 NapCat 要登录就一定会重写这个文件。
-            # 若文件在但已经是旧的，绝不拿它当新码。
-            try:
-                seen = qr.stat().st_mtime
-            except OSError:
-                seen = 0.0
+        detected = 0.0
         while self.qr_watching and not self.closing and gen == self.qr_gen:
             try:
                 mtime = qr.stat().st_mtime
             except OSError:
                 mtime = 0.0
             # 只认 10 分钟内更新过的码：过期文件弹出来是误导
-            if mtime and mtime != seen and (time.time() - mtime) < 600:
-                self.events.put(("qrcode", str(qr)))
-                if self.qr_shown_mtime == mtime:
-                    seen = mtime  # 已成功展示过这张，推进基线，停止重试
-                # 展示失败：不推进 seen，下一轮同一 mtime 再试一次
+            if (mtime and mtime != self.qr_shown_mtime and (time.time() - mtime) < 600
+                    and (not fresh_only or mtime >= since)):
+                if detected != mtime:
+                    self._trace_gui(f"检测到二维码 gen={gen} mtime={mtime} path={qr}")
+                    detected = mtime
+                self.events.put(("qrcode", (gen, str(qr))))
             time.sleep(1.0)
+        self._trace_gui(f"监视退出 gen={gen} current={self.qr_gen} watching={self.qr_watching}")
 
     def _show_qrcode(self, path: str) -> None:
         """主线程：弹出扫码窗口。同一时刻只保留一个。
@@ -1382,40 +1397,51 @@ class App:
         读取失败**不**回填 —— 监视线程下一轮会拿同一个 mtime 再试，
         直到图片完整读出为止；只把首日志打出来，避免每秒刷屏。
         """
-        self._close_qrcode()
         shown_at = 0.0
         try:
             shown_at = os.stat(path).st_mtime
         except OSError:
             pass
+        if shown_at and shown_at == self.qr_shown_mtime:
+            return  # v0.5.7：主线程忙时可能积压同一码，不能反复关窗重建
+        win = None
         try:
             from PIL import Image, ImageTk  # Pillow 是 rapidocr 的既有依赖
 
-            img = Image.open(path)
-            img.thumbnail((340, 340))
-            photo = ImageTk.PhotoImage(img)
+            with Image.open(path) as img:
+                img.load()
+                img.thumbnail((340, 340))
+                photo = ImageTk.PhotoImage(img, master=self.root)
+            win = tk.Toplevel(self.root)
+            win.title("扫码登录 QQ")
+            win.attributes("-topmost", True)
+            ttk.Label(win, text="请用手机 QQ 扫描下方二维码完成登录", font=(FONT, 11)).pack(
+                padx=20, pady=(16, 8)
+            )
+            ttk.Label(win, image=photo).pack(padx=20, pady=4)
+            ttk.Label(
+                win, text="登录成功后本窗口会自动关闭；也可以直接关掉它", style="Hint.TLabel"
+            ).pack(pady=(6, 14))
+            win.photo = photo  # 必须挂在控件上，否则被 GC 后图像变空白
+            win.update_idletasks()
+            win.deiconify()
+            win.lift()
         except Exception as exc:  # noqa: BLE001
+            if win is not None:
+                win.destroy()
             if self._qr_fail_logged != shown_at:
                 # 只在「这张码第一次失败」时打日志；重试期每秒失败一次不刷屏
                 self._qr_fail_logged = shown_at
+                self._trace_gui(f"二维码展示失败 mtime={shown_at} error={exc!r}")
                 self._log_ui(f"[界面] 二维码读取失败（会自动重试）：{exc}\n")
             return
-        self._qr_fail_logged = 0.0
-        self.qr_shown_mtime = shown_at
-        self._log_ui("[界面] 已弹出扫码窗口 —— 请用手机 QQ 扫描\n")
-
-        win = tk.Toplevel(self.root)
-        win.title("扫码登录 QQ")
-        win.attributes("-topmost", True)
-        ttk.Label(win, text="请用手机 QQ 扫描下方二维码完成登录", font=(FONT, 11)).pack(
-            padx=20, pady=(16, 8)
-        )
-        ttk.Label(win, image=photo).pack(padx=20, pady=4)
-        ttk.Label(
-            win, text="登录成功后本窗口会自动关闭；也可以直接关掉它", style="Hint.TLabel"
-        ).pack(pady=(6, 14))
-        win.photo = photo  # 必须挂在控件上，否则被 GC 后图像变空白
+        self._close_qrcode()
         self.qr_win = win
+        self._qr_fail_logged = 0.0
+        # v0.5.7：窗口完整建成后才确认成功，不能在 Toplevel 创建前就停止重试。
+        self.qr_shown_mtime = shown_at
+        self._trace_gui(f"已弹出扫码窗口 mtime={shown_at} path={path}")
+        self._log_ui("[界面] 已弹出扫码窗口 —— 请用手机 QQ 扫描\n")
 
     def _close_qrcode(self) -> None:
         """关掉扫码窗口（协议端连上后自动调用）。"""
@@ -1521,7 +1547,9 @@ class App:
         elif kind == "messages":
             self._render_messages(value)
         elif kind == "qrcode":
-            self._show_qrcode(value)
+            gen, path = value
+            if gen == self.qr_gen and self.qr_watching and not self.closing:
+                self._show_qrcode(path)
         elif kind == "exit":
             if self.proc is not None and self.proc.stdout:
                 try:
@@ -1542,10 +1570,12 @@ class App:
         peers = data.get("ws_peers") or []
         if peers:
             self.v_peer.set(f"已连接 · {', '.join(peers)}")
-            # 保护窗内**不许**停掉二维码监视：重置/启动后的十几秒里，旧的（冻结）
-            # 连接还挂在 ws_peers 上，此刻杀掉监视，等真正要扫码时就没人在盯文件了。
-            # 窗口过后才恢复「连上即停」的正常逻辑。
-            if time.time() >= self.qr_hold_until:
+            # v0.5.7：保护的是重置前旧连接，扫码后的新连接不应再等待两分钟。
+            # 由服务记录连接建立时间，即使断开/重连都发生在两次轮询之间也能识别。
+            connected_at = float(data.get("ws_connected_at") or 0.0)
+            if connected_at >= self.qr_started_at > 0 or time.time() >= self.qr_hold_until:
+                if self.qr_watching:
+                    self._trace_gui(f"协议端已连接，结束扫码监视 connected_at={connected_at}")
                 self.qr_watching = False  # 已连上，没必要再盯着二维码
                 self._close_qrcode()
         elif self.napcat_script() or self.napcat_dir():

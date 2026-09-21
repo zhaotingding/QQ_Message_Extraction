@@ -49,6 +49,7 @@ class Pipeline:
         # 当前连入的协议端（NapCat）地址集合。由接入层维护，供 /health 展示，
         # 让界面能明确区分「服务在跑」和「NapCat 已连上」——这两件事经常被混淆。
         self.ws_peers: set[str] = set()
+        self.ws_connected_at = 0.0  # v0.5.7：GUI 用新连接时间区分扫码成功与重置前旧连接
         # 活着的 WebSocket 连接对象。**退出时必须主动关掉它们**：
         # aiohttp 的 AppRunner.cleanup() 会等待所有活动连接处理完毕，而反向 WS 的
         # 处理器是 `async for raw in ws`，只要 NapCat 不断线就永远不返回。
@@ -193,6 +194,7 @@ class Pipeline:
     # ---------- 协议端连上 / 断开 ----------
 
     def on_peer_connected(self) -> None:
+        self.ws_connected_at = time.time()
         t = self._peer_watch
         if t is not None and not t.done():
             t.cancel()
@@ -306,11 +308,20 @@ class Pipeline:
             self.counters["skipped"] += 1
             return {"ok": False, "reason": f"群 {msg.group_id} 不在监听列表"}
 
-        # 界面配置的消息类型过滤。在入库前拦截，省下存储与模型成本。
+        # 界面配置的消息类型过滤。在处理前拦截，省下图片存储与模型成本。
         # 默认全部关闭，因此默认行为与不启用过滤时完全一致。
         reason = skip_reason(msg, self.cfg.get("filters") or {})
         if reason:
             self.counters["filtered"] += 1
+            # v0.5.7：图片/表情过滤后仍留一行状态，让实时页能说明为何没有识别结果。
+            # 只存简要记录，既不进媒体队列，也不参与打分或摘要。
+            if reason in ("纯表情", "纯图片"):
+                row_id = self.store.insert_message(msg, self.group_name(msg.group_id), self.bot_uin,
+                                                   filtered=True)
+                if row_id is None:
+                    self.counters["duplicate"] += 1
+                    return {"ok": True, "duplicate": True, "filtered": True}
+                return {"ok": True, "row_id": row_id, "filtered": True, "reason": reason}
             return {"ok": False, "reason": f"已按过滤规则丢弃: {reason}"}
 
         name = self.group_name(msg.group_id)
@@ -354,7 +365,8 @@ class Pipeline:
         )
         self.counters["alerts"] += 1
 
-        if result["level"] == "P0":
+        # v0.5.7：全体提醒即使被模型评为 P0，也不打断用户；仍保留消息与评分。
+        if result["level"] == "P0" and not row["at_all"]:
             await self.notifier.notify(
                 f"P0 · {gname or row['group_id']} · {row['sender_name']}",
                 f"{excerpt}\n\n理由：{result['reason']}",
@@ -759,6 +771,7 @@ class Pipeline:
             "billing": self._billing_data,
             "watch_groups": sorted(self.watch) or "全部",
             "ws_peers": sorted(self.ws_peers),
+            "ws_connected_at": self.ws_connected_at,
             # ⚠️ ws_peers 是「对端 IP 的**集合**」：多份 NapCat 全从 127.0.0.1 连进来时
             # 会被去重成 1 个 —— 7 份实例看起来和 1 份完全一样，这正是 2026-09-21
             # 「消息冻结」排查中最费时间的一处盲点。真正该看的是**连接条数**：

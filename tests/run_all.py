@@ -24,6 +24,7 @@ SUITES = [
     ("纪要长度", "test_digest.py"),
     ("媒体校验", "test_media.py"),
     ("群列表属主", "test_groups.py"),
+    ("通知与过滤链路", "test_pipeline.py"),
     ("服务生命周期", "test_service.py"),
     ("界面构建", "test_gui.py"),
 ]

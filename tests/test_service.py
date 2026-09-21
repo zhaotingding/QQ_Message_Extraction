@@ -252,6 +252,8 @@ def main() -> int:
         h1 = wait_conns(1)
         check("测试客户端已挂上 WS（模拟 NapCat 在线）",
               bool(h1.get("ws_peers")), str(h1.get("ws_peers")))
+        check("health 返回本次连接建立时间供二维码自动关闭",
+              started <= h1.get("ws_connected_at", 0) <= time.time())
 
         # ⚠️ 这次「消息冻结」的真正盲点：ws_peers 是**去重后的 IP 集合**，
         # 第二份 NapCat（同样来自 127.0.0.1）不会让它变长 —— 7 份实例和 1 份
@@ -260,6 +262,8 @@ def main() -> int:
         h2 = wait_conns(2)
         check("两条 WS 连接时 ws_conns == 2",
               h2.get("ws_conns") == 2, str(h2.get("ws_conns")))
+        check("同源 IP 重连仍更新连接时间",
+              h2.get("ws_connected_at", 0) > h1.get("ws_connected_at", 0))
         check("同源 IP 的连接不会撑大 ws_peers（正是它会掩盖重复实例）",
               len(h2.get("ws_peers") or []) == 1, str(h2.get("ws_peers")))
         check("ws_conns > len(ws_peers) 可据此判定「有重复实例」",

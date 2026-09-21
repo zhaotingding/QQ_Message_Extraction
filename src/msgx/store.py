@@ -108,6 +108,7 @@ USAGE_MIGRATIONS = (
 MESSAGE_MIGRATIONS = (
     ("vision_state", "TEXT DEFAULT ''"),
     ("vision_tries", "INTEGER DEFAULT 0"),
+    ("at_all", "INTEGER DEFAULT 0"),  # v0.5.7：独立记录，不能依赖可能截断的 raw JSON
 )
 
 # groups 表 v0.5.4 加 bot_uin：**这个群属于哪个协议端账号**。
@@ -269,13 +270,13 @@ class Store:
 
     # ---------- messages ----------
 
-    def insert_message(self, m: Msg, group_name: str = "", bot_uin: str = "") -> int | None:
+    def insert_message(self, m: Msg, group_name: str = "", bot_uin: str = "", *, filtered: bool = False) -> int | None:
         """返回自增 id；重复消息返回 None。"""
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO messages"
             "(group_id, msg_id, sender_id, sender_name, ts, msg_type, text,"
-            " has_media, image_urls, media_state, at_me, reply_to, raw)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " has_media, image_urls, media_state, at_me, at_all, reply_to, raw)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 m.group_id,
                 m.msg_id,
@@ -284,12 +285,13 @@ class Store:
                 m.ts,
                 m.msg_type,
                 m.text,
-                1 if (m.image_urls or m.file_names) else 0,
-                json.dumps(m.image_urls, ensure_ascii=False),
-                "pending" if m.image_urls else "none",
+                1 if not filtered and (m.image_urls or m.file_names) else 0,
+                json.dumps([] if filtered else m.image_urls, ensure_ascii=False),
+                "filtered" if filtered else "pending" if m.image_urls else "none",
                 1 if m.at_me else 0,
+                1 if m.at_all else 0,
                 m.reply_to,
-                json.dumps(m.raw, ensure_ascii=False)[:20000],
+                "" if filtered else json.dumps(m.raw, ensure_ascii=False)[:20000],
             ),
         )
         self.conn.commit()
@@ -405,7 +407,8 @@ class Store:
     def messages_between(self, group_id: str, start: int, end: int) -> list:
         return list(
             self.conn.execute(
-                "SELECT * FROM messages WHERE group_id=? AND ts>? AND ts<=? ORDER BY ts ASC",
+                "SELECT * FROM messages WHERE group_id=? AND ts>? AND ts<=?"
+                " AND media_state<>'filtered' ORDER BY ts ASC",
                 (group_id, start, end),
             )
         )
@@ -418,14 +421,14 @@ class Store:
 
     def first_ts(self, group_id: str) -> int:
         row = self.conn.execute(
-            "SELECT MIN(ts) AS t FROM messages WHERE group_id=?", (group_id,)
+            "SELECT MIN(ts) AS t FROM messages WHERE group_id=? AND media_state<>'filtered'", (group_id,)
         ).fetchone()
         return int(row["t"]) if row and row["t"] else 0
 
     # ---------- 跨群（热点统计用） ----------
 
     def first_ts_all(self) -> int:
-        row = self.conn.execute("SELECT MIN(ts) AS t FROM messages").fetchone()
+        row = self.conn.execute("SELECT MIN(ts) AS t FROM messages WHERE media_state<>'filtered'").fetchone()
         return int(row["t"]) if row and row["t"] else 0
 
     def window_end_by_kind(self, kind: str) -> int:
@@ -447,7 +450,7 @@ class Store:
         """窗口内全部群的消息，按时间升序。供跨群热点统计使用。"""
         return list(
             self.conn.execute(
-                "SELECT * FROM messages WHERE ts>? AND ts<=? ORDER BY ts ASC LIMIT ?",
+                "SELECT * FROM messages WHERE ts>? AND ts<=? AND media_state<>'filtered' ORDER BY ts ASC LIMIT ?",
                 (start, end, limit),
             )
         )

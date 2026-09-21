@@ -20,6 +20,7 @@ class Msg:
     image_urls: list = field(default_factory=list)
     file_names: list = field(default_factory=list)
     at_me: bool = False
+    at_all: bool = False
     reply_to: str = ""
     ocr_text: str = ""
     vision_text: str = ""
@@ -76,6 +77,18 @@ def _from_cq_string(s: str, at_ids: set) -> tuple[str, list, bool]:
             out.append(f"[{ctype}]")
     out.append(s[pos:])
     return "".join(out), images, at_me
+
+
+def mentions_all(event: dict) -> bool:
+    """按协议标记识别 @全体成员，避免把正文中引用的同名文字误判为群提醒。"""
+    segments = event.get("message")
+    if isinstance(segments, list):
+        return any(isinstance(seg, dict) and seg.get("type") == "at"
+                   and str((seg.get("data") or {}).get("qq")) == "all" for seg in segments)
+    if isinstance(segments, str):
+        return any(m.group(1) == "at" and _cq_params(m.group(2)).get("qq") == "all"
+                   for m in CQ_RE.finditer(segments))
+    return False
 
 
 def parse_onebot_event(event: dict, self_id: str, at_ids: set | None = None) -> Msg | None:
@@ -176,6 +189,7 @@ def parse_onebot_event(event: dict, self_id: str, at_ids: set | None = None) -> 
         image_urls=images,
         file_names=files,
         at_me=at_me,
+        at_all=mentions_all(event),
         reply_to=reply_to,
         raw=event,
     )

@@ -286,9 +286,14 @@ check(
     app.napcat_script() == Path(r"D:\App\NapCat\start-napcat.bat"),
     str(app.napcat_script()),
 )
-# NapCat 安装目录：留空 → 不自动弹二维码；填了 → 供监视 <dir>\cache\qrcode.png
+# v0.5.7：启动器能自动找到目录时，GUI 必须监听同一个目录。
+from unittest.mock import patch
+
 app.cfg["napcat"] = {"dir": ""}
-check("未配置 NapCat 目录时返回 None", app.napcat_dir() is None, str(app.napcat_dir()))
+with patch("msgx.gui.napcat_mod.resolve_dir", return_value=Path("D:/App/NapCat")):
+    check("未填目录时复用启动器自动发现结果", app.napcat_dir() == Path("D:/App/NapCat"))
+with patch("msgx.gui.napcat_mod.resolve_dir", return_value=None):
+    check("启动器也找不到目录时返回 None", app.napcat_dir() is None)
 app.cfg["napcat"] = {"dir": "NapCat"}
 check("相对目录拼到项目根", app.napcat_dir() == PROJ / "NapCat", str(app.napcat_dir()))
 app.cfg["napcat"] = {"dir": r"D:\App\NapCat"}
@@ -461,7 +466,7 @@ check("dir 留空时仍给出可读说明且不下否定结论",
 N.running_instances = _orig_running  # type: ignore[assignment]
 
 print("\n=== 启动前拦截重复注入（v0.5.2）===")
-app.cfg["napcat"] = {"dir": ""}  # 不监视二维码，避免测试里弹窗
+app.cfg["napcat"] = {"dir": "tests/nonexistent-napcat"}  # 不碰真实协议端的二维码
 _calls = {"n": 0}
 
 
@@ -530,7 +535,7 @@ app._apply_health({
 check("保护窗外：连上即停（恢复原语义）", app.qr_watching is False, str(app.qr_watching))
 
 print("\n=== 二维码监视：每次武装都换代（v0.5.6）===")
-app.cfg["napcat"] = {"dir": ""}  # napcat_dir()=None → 线程立即返回，测试不弹窗
+app.cfg["napcat"] = {"dir": "tests/nonexistent-napcat"}  # 不碰真实协议端的二维码
 _g0 = app.qr_gen
 app._start_qrcode_watch(fresh_only=True)
 _g1 = app.qr_gen
@@ -581,6 +586,102 @@ app._drain()                               # 直接跑一轮（不被 after 调�
 app._apply_billing = _orig_billing  # type: ignore[assignment]
 check("坏事件被兜住且记了日志", "事件处理异常" in app.log.get("1.0", "end"), "")
 check("坏事件之后的事件仍被处理（事件泵未死）", app.status.get() == "泵还活着", app.status.get())
+
+print("\n=== 重启到扫码窗口的完整链路（v0.5.7）===")
+with _tf.TemporaryDirectory() as _tmp:
+    _nc = Path(_tmp)
+    (_nc / "cache").mkdir()
+    (_nc / "launcher.bat").touch()  # 仅用于目录发现，不执行脚本
+    _qr = _nc / "cache" / "qrcode.png"
+    _Img.new("RGB", (20, 20), "white").save(_qr)
+    _old = time.time() - 30
+    os.utime(_qr, (_old, _old))
+    app.cfg["napcat"] = {"restart_script": "tools/重启协议端.bat"}  # 没有 dir，靠自动发现
+
+    def _fake_restart(cfg):
+        # 新码在提权调用返回前写出，监视线程开始时文件已经存在。
+        _Img.new("RGB", (20, 20), "green").save(_qr)
+        _written = time.time()
+        os.utime(_qr, (_written, _written))
+        return {"ok": True, "note": "测试重置", "log": "测试日志"}
+
+    with patch.dict(os.environ, {"NAPCAT_HOME": str(_nc)}), \
+            patch.object(N, "restart", side_effect=_fake_restart) as _restart, \
+            patch.object(_mb, "askyesno", return_value=True):
+        check("未填目录时 GUI 与启动器定位同一目录", app.napcat_dir() == N.resolve_dir(app.cfg) == _nc)
+        app.restart_napcat()
+        _deadline = time.monotonic() + 3
+        while app.qr_win is None and time.monotonic() < _deadline:
+            root.update()
+            time.sleep(0.02)
+        check("重启只调用一次协议端接口", _restart.call_count == 1)
+        check("重启返回前已写好的码经线程和事件泵自动弹出", app.qr_win is not None)
+        check("扫码窗口实际可见", app.qr_win is not None and bool(app.qr_win.winfo_viewable()))
+        _first_win = app.qr_win
+        _deadline = time.monotonic() + 1.2
+        while time.monotonic() < _deadline:
+            root.update()
+            time.sleep(0.02)
+        check("同一二维码不会下一秒重建窗口", app.qr_win is _first_win)
+        app._close_qrcode()
+
+        # 新一次重置只能等新码，当前缓存虽然很新也不应再次弹出。
+        app._start_qrcode_watch(fresh_only=True)
+        _deadline = time.monotonic() + 1.2
+        while time.monotonic() < _deadline:
+            root.update()
+            time.sleep(0.02)
+        check("新一轮重置忽略上轮缓存二维码", app.qr_win is None)
+        app._dispatch_event("qrcode", (app.qr_gen - 1, str(_qr)))
+        check("换代后丢弃旧线程已排队事件", app.qr_win is None)
+
+        app.qr_watching = False
+        app.qr_gen += 1
+        app.qr_shown_mtime = 0.0
+        with patch("msgx.gui.tk.Toplevel", side_effect=tk.TclError("测试窗口创建失败")):
+            app._show_qrcode(str(_qr))
+        check("窗口创建失败不提前确认成功", app.qr_shown_mtime == 0.0 and app.qr_win is None)
+        app._show_qrcode(str(_qr))
+        check("窗口创建恢复后同一码可重试成功", app.qr_win is not None)
+        app._close_qrcode()
+
+        # 图片写入中读取失败后，不再改 mtime，也必须由监视线程重试。
+        _qr.write_bytes(b"incomplete PNG")
+        _stamp = _qr.stat().st_mtime
+        app._start_qrcode_watch()
+        _deadline = time.monotonic() + 1.2
+        while time.monotonic() < _deadline:
+            root.update()
+            time.sleep(0.02)
+        check("半张图片不会确认展示成功", app.qr_shown_mtime == 0.0)
+        _Img.new("RGB", (20, 20), "blue").save(_qr)
+        os.utime(_qr, (_stamp, _stamp))
+        _deadline = time.monotonic() + 3
+        while app.qr_win is None and time.monotonic() < _deadline:
+            root.update()
+            time.sleep(0.02)
+        check("图片完整后相同 mtime 自动重试并弹窗", app.qr_win is not None)
+        app.qr_watching = False
+        app.qr_gen += 1
+        app._close_qrcode()
+
+print("\n=== 登录成功后立即关闭二维码（v0.5.7）===")
+app.qr_shown_mtime = 0.0
+app._show_qrcode(_ok_png)
+app.qr_watching = True
+app.qr_started_at = time.time()
+app.qr_hold_until = time.time() + 120
+app._apply_health({"ws_peers": ["127.0.0.1"], "ws_connected_at": app.qr_started_at - 10})
+check("保护期内旧连接不关闭二维码", app.qr_win is not None and app.qr_watching)
+app._apply_health({"ws_peers": ["127.0.0.1"], "ws_connected_at": app.qr_started_at + 1})
+check("保护期内新连接立即关闭二维码并停监视", app.qr_win is None and not app.qr_watching)
+app._close_qrcode()
+check("图片列明确显示已过滤", App._media_label({"media_state": "filtered"}) == "已过滤")
+check("普通无图消息仍显示横线", App._media_label({"media_state": "none", "text": "普通文字"}) == "—")
+
+_trace = (PROJ / "data" / "logs" / "gui.log").read_text(encoding="utf-8")
+check("持久日志包含版本与进程", "启动 version=" in _trace and f"pid={os.getpid()}" in _trace)
+check("持久日志能定位检测与展示环节", "检测到二维码" in _trace and "已弹出扫码窗口" in _trace)
 
 root.update()
 root.destroy()
