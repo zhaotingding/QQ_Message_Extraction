@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from msgx.models import Msg  # noqa: E402
-from msgx.prefs import apply_to_config, plain_text, skip_reason  # noqa: E402
+from msgx.prefs import apply_to_config, load, load_from_env, plain_text, save, skip_reason  # noqa: E402
 
 fails: list[str] = []
 
@@ -55,21 +57,37 @@ check("开关关闭时不生效", skip_reason(face, {"skip_face_only": False}) =
 check("min_length=0 不过滤", skip_reason(short, {"min_text_length": 0}) == "")
 
 print("\n=== 偏好叠加到配置 ===")
-cfg = {"score": {"keywords": ["原有关键词"]}, "summary": {"interval_minutes": 30},
+cfg = {"summary": {"prompt": "原有提示词", "target_chars": 3000},
        "watch": {"groups": []}, "filters": {}}
-merged = apply_to_config(cfg, {"keywords": ["新词"], "interval_minutes": 15, "groups": ["123"],
+merged = apply_to_config(cfg, {"summary_prompt": "自定义提示词 {{目标字数}}", "summary_target_chars": 4500,
+                              "keywords": ["旧热点词"], "interval_minutes": 15, "groups": ["123"],
                               "filters": {"skip_face_only": True, "min_text_length": 3}})
-check("关键词被覆盖", merged["score"]["keywords"] == ["新词"])
-check("间隔被覆盖", merged["summary"]["interval_minutes"] == 15)
+check("提示词被覆盖", merged["summary"]["prompt"] == "自定义提示词 {{目标字数}}")
+check("目标字数被覆盖", merged["summary"]["target_chars"] == 4500)
+check("旧热点词和自动间隔不再生效", "score" not in merged and "interval_minutes" not in merged["summary"])
 check("群列表被覆盖", merged["watch"]["groups"] == ["123"])
 check("过滤开关生效", merged["filters"]["skip_face_only"] is True)
 check("最小长度生效", merged["filters"]["min_text_length"] == 3)
-check("入参 cfg 未被修改", cfg["score"]["keywords"] == ["原有关键词"])
+check("入参 cfg 未被修改", cfg["summary"] == {"prompt": "原有提示词", "target_chars": 3000})
 
-empty = apply_to_config(cfg, {"keywords": [], "interval_minutes": 0, "groups": []})
-check("空关键词 = 沿用配置文件", empty["score"]["keywords"] == ["原有关键词"])
-check("间隔 0 = 沿用配置文件", empty["summary"]["interval_minutes"] == 30)
+empty = apply_to_config(cfg, {"summary_prompt": "", "summary_target_chars": 0, "groups": []})
+check("空提示词 = 沿用配置文件", empty["summary"]["prompt"] == "原有提示词")
+check("无目标覆盖时沿用配置文件", empty["summary"]["target_chars"] == 3000)
 check("空群列表 = 关注全部", empty["watch"]["groups"] == [])
+with tempfile.TemporaryDirectory() as tmp:
+    path = Path(tmp) / "preferences.json"
+    saved = {"summary_prompt": "只归纳技术主题 {{目标字数}}", "summary_target_chars": 4200,
+             "interval_minutes": 720, "unrelated_preference": "保留"}
+    save(saved, path)
+    loaded = load(path)
+    check("提示词与目标字数持久保存", loaded["summary_prompt"] == saved["summary_prompt"]
+          and loaded["summary_target_chars"] == 4200)
+    check("旧偏好和无关偏好仍保留", loaded["interval_minutes"] == 720
+          and loaded["unrelated_preference"] == "保留")
+    save({"interval_minutes": 720}, path)
+    with patch.dict("os.environ", {"MSGX_PREFS": str(path)}):
+        config_custom = {**cfg, "summary": {"target_chars": 5000}}
+        check("旧偏好文件不覆盖配置中的目标字数", apply_to_config(config_custom, load_from_env())["summary"]["target_chars"] == 5000)
 
 print()
 if fails:

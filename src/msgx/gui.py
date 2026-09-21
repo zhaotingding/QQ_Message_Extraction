@@ -31,7 +31,7 @@ from . import __version__
 from . import napcat as napcat_mod
 from . import prefs as prefs_mod
 from .config import ROOT, abs_path, load
-from .summarize import DIGEST_RANGES
+from .summarize import DEFAULT_DIGEST_PROMPT, DIGEST_DEFAULT_CHARS, DIGEST_RANGES
 
 APP_TITLE = "消息萃取 msgx"
 FONT = "Microsoft YaHei UI"
@@ -256,7 +256,7 @@ class App:
         progress.pack(fill="x", pady=(6, 0))
         self.summary_bar = ttk.Progressbar(progress, mode="indeterminate", length=110)
         self.summary_bar.pack(side="left")
-        self.v_summary = tk.StringVar(value="摘要待生成，目标约 3000 字")
+        self.v_summary = tk.StringVar(value=f"摘要待生成，目标约 {self._summary_options()['target_chars']} 字")
         ttk.Label(progress, textvariable=self.v_summary, wraplength=740).pack(side="left", padx=8)
 
         # ---- 日志区（v0.5.5：服务日志 / 协议端日志在这里切换，不再弹独立窗口）----
@@ -292,10 +292,10 @@ class App:
         self.log.pack(fill="both", expand=True)
         self.alt_log = self._make_log_text(log_frame)  # 协议端日志（默认不显示）
 
-    @staticmethod
-    def _range_desc(label: str) -> str:
-        for text, hours, chars in DIGEST_RANGES:
+    def _range_desc(self, label: str) -> str:
+        for text, hours, _chars in DIGEST_RANGES:
             if text == label:
+                chars = self._summary_options()["target_chars"]
                 return f"模型总结目标约 {chars} 字，完整保留生成结果；数据源为最近 {hours // 24} 天"
         return ""
 
@@ -463,31 +463,25 @@ class App:
         canvas.bind("<Configure>", _fit)
         self._scroll_canvas = canvas
 
-        # --- 关键词 ---
-        kw = ttk.LabelFrame(tab, text="热点关注词", padding=12)
-        kw.pack(fill="both", expand=False)
-        ttk.Label(
-            kw,
-            text="一行一个，用于跨群热点摘要。留空表示沿用 config.toml 里的设置。",
-            style="Hint.TLabel",
-        ).pack(anchor="w", pady=(0, 6))
-        self.txt_keywords = tk.Text(kw, height=6, wrap="word", font=(FONT, 10), relief="solid", borderwidth=1)
-        self.txt_keywords.pack(fill="both", expand=True)
-
         # --- 摘要 ---
-        sm = ttk.LabelFrame(tab, text="摘要频率", padding=12)
-        sm.pack(fill="x", pady=(12, 0))
+        sm = ttk.LabelFrame(tab, text="手动摘要", padding=12)
+        sm.pack(fill="x")
         line = ttk.Frame(sm)
         line.pack(fill="x")
-        ttk.Label(line, text="每").pack(side="left")
-        self.v_interval = tk.StringVar()
-        ttk.Entry(line, textvariable=self.v_interval, width=6).pack(side="left", padx=6)
-        ttk.Label(line, text="分钟生成一次摘要").pack(side="left")
+        ttk.Label(line, text="目标字数").pack(side="left")
+        self.v_summary_chars = tk.StringVar()
+        ttk.Entry(line, textvariable=self.v_summary_chars, width=8).pack(side="left", padx=6)
+        ttk.Button(line, text="恢复默认提示词", command=self.reset_summary_prompt).pack(side="right")
         ttk.Label(
             sm,
-            text="填 0 表示沿用 config.toml 里的值。间隔越短，模型调用越频繁，成本越高。",
+            text="提示词中的 {{目标字数}} 会自动替换。保存后下一次生成即生效；"
+                 "在运行状态页选择统计时间范围后手动生成。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(6, 0))
+        self.txt_summary_prompt = ScrolledText(
+            sm, height=12, wrap="word", font=(FONT, 10), relief="solid", borderwidth=1,
+        )
+        self.txt_summary_prompt.pack(fill="both", expand=True, pady=(6, 0))
 
         # --- 群范围 ---
         gp = ttk.LabelFrame(tab, text="统计哪些群", padding=12)
@@ -668,12 +662,15 @@ class App:
 
     def _load_into_widgets(self) -> None:
         p = self.prefs
-        keywords = p.get("keywords") or self.cfg["score"].get("keywords") or []
-        self.txt_keywords.delete("1.0", "end")
-        self.txt_keywords.insert("1.0", "\n".join(str(k) for k in keywords))
-
-        interval = int(p.get("interval_minutes") or 0)
-        self.v_interval.set(str(interval))
+        if "summary_target_chars" not in prefs_mod.load_raw(self.prefs_file):
+            p["summary_target_chars"] = self.cfg.get("summary", {}).get("target_chars", DIGEST_DEFAULT_CHARS)
+        options = self._summary_options()
+        self.txt_summary_prompt.delete("1.0", "end")
+        self.txt_summary_prompt.insert("1.0", options["prompt"])
+        self.v_summary_chars.set(str(options["target_chars"]))
+        self.v_range_desc.set(self._range_desc(self.v_range.get()))
+        if not self._summary_busy:
+            self.v_summary.set(f"摘要待生成，目标约 {options['target_chars']} 字")
 
         f = p.get("filters") or {}
         for key, var in self.v_filters.items():
@@ -701,16 +698,28 @@ class App:
             if gid in saved:
                 self.lst_groups.selection_set(i)
 
-    def _collect(self) -> dict:
-        keywords = [
-            ln.strip()
-            for ln in self.txt_keywords.get("1.0", "end").splitlines()
-            if ln.strip()
-        ]
+    def _summary_options(self) -> dict:
+        """仅使用已保存的设置，生成过程中编辑提示词不会改变当前请求。"""
+        config = self.cfg.get("summary", {})
+        prompt = str(self.prefs.get("summary_prompt") or config.get("prompt") or DEFAULT_DIGEST_PROMPT)
         try:
-            interval = max(0, int(self.v_interval.get() or 0))
+            chars = int(self.prefs.get("summary_target_chars") or config.get("target_chars") or DIGEST_DEFAULT_CHARS)
+        except (TypeError, ValueError):
+            chars = DIGEST_DEFAULT_CHARS
+        return {"prompt": prompt, "target_chars": chars if 1 <= chars <= 100000 else DIGEST_DEFAULT_CHARS}
+
+    def reset_summary_prompt(self) -> None:
+        self.txt_summary_prompt.delete("1.0", "end")
+        self.txt_summary_prompt.insert("1.0", DEFAULT_DIGEST_PROMPT)
+        self.status.set("已恢复默认提示词；点击保存设置后生效")
+
+    def _collect(self) -> dict:
+        try:
+            target_chars = int(self.v_summary_chars.get())
+            if not 1 <= target_chars <= 100000:
+                raise ValueError
         except ValueError:
-            raise ValueError("摘要间隔必须是整数（分钟）")
+            raise ValueError("摘要目标字数必须是 1～100000 的整数")
         try:
             minlen = max(0, int(self.v_minlen.get() or 0))
         except ValueError:
@@ -718,8 +727,9 @@ class App:
 
         groups = [self._group_ids[i] for i in self.lst_groups.curselection()]
         return {
-            "keywords": keywords,
-            "interval_minutes": interval,
+            **self.prefs,
+            "summary_prompt": self.txt_summary_prompt.get("1.0", "end").strip(),
+            "summary_target_chars": target_chars,
             "groups": groups,
             "filters": {
                 "skip_face_only": bool(self.v_filters["skip_face_only"].get()),
@@ -749,11 +759,13 @@ class App:
                 self._log_ui(f"[界面] 保存失败：{exc}\n")
             return False
         self.prefs = data
+        self.v_range_desc.set(self._range_desc(self.v_range.get()))
+        if not self._summary_busy:
+            self.v_summary.set(f"摘要待生成，目标约 {data['summary_target_chars']} 字")
         n_groups = len(data["groups"]) or "全部"
         self.status.set(
-            f"设置已保存 · 关键词 {len(data['keywords'])} 个 · "
-            f"间隔 {data['interval_minutes'] or '默认'} 分钟 · 群 {n_groups}"
-            + ("（服务运行中，重启后生效）" if self.proc else "")
+            f"设置已保存 · 摘要约 {data['summary_target_chars']} 字，下一次生成生效 · 群 {n_groups}"
+            + ("（其他服务设置重启后生效）" if self.proc else "")
         )
         return True
 
@@ -1083,8 +1095,9 @@ class App:
         self.btn_summary.configure(state="disabled")
         self.btn_summary_range.configure(state="disabled")
         self.summary_bar.start(12)
+        options = self._summary_options()
         target = f"最近 {hours // 24} 天" if kind == "range" and hours else "增量"
-        note = f"开始生成{target}摘要，目标约 3000 字；正在读取消息并调用 DeepSeek…"
+        note = f"开始生成{target}摘要，目标约 {options['target_chars']} 字；正在读取消息并调用 DeepSeek…"
         self.v_summary.set(note)
         self.status.set(note)
         self._log_ui(f"[界面] {note}\n")
@@ -1095,7 +1108,10 @@ class App:
                 url = f"http://127.0.0.1:{port}/summary/now?kind={kind}"
                 if kind == "range" and hours:
                     url += f"&hours={int(hours)}"
-                req = urllib.request.Request(url, data=b"", method="POST")
+                req = urllib.request.Request(
+                    url, data=json.dumps(options, ensure_ascii=False).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
                 op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
                 with op.open(req, timeout=1800) as response:
                     body = json.loads(response.read().decode("utf-8"))
@@ -1112,7 +1128,7 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def summary_by_range(self) -> None:
-        """按选定时间范围重做约 3000 字的完整摘要。"""
+        """按选定时间范围生成完整摘要。"""
         label = self.v_range.get()
         hours = DIGEST_RANGES[0][1]
         for text, h, _c in DIGEST_RANGES:

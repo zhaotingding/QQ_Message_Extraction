@@ -70,14 +70,8 @@ max_download_mb    = 20
 images_per_minute  = 60       # 图片处理限速，控制成本
 
 [summary]
-interval_minutes    = 30      # 周期摘要间隔
-daily_report_at     = "22:00" # 每日报告时间（本地时区）
-chunk_char_budget   = 6000    # 单次送模型的最大字符数
-min_messages        = 8       # 窗口内消息少于此数则不生成摘要
-
-[score]
-# 跨群热点统计的候选词；沿用旧表名以兼容配置，不再进行消息评分
-keywords = ["招聘", "内推", "开源", "白嫖", "免费", "踩坑", "漏洞", "论文", "数据集", "复现", "实测", "避雷"]
+prompt              = ""      # 空 = 使用内置申论式纪要提示词，可在界面设置中编辑
+target_chars        = 3000    # 由模型归纳控制篇幅，不截取生成结果
 
 [napcat]
 # 协议端（NapCat）的启动脚本。

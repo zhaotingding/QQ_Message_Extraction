@@ -17,6 +17,20 @@ class BudgetExceeded(Exception):
     pass
 
 
+class IncompleteResponse(RuntimeError):
+    """接口已返回并计费，但正文没有完整结束；保留原文供摘要保存残稿。"""
+
+    def __init__(self, content: str, finish_reason: str, max_tokens: int, output_tokens):
+        self.content = content
+        self.finish_reason = finish_reason
+        self.max_tokens = max_tokens
+        self.output_tokens = output_tokens
+        super().__init__(
+            f"模型输出未完成（finish_reason={finish_reason}，输出 {output_tokens} Token，"
+            f"max_tokens={max_tokens}）；请检查输出额度或模型返回原因，本次未自动重试"
+        )
+
+
 class _Transient(Exception):
     """可重试的失败：连接被掐、超时、5xx、429。
 
@@ -188,13 +202,22 @@ class LLM:
             cost = self.cost_cny(int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)),
                                  int(usage.get("prompt_cache_hit_tokens", 0)), ts=started)
         choice = (data.get("choices") or [{}])[0]
-        status = "输出未完成" if choice.get("finish_reason") == "length" else "完成"
+        finish_reason = choice.get("finish_reason") or "missing"
+        content = (choice.get("message") or {}).get("content") or ""
+        complete = finish_reason == "stop" and bool(content.strip())
+        reason = "stop/empty_content" if finish_reason == "stop" and not content.strip() else finish_reason
+        status = "完成" if complete else f"输出未完成（{reason}）"
         if usage is None:
             status += "，用量未知"
         self.store.record_api_call(ts=started, purpose=purpose, source_ids=source_ids or [],
                                    model=payload["model"], usage=usage, cost_cny=cost, status=status)
-        log.info("API 请求成功 · %s · 输入 %s / 输出 %s Token", purpose,
-                 (usage or {}).get("prompt_tokens", "未知"), (usage or {}).get("completion_tokens", "未知"))
+        if complete:
+            log.info("API 请求成功 · %s · 输入 %s / 输出 %s Token", purpose,
+                     (usage or {}).get("prompt_tokens", "未知"), (usage or {}).get("completion_tokens", "未知"))
+        else:
+            log.warning("API 输出未完成 · %s · finish_reason=%s · 输入 %s / 输出 %s Token · max_tokens=%s",
+                        purpose, reason, (usage or {}).get("prompt_tokens", "未知"),
+                        (usage or {}).get("completion_tokens", "未知"), payload.get("max_tokens", "默认"))
         return data
 
     async def chat(
@@ -247,9 +270,17 @@ class LLM:
 
         data = await self._accounted_post(payload, purpose, source_ids)
 
-        # 兜底：若还是被截断且正文为空，放大预算重试一次。
-        # 没有这层保护会静默产出空摘要，用户完全察觉不到。
         choice = (data.get("choices") or [{}])[0]
+        if require_complete:
+            content = (choice.get("message") or {}).get("content") or ""
+            finish_reason = choice.get("finish_reason") or "missing"
+            if finish_reason != "stop" or not content.strip():
+                reason = "stop/empty_content" if finish_reason == "stop" else finish_reason
+                raise IncompleteResponse(content, reason, budget,
+                                         (data.get("usage") or {}).get("completion_tokens", "未知"))
+            return content.strip()
+
+        # 非摘要调用保留旧的空正文兜底；摘要额度由调用方预估，未完成时不追加收费请求。
         if not (choice.get("message") or {}).get("content", "").strip() and choice.get(
             "finish_reason"
         ) == "length":
@@ -272,8 +303,6 @@ class LLM:
                     budget,
                 )
 
-        if require_complete and choice.get("finish_reason") == "length":
-            raise RuntimeError("模型输出未完成，请重新生成；本次不保存残缺摘要")
         try:
             # **返回前 strip()**。理由：上面判定「空正文」时用的就是 strip()，
             # 如果这里把 "   " 原样返回，就等于「判定它为空、却交给调用方一个非空串」，

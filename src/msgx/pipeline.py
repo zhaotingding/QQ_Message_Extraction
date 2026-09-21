@@ -22,7 +22,7 @@ log = logging.getLogger("msgx.pipeline")
 
 
 class Pipeline:
-    """消息总线：接入 → 入库 → 带配文图片解析 → 周期摘要。"""
+    """消息总线：接入 → 入库 → 带配文图片解析，摘要仅由用户手动生成。"""
 
     def __init__(self, cfg: dict | None = None):
         self.cfg = cfg or load()
@@ -95,8 +95,6 @@ class Pipeline:
             # 表现为「服务日志显示协议端已连接，但数据库里一条消息都没有」。
             asyncio.create_task(self._ingest_loop(), name="ingest"),
             asyncio.create_task(self._media_loop(), name="media"),
-            asyncio.create_task(self._summary_loop(), name="summary"),
-            asyncio.create_task(self._daily_loop(), name="daily"),
             asyncio.create_task(self._prune_loop(), name="prune"),
             asyncio.create_task(self._billing_loop(), name="billing"),
             asyncio.create_task(self._watchdog_loop(), name="watchdog"),
@@ -334,32 +332,6 @@ class Pipeline:
             except Exception as e:  # noqa: BLE001
                 log.warning("媒体循环异常: %s", e)
                 await asyncio.sleep(5)
-
-    async def _summary_loop(self) -> None:
-        interval = max(1, int(self.cfg["summary"].get("interval_minutes", 30))) * 60
-        while not self._stop.is_set():
-            try:
-                await asyncio.sleep(interval)
-                await self.summarizer.run_periodic()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001
-                log.warning("摘要循环异常: %s", e)
-
-    async def _daily_loop(self) -> None:
-        target = str(self.cfg["summary"].get("daily_report_at", "22:00"))
-        last_day = ""
-        while not self._stop.is_set():
-            try:
-                await asyncio.sleep(60)
-                now = datetime.now()
-                if now.strftime("%H:%M") == target and now.strftime("%Y-%m-%d") != last_day:
-                    last_day = now.strftime("%Y-%m-%d")
-                    await self.summarizer.run_daily()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001
-                log.warning("日报循环异常: %s", e)
 
     async def _prune_loop(self) -> None:
         while not self._stop.is_set():

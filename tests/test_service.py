@@ -172,8 +172,12 @@ def main() -> int:
     st, body = call("/summary/now?kind=range&hours=0", post=True)
     check("hours=0 返回 400", st == 400, str(st))
     st, body = call("/summary/now?kind=range&hours=72", post=True)
-    check("hours 合法时正常受理（未配模型 → created 为空）",
-          st == 200 and isinstance(body.get("created"), list), f"{st} {str(body)[:90]}")
+    check("hours 合法但未配模型时明确说明原因",
+          st == 502 and "LLM 未配置" in body.get("error", ""), f"{st} {str(body)[:90]}")
+    for kind in ("periodic", "daily"):
+        st, body = call(f"/summary/now?kind={kind}", post=True)
+        check(f"已删除 {kind} 摘要入口，不回退为付费增量请求",
+              st == 400 and body.get("ok") is False)
 
     print("\n=== WebSocket 端点契约 ===")
     try:

@@ -8,11 +8,13 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from msgx.config import DEFAULTS
+from msgx.onebot import _summary_now
 from msgx.pipeline import Pipeline
 
 fails: list[str] = []
@@ -43,6 +45,10 @@ async def main() -> None:
             await pipe.start()
             await asyncio.sleep(0)
             check("启动不发起模型探测", pipe.llm._post.await_count == 0)
+            check("启动不创建任何自动摘要任务",
+                  {task.get_name() for task in pipe._tasks} == {"ingest", "media", "prune", "billing", "watchdog"})
+            check("旧摘要定时循环已删除",
+                  not hasattr(pipe, "_summary_loop") and not hasattr(pipe, "_daily_loop"))
             check("评分器和通知器已从管道移除", not hasattr(pipe, "scorer") and not hasattr(pipe, "notifier"))
             for mid, message in enumerate([
                 [{"type": "at", "data": {"qq": "all"}}, {"type": "text", "data": {"text": "紧急通知"}}],
@@ -92,6 +98,41 @@ async def main() -> None:
             check("关闭入库过滤后保留纯图，仍由媒体层跳过解析", len(pipe.store.pending_media()) == 2)
         finally:
             await pipe.stop()
+
+    print("\n=== 手动摘要接口 ===")
+    summarizer = SimpleNamespace(run_digest=AsyncMock(return_value={"content": "完整摘要"}))
+
+    class Request:
+        app = {"pipe": SimpleNamespace(summarizer=summarizer)}
+
+        def __init__(self, query, body=None):
+            self.query = query
+            self.body = body
+            self.can_read_body = body is not None
+
+        async def json(self):
+            return self.body
+
+    for kind in ("periodic", "daily", "typo"):
+        response = await _summary_now(Request({"kind": kind}))
+        check(f"拒绝旧入口或未知类型 {kind}，不调用模型",
+              response.status == 400 and summarizer.run_digest.await_count == 0)
+    for body in (["错误对象"], {"prompt": 1}, {"target_chars": True},
+                 {"target_chars": 0}, {"target_chars": 100001}, {"target_chars": "3000"}):
+        response = await _summary_now(Request({"kind": "range", "hours": "24"}, body))
+        check(f"非法摘要设置不发起请求 {body}",
+              response.status == 400 and summarizer.run_digest.await_count == 0)
+    response = await _summary_now(Request({"kind": "range", "hours": "72"},
+                                          {"prompt": "用户设定提示词", "target_chars": 4500}))
+    check("按范围摘要完整转交已保存提示词与目标字数",
+          response.status == 200 and summarizer.run_digest.call_args.kwargs == {
+              "full": True, "hours": 72, "prompt": "用户设定提示词", "target_chars": 4500})
+    response = await _summary_now(Request({"kind": "digest"}))
+    check("空请求使用服务配置，不以 3000 覆盖用户设置",
+          response.status == 200 and summarizer.run_digest.call_args.kwargs == {"full": False})
+    response = await _summary_now(Request({"kind": "full"}))
+    check("保留手动全量入口", response.status == 200
+          and summarizer.run_digest.call_args.kwargs == {"full": True})
 
 
 asyncio.run(main())

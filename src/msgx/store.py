@@ -461,8 +461,8 @@ class Store:
         """跨群热点视角的窗口上界：最近一份热点报告覆盖到的时间点。"""
         return self.window_end_by_kind("hotspot")
 
-    def messages_between_all(self, start: int, end: int, limit: int = 8000) -> list:
-        """窗口内全部群的消息，按时间升序。供跨群热点统计使用。"""
+    def messages_between_all(self, start: int, end: int, limit: int = -1) -> list:
+        """窗口内全部未过滤消息，按时间升序；默认不限制条数，避免摘要漏掉尾部。"""
         return list(
             self.conn.execute(
                 "SELECT * FROM messages WHERE ts>? AND ts<=? AND media_state<>'filtered' ORDER BY ts ASC LIMIT ?",

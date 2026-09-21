@@ -5,7 +5,7 @@
   * `.ui/preferences.json` 是**每个人本地**的偏好，不入库，由界面自由读写。
 
 服务进程通过环境变量 `MSGX_PREFS` 获得偏好文件路径，在 `config.load()` 里叠加。
-这样界面改设置 → 重启服务 → 生效，全程不需要动 config.toml，也就不会和别人冲突。
+摘要提示词和目标字数随每次手动请求传入；其他服务设置在重启后生效。
 """
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ ENV_PREFS = "MSGX_PREFS"
 # 界面可调项的默认值。注意「默认不过滤任何东西」——
 # 过滤是 0.2.0 才引入的能力，默认值必须保持与 0.1.0 完全一致的行为。
 DEFAULTS: dict = {
-    "keywords": [],           # 空 = 沿用 config.toml 里的关键词
-    "interval_minutes": 0,    # 0 = 沿用 config.toml 里的间隔
+    "summary_prompt": "",    # 空 = 沿用 config.toml 或内置提示词
+    "summary_target_chars": 3000,
     "groups": [],             # 空 = 关注全部群（群列表是「全选/多选」语义，空即全部）
     "filters": {
         "skip_face_only": False,    # 纯表情 / 表情包
@@ -113,7 +113,11 @@ def load_from_env() -> dict | None:
         data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return _merge(json.loads(json.dumps(DEFAULTS)), data if isinstance(data, dict) else {})
+    raw = data if isinstance(data, dict) else {}
+    prefs = _merge(json.loads(json.dumps(DEFAULTS)), raw)
+    if "summary_target_chars" not in raw:
+        prefs.pop("summary_target_chars", None)
+    return prefs
 
 
 def apply_to_config(cfg: dict, prefs: dict) -> dict:
@@ -124,14 +128,13 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
     """
     out = json.loads(json.dumps(cfg, ensure_ascii=False, default=str))
 
-    keywords = [str(k).strip() for k in (prefs.get("keywords") or []) if str(k).strip()]
-    if keywords:
-        out["score"]["keywords"] = keywords
-
+    prompt = str(prefs.get("summary_prompt") or "").strip()
+    if prompt:
+        out.setdefault("summary", {})["prompt"] = prompt
     try:
-        interval = int(prefs.get("interval_minutes") or 0)
-        if interval > 0:
-            out["summary"]["interval_minutes"] = interval
+        target_chars = int(prefs.get("summary_target_chars") or 0)
+        if target_chars > 0:
+            out.setdefault("summary", {})["target_chars"] = target_chars
     except (TypeError, ValueError):
         pass
 
@@ -153,7 +156,7 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
     if "napcat_hidden" in prefs:
         out.setdefault("napcat", {})["hidden"] = bool(prefs.get("napcat_hidden"))
 
-    # 平台 token：留空 = 沿用 config.toml（和关键词同一套「留空即沿用」语义）
+    # 平台 token：留空 = 沿用 config.toml。
     token = str(prefs.get("platform_token") or "").strip()
     if token:
         out.setdefault("billing", {})["platform_token"] = token

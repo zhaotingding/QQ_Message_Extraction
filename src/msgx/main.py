@@ -111,11 +111,8 @@ async def cmd_run(cfg: dict, stop_file: str | None = None) -> None:
 async def cmd_summary(cfg: dict, kind: str, hours: int = 24) -> None:
     pipe = Pipeline(cfg)
     try:
-        if kind == "daily":
-            path = await pipe.summarizer.run_daily()
-            print(f"日报已生成: {path}" if path else "没有可汇总的内容")
-        elif kind == "full":
-            # full = 按时间范围重做，各范围统一以约 3000 字为目标。
+        if kind == "full":
+            # full = 按时间范围重做，目标字数与提示词沿用配置。
             item = await pipe.summarizer.run_digest(full=True, hours=hours)
             label = f"近 {hours} 小时" if hours < 24 else f"近 {hours // 24} 天"
             if item:
@@ -128,12 +125,6 @@ async def cmd_summary(cfg: dict, kind: str, hours: int = 24) -> None:
         elif kind == "digest":
             item = await pipe.summarizer.run_digest()
             print(f"群消息纪要已生成: {item['path']}" if item else "自上次纪要以来没有新消息")
-        else:
-            created = await pipe.summarizer.run_periodic(force=True)
-            if not created:
-                print("没有需要生成摘要的窗口（消息不足或 LLM 不可用）")
-            for c in created:
-                print(f"[{c['group_id']}] {c['count']} 条 -> {c['path']}")
     finally:
         await pipe.stop()
 
@@ -223,8 +214,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p_sum = sub.add_parser("summary", help="立即生成摘要")
     p_sum.add_argument(
-        "--kind", choices=["digest", "full", "periodic", "daily"], default="digest",
-        help="digest=增量纪要（默认）；full=按 --hours 范围重做；periodic/daily=按群摘要/日报",
+        "--kind", choices=["digest", "full"], default="digest",
+        help="digest=增量纪要（默认）；full=按 --hours 范围重做",
     )
     p_sum.add_argument(
         "--hours", type=int, default=24,

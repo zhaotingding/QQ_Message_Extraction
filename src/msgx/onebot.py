@@ -124,24 +124,37 @@ async def _summary_now(request: web.Request) -> web.Response:
 async def _summary_request(request: web.Request) -> web.Response:
     pipe = request.app["pipe"]
     kind = request.query.get("kind", "digest")
-    if kind == "daily":
-        path = await pipe.summarizer.run_daily()
-        return web.json_response({"ok": True, "path": path})
-    if kind == "periodic":
-        created = await pipe.summarizer.run_periodic(force=True)
-        return web.json_response({"ok": True, "created": created})
+    if kind not in ("digest", "full", "range"):
+        return web.json_response({"ok": False, "error": "仅支持手动增量或按时间范围生成摘要"}, status=400)
+    options = {}
+    if request.can_read_body:
+        try:
+            data = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return web.json_response({"ok": False, "error": "摘要设置必须是 JSON 对象"}, status=400)
+        if not isinstance(data, dict):
+            return web.json_response({"ok": False, "error": "摘要设置必须是 JSON 对象"}, status=400)
+        if "prompt" in data:
+            if not isinstance(data["prompt"], str):
+                return web.json_response({"ok": False, "error": "prompt 必须是文本"}, status=400)
+            options["prompt"] = data["prompt"]
+        if "target_chars" in data:
+            value = data["target_chars"]
+            if type(value) is not int or not 1 <= value <= 100000:
+                return web.json_response({"ok": False, "error": "目标字数必须是 1 到 100000 的整数"}, status=400)
+            options["target_chars"] = value
     if kind == "range":
-        # 用户指定的时间范围：hours=24/72/168/720，目标字数由 chars_for_hours 决定
+        # 用户指定的统计窗口，不会创建定时摘要任务。
         try:
             hours = int(request.query.get("hours", 24))
         except ValueError:
             return web.json_response({"ok": False, "error": "hours 必须是整数"}, status=400)
         if hours <= 0:
             return web.json_response({"ok": False, "error": "hours 必须为正"}, status=400)
-        item = await pipe.summarizer.run_digest(full=True, hours=hours)
+        item = await pipe.summarizer.run_digest(full=True, hours=hours, **options)
         return web.json_response({"ok": True, "created": [item] if item else []})
     # digest（默认）= 接着上次已总结过的消息做增量纪要；full = 近 24h 全量重做
-    item = await pipe.summarizer.run_digest(full=(kind == "full"))
+    item = await pipe.summarizer.run_digest(full=(kind == "full"), **options)
     return web.json_response({"ok": True, "created": [item] if item else []})
 
 

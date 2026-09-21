@@ -65,6 +65,10 @@ async def main():
         unknown = [r for r in items if r["cost_cny"] is None]
         check("失败或未返回 usage 保持未知，不记成零费用", len(unknown) == 2 and all(r["in_tokens"] is None for r in unknown))
         known = [r for r in items if r["cost_cny"] is not None]
+        incomplete = [r for r in items if r["status"].startswith("输出未完成")]
+        check("输出未完成仍记入已返回用量及费用，并标注结束原因",
+              len(incomplete) == 2 and all("length" in r["status"]
+                  and r["cost_cny"] > 0 and r["out_tokens"] == 50 for r in incomplete))
         check("输入输出和缓存 Token 与 API 返回一致", all((r["in_tokens"], r["out_tokens"], r["cache_hit_tokens"]) == (100, 50, 60) for r in known))
         check("逐次费用与日累计相等且没有重复计费", abs(store.cost_totals()["cost_cny"] - 0.25 - sum(r["cost_cny"] for r in known)) < 1e-10)
         check("旧版未归因合计单列，不伪造消息记录", abs(data["historical_unattributed_cny"] - 0.25) < 1e-10)

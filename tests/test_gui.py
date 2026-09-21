@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import sys
+import json
 import time
 from pathlib import Path
 
@@ -43,10 +44,11 @@ root.update()  # 强制完成一次几何计算，布局错误会在这时抛出
 print("  界面构建完成，无异常")
 
 print("\n=== 控件取值 ===")
-interval = app.v_interval.get()
-check("摘要间隔可读", interval.isdigit(), f"值={interval!r}")
-kw = app.txt_keywords.get("1.0", "end").strip()
-check("关键词框已填充", len(kw) > 0, f"{len(kw.splitlines())} 行")
+chars = app.v_summary_chars.get()
+check("摘要目标字数可读", chars.isdigit(), f"值={chars!r}")
+prompt = app.txt_summary_prompt.get("1.0", "end").strip()
+check("摘要提示词已填充", bool(prompt), f"{len(prompt)} 字符")
+check("不再提供自动摘要与热点设置", not hasattr(app, "v_interval") and not hasattr(app, "txt_keywords"))
 check("群列表已加载", isinstance(app._group_ids, list), f"{len(app._group_ids)} 个群")
 
 data = app._collect()
@@ -722,12 +724,38 @@ check("消费明细紧邻设置，全文有独立页", [app.nb.tab(t, "text") fo
       ["运行状态", "实时消息", "设置", "消费明细", "摘要全文"])
 _saved_proc = app.proc
 app.proc = object()  # 仅模拟已启动；拦截线程，禁止真实请求。
+_saved_prefs = dict(app.prefs)
+_saved_prompt = app.txt_summary_prompt.get("1.0", "end").strip()
+_saved_chars = app.v_summary_chars.get()
+app.txt_summary_prompt.delete("1.0", "end")
+app.txt_summary_prompt.insert("1.0", "请按主题总结到 {{目标字数}} 字")
+app.v_summary_chars.set("4200")
+app.prefs["unrelated_test_preference"] = "保持原样"
+with patch("msgx.gui.prefs_mod.save") as _save:
+    check("保存提示词与字数且下一次生成生效", app.save_prefs()
+          and _save.call_args.args[0]["summary_target_chars"] == 4200
+          and _save.call_args.args[0]["summary_prompt"] == "请按主题总结到 {{目标字数}} 字"
+          and "4200" in app.v_range_desc.get())
+    check("保存保留不归此页管理的偏好", _save.call_args.args[0]["unrelated_test_preference"] == "保持原样")
+app.txt_summary_prompt.delete("1.0", "end")
+app.txt_summary_prompt.insert("1.0", "尚未保存的内容")
+app.v_summary_chars.set("9000")
 with patch("msgx.gui.threading.Thread") as _thread:
     app.summary_now("range", 72)
     app.summary_now("range", 72)
     check("点击立即标记忙碌并阻止重复请求", app._summary_busy and _thread.call_count == 1)
     check("生成期间两个入口禁用", app.btn_summary.instate(["disabled"]) and app.btn_summary_range.instate(["disabled"]))
     check("无需等 API 即可看到开始日志", "开始生成最近 3 天摘要" in app.log.get("1.0", "end"))
+    check("日志采用已保存目标字数", "目标约 4200 字" in app.v_summary.get())
+    with patch("msgx.gui.urllib.request.build_opener") as _opener:
+        _opener.return_value.open.return_value.__enter__.return_value.read.return_value = b'{"created": []}'
+        _thread.call_args.kwargs["target"]()
+        _request = _opener.return_value.open.call_args.args[0]
+        _payload = json.loads(_request.data.decode("utf-8"))
+        check("手动请求携带已保存提示词和字数，忽略未保存编辑", _payload == {
+            "prompt": "请按主题总结到 {{目标字数}} 字", "target_chars": 4200})
+        check("时间范围与提示词一并提交", "kind=range&hours=72" in _request.full_url
+              and _request.get_header("Content-type") == "application/json")
     app._apply_health({"summary_progress": {"state": "running", "message": "正在总结第 2/6 块"}})
     check("阶段进度和耗时可见", "第 2/6 块" in app.v_summary.get() and "秒" in app.v_summary.get())
     app._summary_finished({"error": "模型输出未完成"})
@@ -759,11 +787,19 @@ with patch("msgx.gui.threading.Thread") as _thread:
     check("切换记录后不混入过期来源响应", "过期响应" not in app.usage_detail.get("1.0", "end"))
     app.usage_table.selection_remove("7")
 app.proc = _saved_proc
+app.reset_summary_prompt()
+from msgx.summarize import DEFAULT_DIGEST_PROMPT  # noqa: E402
+check("恢复默认仅修改编辑框，尚需保存", app.txt_summary_prompt.get("1.0", "end").strip() == DEFAULT_DIGEST_PROMPT.strip()
+      and app._summary_options()["prompt"] == "请按主题总结到 {{目标字数}} 字"
+      and app.v_summary_chars.get() == "9000")
+app.prefs = _saved_prefs
+app.txt_summary_prompt.delete("1.0", "end")
+app.txt_summary_prompt.insert("1.0", _saved_prompt)
+app.v_summary_chars.set(_saved_chars)
 
 print("\n=== 状态和错误仅在界面内显示，不弹通知 ===")
 _labels = [str(w.cget("text")) for w in allw if isinstance(w, (ttk.Label, ttk.LabelFrame, ttk.Checkbutton))]
-check("关注词用途不再涉及评分或提醒", "热点关注词" in _labels and
-      not any("模型判定是否值得提醒" in value for value in _labels))
+check("删除热点关键词和摘要频率设置", "热点关注词" not in _labels and "摘要频率" not in _labels)
 check("图片规则明确按消息配文判断", any("消息附带文字时才调用 API" in value for value in _labels)
       and "纯图片（消息未附带文字）" in _labels)
 with patch.object(_mb, "showinfo") as _info, patch.object(_mb, "showerror") as _error:
@@ -774,10 +810,10 @@ with patch.object(_mb, "showinfo") as _info, patch.object(_mb, "showerror") as _
     app.prune_groups()
     check("未启动时查询群仅显示状态栏", "先启动服务" in app.status.get())
 
-    _interval = app.v_interval.get()
-    app.v_interval.set("不是整数")
-    check("无效设置直接指出问题", not app.save_prefs() and "摘要间隔必须是整数" in app.status.get())
-    app.v_interval.set(_interval)
+    _chars = app.v_summary_chars.get()
+    app.v_summary_chars.set("不是整数")
+    check("无效设置直接指出问题", not app.save_prefs() and "摘要目标字数必须是" in app.status.get())
+    app.v_summary_chars.set(_chars)
     with patch("msgx.gui.prefs_mod.save", side_effect=OSError("测试保存失败")):
         check("保存失败留在状态栏和日志", not app.save_prefs() and "测试保存失败" in app.status.get()
               and "测试保存失败" in app.log.get("1.0", "end"))

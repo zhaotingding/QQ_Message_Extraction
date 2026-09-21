@@ -59,13 +59,8 @@ DEFAULTS: dict = {
         "images_per_minute": 60,
     },
     "summary": {
-        "interval_minutes": 30,
-        "daily_report_at": "22:00",
-        "chunk_char_budget": 6000,
-        "min_messages": 8,
-    },
-    "score": {  # 仅保留热点关键词的旧配置键，已无消息评分。
-        "keywords": [],
+        "prompt": "",             # 空 = 使用内置申论式纪要提示词
+        "target_chars": 3000,
     },
     # 协议端（NapCat）。本服务只监听协议端连入，**不负责启动它**，所以默认都是空的。
     #   start_script —— 填上后界面出现「启动协议端(NapCat)」按钮（可见排障模式用）

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import tempfile
 from pathlib import Path
@@ -27,7 +28,7 @@ from pathlib import Path
 PROJ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJ / "src"))
 
-from msgx.llm import THINK_MIN_TOKENS, LLM, _Transient  # noqa: E402
+from msgx.llm import THINK_MIN_TOKENS, IncompleteResponse, LLM, _Transient  # noqa: E402
 
 fails: list[str] = []
 
@@ -154,6 +155,74 @@ check("放大后仍为空 → 返回空串（由调用方决定降级）", out =
 # 回归：正常返回时不该多打一次请求（否则每次调用都白花一倍输入钱）
 budgets, out = asyncio.run(escalate(make_llm(), ok_response()))
 check("正常返回只发一次请求", len(budgets) == 1, str(budgets))
+
+# ---------------------------------------------------------------- 摘要完整性
+
+print("\n=== 摘要完整性：保留预估额度，未完成不自动追加请求 ===")
+
+
+class CaptureLogs(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+async def complete_summary(reply):
+    llm = make_llm()
+    sent = []
+    async def fake_post(payload):
+        sent.append(payload.copy())
+        return reply
+    llm._post = fake_post
+    handler = CaptureLogs()
+    logger = logging.getLogger("msgx.llm")
+    old_level = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    try:
+        try:
+            result = await llm.chat("sys", "完整消息", max_tokens=17342, think=False,
+                                    purpose="摘要成稿", source_ids=[123], require_complete=True)
+        except IncompleteResponse as exc:
+            result = exc
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+    return sent, result, handler.records, llm.store.details
+
+
+for reason, content in [("length", "残缺正文"), ("length", ""),
+                        ("content_filter", "待审核正文"), ("aborted", "中途停止"),
+                        ("insufficient_system_resource", ""), (None, "缺少结束原因"),
+                        ("stop", "   ")]:
+    reply = ok_response(content)
+    reply["choices"][0]["finish_reason"] = reason
+    sent, result, records, details = asyncio.run(complete_summary(reply))
+    label = f"{reason}/{bool(content.strip())}"
+    check(f"{label} 未完成摘要仅请求一次", len(sent) == 1)
+    check(f"{label} 保留摘要计算的 max_tokens", sent[0]["max_tokens"] == 17342)
+    check(f"{label} 错误包含原因、输出量、实际额度",
+          isinstance(result, IncompleteResponse) and str(reason or "missing") in str(result)
+          and "输出 5 Token" in str(result) and "max_tokens=17342" in str(result))
+    check(f"{label} 异常保留收到的原文供保存残稿",
+          isinstance(result, IncompleteResponse) and result.content == content)
+    check(f"{label} 日志明确告警且不报成功",
+          len(records) == 1 and records[0].levelno == logging.WARNING
+          and "API 请求成功" not in records[0].getMessage()
+          and "max_tokens=17342" in records[0].getMessage())
+    check(f"{label} 失败仍保留 Token、费用和来源",
+          len(details) == 1 and details[0]["usage"]["completion_tokens"] == 5
+          and details[0]["cost_cny"] > 0 and details[0]["source_ids"] == [123]
+          and details[0]["status"].startswith("输出未完成"))
+
+full_content = "# 总标题\n\n**独立主题**\n" + "完整内容，" * 4000
+sent, result, records, details = asyncio.run(complete_summary(ok_response(full_content)))
+check("完整长正文不截断、不额外改写", result == full_content and len(sent) == 1)
+check("完整响应才记录 API 成功", len(records) == 1 and records[0].levelno == logging.INFO
+      and "API 请求成功" in records[0].getMessage() and details[0]["status"] == "完成")
 
 # ---------------------------------------------------------------- 连接层
 
