@@ -200,17 +200,11 @@ def qq_db_report(verdicts: list[tuple[str, str]]) -> str:
 
     # 拿自己库里的最新消息做对照
     db = ROOT / "data" / "msgx.db"
-    db_last = None
+    db_last = db_latest_real(db)
     rhythm: list[tuple[str, int]] = []
     if db.exists():
         try:
             conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            # 必须把本工具自己注入的探针排除掉，否则「本库最新一条」永远是探针那一刻，
-            # 与 QQ 库做时间差对照就永远对不上（踩过：探针把 00:45 顶成 01:12）。
-            row = conn.execute(
-                "SELECT MAX(ts) FROM messages WHERE COALESCE(text, '') NOT LIKE '【链路自检】%'"
-            ).fetchone()
-            db_last = row[0] if row else None
             rhythm = _hour_rhythm(conn, time.localtime().tm_hour)
             conn.close()
         except Exception:  # noqa: BLE001
@@ -255,6 +249,28 @@ def health() -> dict | None:
     try:
         with op.open(f"{BASE}/health", timeout=4) as r:
             return json.loads(r.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def db_latest_real(db: Path | None = None) -> int | None:
+    """本库最新的一条**真实**消息的 ts（排除本工具注入的探针）。
+
+    两处都要用它：
+    1. 判断链路是否其实【正常】—— 时间很近就不该再喊「不推消息」（曾误报）；
+    2. 与 QQ 库做时间差对照。**必须排除探针**，否则「最新一条」永远是探针那一刻，
+       时间差永远对不上。
+    """
+    db = db or (ROOT / "data" / "msgx.db")
+    if not db.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        row = conn.execute(
+            "SELECT MAX(ts) FROM messages WHERE COALESCE(text, '') NOT LIKE '【链路自检】%'"
+        ).fetchone()
+        conn.close()
+        return row[0] if row and row[0] else None
     except Exception:  # noqa: BLE001
         return None
 
@@ -325,6 +341,12 @@ def main() -> int:
 
     verdicts: list[tuple[str, str]] = []
 
+    # 先取「本库最新一条真实消息」：它既能判断链路是否其实正常（见 ③），
+    # 又是 ⑤ 与 QQ 库做时间差对照的基准。**排除探针行**。
+    db_file = ROOT / "data" / "msgx.db"
+    db_last = db_latest_real(db_file)
+    link_fresh = db_last is not None and (time.time() - db_last) < 600
+
     # ---------- 1. 进程 ----------
     section("① 进程：是不是重复启动过？")
     table = snapshot()
@@ -392,13 +414,19 @@ def main() -> int:
                              "ingest 循环死了 —— 这是**代码问题**，不是协议端问题。"
                              "重启服务；若复现请保留 data/service.log。"))
         elif state == "alive":
-            print("    ⇒ 排除服务侧：处理链路完好，问题在协议端一侧。")
-            if n_conn:
+            print("    ⇒ 排除服务侧：处理链路完好。")
+            if link_fresh:
+                # ⚠️ 这里以前无条件追加「连着但不推消息事件」的告警，
+                # 结果**链路完全正常时也在喊**（2026-09-21 实测误报）。
+                # 判据：本库刚收过真实消息 ⇒ 一切正常，不要制造假警报。
+                print(f"    且本库 {(time.time() - db_last) / 60:.1f} 分钟前刚收过真实消息"
+                      " ⇒ 链路【正常】，无需处置。")
+            elif n_conn:
                 verdicts.append((
                     "协议端连着、能应答 API，但就是不推消息事件",
                     "「已连接」只证明 socket 通了，既不证明 QQ 登录态正常、更不证明有新消息进来。"
                     "先看下面的 ⑤：若 QQ 自己的消息库也没在写，问题就不在协议端。"
-                    "协议端侧可查 D:\\App\\NapCat\\logs\\（需含账号级的 fileLog: true，且要重启协议端才生效）。",
+                    "协议端侧可查 <NapCat 目录>\\logs\\（需含账号级的 fileLog: true，且要重启协议端才生效）。",
                 ))
 
     # ---------- 4. 二维码 ----------
