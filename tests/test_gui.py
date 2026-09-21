@@ -509,6 +509,79 @@ _mb.askyesno = _orig_ask  # type: ignore[assignment]
 N.running_instances = _orig_running  # type: ignore[assignment]
 N.launch = _orig_launch  # type: ignore[assignment]
 
+# ---------------------------------------------------------------------------
+# v0.5.6：「重启协议端后二维码从不弹出」的三处修复。
+# 复盘（napcat.log + 冻结形态推演）：冻结 = 「连着但不推」，点重置的瞬间旧连接还挂在
+# ws_peers 上；_apply_health 每 2 秒看一眼「已连接」就把 qr_watching 置 False ——
+# 刚武装的监视线程 2 秒内被掐死，而 bat（UAC→清场→重登→写码）20~60 秒后才写新码，
+# 等真要扫码时已经没人在盯文件。用户连点 4 次重置全部哑火，就是这个死循环。
+# ---------------------------------------------------------------------------
+print("\n=== 二维码监视：保护窗（v0.5.6）===")
+app.qr_watching = True
+app.qr_hold_until = time.time() + 120  # 刚点过「重启协议端」
+app._apply_health({
+    "ok": True, "ws_peers": ["127.0.0.1"], "counters": {}, "stats": {},
+})
+check("保护窗内：旧连接还在也不许杀监视线程", app.qr_watching is True, str(app.qr_watching))
+app.qr_hold_until = 0.0  # 保护窗已过
+app._apply_health({
+    "ok": True, "ws_peers": ["127.0.0.1"], "counters": {}, "stats": {},
+})
+check("保护窗外：连上即停（恢复原语义）", app.qr_watching is False, str(app.qr_watching))
+
+print("\n=== 二维码监视：每次武装都换代（v0.5.6）===")
+app.cfg["napcat"] = {"dir": ""}  # napcat_dir()=None → 线程立即返回，测试不弹窗
+_g0 = app.qr_gen
+app._start_qrcode_watch(fresh_only=True)
+_g1 = app.qr_gen
+app._start_qrcode_watch(fresh_only=True)
+check("每次调用换代号 +1（重置时的新基线请求不再被旧线程吞掉）",
+      app.qr_gen == _g0 + 2, f"{_g0} -> {app.qr_gen}")
+check("武装时设了 2 分钟保护窗", app.qr_hold_until > time.time() + 100, str(app.qr_hold_until))
+check("武装后监视为开启态", app.qr_watching is True, str(app.qr_watching))
+app.qr_watching = False
+
+print("\n=== 二维码弹窗：展示成功才推进基线（v0.5.6）===")
+import tempfile as _tf  # noqa: E402
+from PIL import Image as _Img  # noqa: E402
+
+_qrd = _tf.mkdtemp()
+_ok_png = os.path.join(_qrd, "ok.png")
+_Img.new("RGB", (20, 20), "blue").save(_ok_png)
+_ok_mtime = os.stat(_ok_png).st_mtime
+app._show_qrcode(_ok_png)
+check("成功展示后回填 shown mtime（监视线程据此推进基线）",
+      app.qr_shown_mtime == _ok_mtime, f"{app.qr_shown_mtime} vs {_ok_mtime}")
+check("弹窗真的建出来了", app.qr_win is not None, str(app.qr_win))
+app._close_qrcode()
+
+_bad_png = os.path.join(_qrd, "bad.png")
+with open(_bad_png, "wb") as f:
+    f.write(b"\x89PNG\r\n\x1a\nnot-a-real-png-body")
+app.qr_shown_mtime = 0.0
+app._qr_fail_logged = 0.0
+_n_before = app.log.get("1.0", "end").count("二维码读取失败")
+app._show_qrcode(_bad_png)
+check("半张/坏图不回填 shown mtime（下一秒自动重试同一张）",
+      app.qr_shown_mtime == 0.0, str(app.qr_shown_mtime))
+app._show_qrcode(_bad_png)
+app._show_qrcode(_bad_png)
+_fail_lines = app.log.get("1.0", "end").count("二维码读取失败") - _n_before
+check("坏图时给出可读报错（且只报一次）", _fail_lines == 1, str(_fail_lines))
+check("重试期失败日志去重（不每秒刷屏）", _fail_lines == 1, str(_fail_lines))
+
+print("\n=== 事件泵：一个坏事件不得带死全部刷新（v0.5.6）===")
+# _drain 靠结尾的 after() 自续；此前任何一个 handler 抛异常都会跳过自续，
+# 健康刷新/日志/二维码弹窗从此全部静默失效，界面却看着还活着。
+_orig_billing = app._apply_billing
+app._apply_billing = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[assignment]
+app.events.put(("billing", None))          # 会炸的事件
+app.events.put(("note", "泵还活着"))        # 排在后面、必须还能被处理的事件
+app._drain()                               # 直接跑一轮（不被 after 调度干扰）
+app._apply_billing = _orig_billing  # type: ignore[assignment]
+check("坏事件被兜住且记了日志", "事件处理异常" in app.log.get("1.0", "end"), "")
+check("坏事件之后的事件仍被处理（事件泵未死）", app.status.get() == "泵还活着", app.status.get())
+
 root.update()
 root.destroy()
 
