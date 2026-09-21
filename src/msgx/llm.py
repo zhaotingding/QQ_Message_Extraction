@@ -315,13 +315,8 @@ class LLM:
     async def _post(self, payload: dict, retries: int | None = None) -> dict:
         """POST 一次；**连接层失败自动重试**。
 
-        为什么必须有重试：实测本机到 api.deepseek.com 会偶发
-        `ServerDisconnectedError`。注意这**不是图片太大** —— v0.5.1 定量测过
-        （tools/probe_llm_flake.py）：13KB 与 126KB 的图各 6 次全部成功、中位 0.8s；
-        16 次纯文本也 0 失败。而且代理日志显示 `api.deepseek.com match GeoIP(cn)
-        using DIRECT`（**直连**，没走境外节点）。这属于链路中间的问题，
-        本地只能重试、不能修。v0.4.x 的 `describe_image` 没有任何重试，
-        一次抖动就把这张图的语义永久丢掉。
+        瞬时链路故障仍允许有限重试。大请求突发上传导致的断连由 _post_once
+        的上传节奏处理，不能靠反复重发大包解决。失败未返回 usage 时费用未知。
 
         ⚠️ **重试时绝不要 reset 会话。** v0.5.0 在这里调 `_reset_session()`
         （close 掉共享 session），实测会把**其他并发请求一起掐死**
@@ -357,14 +352,42 @@ class LLM:
     async def _post_once(self, payload: dict) -> dict:
         s = await self.session()
         base = self.llm["base_url"].rstrip("/")
+        encoded = json.dumps(payload).encode("utf-8")
+        paced = len(encoded) > 64 * 1024
         headers = {
             "Authorization": f"Bearer {self.key}",
             "Content-Type": "application/json",
+            "Content-Length": str(len(encoded)),
         }
         last = ""
+        stage = "连接或发送请求"
+        queued = 0
+        started = time.monotonic()
+
+        async def upload():
+            nonlocal stage, queued
+            stage = "上传请求体"
+            # 同一个 HTTP 请求分段写入，不拆消息、不增加模型调用。
+            # 本机约 452 KiB 大包直接写出会在 15～20 秒断连；相同内容按此节奏
+            # 上传已实测成功。保留 Content-Length，避免改成 chunked 传输编码。
+            for offset in range(0, len(encoded), 8192):
+                await asyncio.sleep(0.01)
+                chunk = encoded[offset:offset + 8192]
+                yield chunk
+                queued += len(chunk)
+            stage = "等待响应头"
+            log.info("API 请求体已提交：%d 字节，耗时 %.2fs；等待响应", queued, time.monotonic() - started)
+
         try:
             for url in (f"{base}/chat/completions", f"{base}/v1/chat/completions"):
-                async with s.post(url, headers=headers, json=payload) as r:
+                stage, queued, started = "连接或发送请求", 0, time.monotonic()
+                if paced:
+                    log.info("API 开始上传：%.1f KiB，单次请求，每段 8 KiB", len(encoded) / 1024)
+                # 每次尝试都创建新的迭代器，404 路径回退和重试不能复用耗尽的正文。
+                async with s.post(url, headers=headers, data=upload() if paced else encoded) as r:
+                    stage = "读取响应正文"
+                    if paced:
+                        log.info("API 响应头已收到：HTTP %d，耗时 %.2fs；正在接收结果", r.status, time.monotonic() - started)
                     body = await r.text()
                     if r.status == 200:
                         try:
@@ -377,11 +400,11 @@ class LLM:
                         raise _Transient(last)
                     if r.status != 404:
                         break
-        except aiohttp.ClientConnectionError as e:
+        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as e:
             # 含 ServerDisconnectedError / ClientOSError(10053) / ClientConnectorError
-            raise _Transient(f"{type(e).__name__}: {e}") from e
+            raise _Transient(f"{type(e).__name__}: {e}（阶段：{stage}）") from e
         except asyncio.TimeoutError as e:
-            raise _Transient("请求超时") from e
+            raise _Transient(f"请求超时（阶段：{stage}）") from e
         raise RuntimeError(last or "请求失败")
 
     # 这里原本有个 `_reset_session()`（close 掉共享 session 以「换掉半死的连接池」）。

@@ -21,6 +21,7 @@ SUITES = [
     ("计费口径", "test_cost.py"),
     ("逐请求消费明细", "test_usage.py"),
     ("LLM 调用层", "test_llm.py"),
+    ("大摘要 HTTP 上传", "test_transport.py"),
     ("纪要长度", "test_digest.py"),
     ("媒体校验", "test_media.py"),
     ("群列表属主", "test_groups.py"),
