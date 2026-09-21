@@ -211,12 +211,20 @@ class App:
         buttons2 = ttk.Frame(tab)
         buttons2.pack(fill="x")
         ttk.Label(buttons2, textvariable=self.v_range_desc, style="Hint.TLabel").pack(side="left")
-        # 协议端必须单独启动 —— 本服务只监听它连入。没配置就不显示这两个按钮。
+        # 协议端必须单独启动 —— 本服务只监听它连入。没配置就不显示这几个按钮。
+        # pack(side="right") 是「先 pack 的在最右」，所以下面的书写顺序 = 界面从右往左，
+        # 看的时候请从下往上读：刷新账单 | 协议端日志 | 启动协议端(NapCat) | 重启协议端。
         if self.napcat_script() or self.napcat_dir():
+            # 「重启」紧挨着「启动」：两者只差一个「先清场」，而这正是排障时最容易搞错的一点。
+            # 「启动」只是再注入一份（会和卡住的那份并存）；「重启」才是先全退再重登。
+            if napcat_mod.restart_script(self.cfg):
+                ttk.Button(buttons2, text="重启协议端", command=self.restart_napcat).pack(side="right")
             ttk.Button(
                 buttons2, text="启动协议端(NapCat)", command=self.start_napcat
-            ).pack(side="right", padx=8)
-            ttk.Button(buttons2, text="协议端日志", command=self.show_napcat_log).pack(side="right")
+            ).pack(side="right")
+            ttk.Button(buttons2, text="协议端日志", command=self.show_napcat_log).pack(
+                side="right", padx=8
+            )
         ttk.Button(buttons2, text="刷新账单", command=self.refresh_billing).pack(side="right", padx=8)
 
         log_frame = ttk.LabelFrame(tab, text="服务日志", padding=8)
@@ -375,10 +383,20 @@ class App:
         self.lst_groups.configure(yscrollcommand=sb.set)
         self.lst_groups.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        ttk.Button(gp, text="刷新群列表", command=self.refresh_groups).pack(anchor="w", pady=(8, 0))
+        row = ttk.Frame(gp)
+        row.pack(anchor="w", pady=(8, 0))
+        ttk.Button(row, text="刷新群列表", command=self.refresh_groups).pack(side="left")
+        # 「只保留当前账号的群」（v0.5.4）。群表是**历次登录的并集**：换个账号登进来
+        # 一次，它的全部群就永久留在库里（实测误登一次主号灌进来 30 个空群），
+        # 下拉框里再也找不到自己关心的那几个。这个按钮把不属于当前账号、又一条消息
+        # 都没有的群清掉 —— 有消息的一律保留（删了会让那个群的摘要静默失效）。
+        ttk.Button(
+            row, text="只保留当前账号的群", command=self.prune_groups
+        ).pack(side="left", padx=8)
         ttk.Label(
             gp,
-            text="群列表来自已入库的数据，需要先让服务跑一会儿再刷新。",
+            text="群列表来自已入库的数据；换过登录账号就会混进别的账号的群，"
+                 "可用「只保留当前账号的群」清掉（有消息的群一律保留）。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(4, 0))
 
@@ -618,46 +636,107 @@ class App:
 
     # ---------------- 群列表 ----------------
 
-    def refresh_groups(self) -> None:
-        # 先让服务经协议端调 get_group_list 拉真实群名（NapCat 就在线上，
-        # 没理由显示「(未命名)」）；服务没跑或协议端不在线时退回本地库。
-        fetched = False
+    def refresh_groups(self, prune: bool = False) -> dict:
+        """刷新群列表。``prune=True`` 时同时请服务删掉别的账号留下的空群。
+
+        先让服务经协议端调 get_group_list 拉真实群名（NapCat 就在线上，
+        没理由显示「(未命名)」）；服务没跑或协议端不在线时退回本地库。
+        返回服务端给的元信息（``uin`` / ``deleted`` / ``protected``），失败返回 ``{}``。
+        """
+        fetched: dict = {}
         if self.proc is not None:
             try:
                 port = int(self.cfg["onebot"]["http_port"])
-                req = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/groups/refresh", data=b"", method="POST"
-                )
+                url = f"http://127.0.0.1:{port}/groups/refresh"
+                if prune:
+                    url += "?prune=1"
+                req = urllib.request.Request(url, data=b"", method="POST")
                 op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                with op.open(req, timeout=15) as r:
-                    fetched = bool(json.loads(r.read().decode("utf-8")).get("ok"))
+                with op.open(req, timeout=20) as r:
+                    fetched = json.loads(r.read().decode("utf-8"))
             except Exception:  # noqa: BLE001
-                fetched = False
+                fetched = {}
         saved = set(self.prefs.get("groups") or [])
+        uin = str(fetched.get("uin") or "")
         self._group_ids = []
+        rows: list = []
         self.lst_groups.delete(0, "end")
         try:
             db = abs_path(self.cfg, "db_path")
             if db.exists():
                 conn = sqlite3.connect(str(db), timeout=3)
                 try:
-                    rows = list(conn.execute("SELECT id, name FROM groups ORDER BY id"))
+                    rows = list(
+                        conn.execute(
+                            "SELECT g.id, g.name, g.bot_uin,"
+                            " (SELECT COUNT(*) FROM messages m WHERE m.group_id = g.id)"
+                            " FROM groups g ORDER BY g.id"
+                        )
+                    )
                 finally:
                     conn.close()
-                for gid, name in rows:
-                    gid, name = str(gid), str(name or "")
+                for gid, name, owner, n in rows:
+                    gid, name, owner = str(gid), str(name or ""), str(owner or "")
                     self._group_ids.append(gid)
-                    self.lst_groups.insert("end", f"{name}  ({gid})" if name else f"(未命名)  {gid}")
+                    label = f"{name}  ({gid})" if name else f"(未命名)  {gid}"
+                    # 属主看板：只有在「知道当前账号」且「这个群记的是别的账号」时才标。
+                    # 属主为空 = 未知（老数据），不当成「别人的群」——那会误标一大片。
+                    if uin and owner and owner != uin:
+                        label += "   ⚠ 非当前账号"
+                    elif n == 0:
+                        label += "   · 0 条"
+                    self.lst_groups.insert("end", label)
         except Exception as exc:  # noqa: BLE001
             self.status.set(f"读取群列表失败：{exc}")
-            return
+            return fetched
         for i, gid in enumerate(self._group_ids):
             if gid in saved:
                 self.lst_groups.selection_set(i)
-        msg = f"群列表已刷新，共 {len(self._group_ids)} 个群"
-        if not fetched:
-            msg += "（未能连到协议端，群名来自本地库；启动服务与协议端后可拉到真实群名）"
-        self.status.set(msg)
+        parts = [f"群列表已刷新，共 {len(self._group_ids)} 个群"]
+        if uin:
+            mine = sum(1 for _g, _n, o, _c in rows if o == uin) if rows else 0
+            parts.append(f"当前协议端账号 {uin}（其中 {mine} 个已标注属主）")
+        else:
+            parts.append("未能连到协议端，群名来自本地库；启动服务与协议端后可拉到真实群名")
+        deleted = fetched.get("deleted") or []
+        protected = fetched.get("protected") or []
+        if deleted:
+            parts.append(f"已删除 {len(deleted)} 个不属于当前账号的空群")
+        if protected:
+            parts.append(f"保留 {len(protected)} 个有消息但不属于当前账号的群（删了会让摘要失效）")
+        self.status.set("；".join(parts))
+        return fetched
+
+    def prune_groups(self) -> None:
+        """「只保留当前账号的群」：让服务按当前登录账号删掉别的账号留下的空群。"""
+        if self.proc is None:
+            messagebox.showinfo(
+                "需要服务在运行",
+                "这个动作要让服务去问协议端「当前登录的是哪个账号」，"
+                "所以得先启动服务。",
+                parent=self.root,
+            )
+            return
+        if not messagebox.askyesno(
+            "只保留当前账号的群",
+            "将删掉「不属于当前登录账号、且一条消息都没有」的群。\n\n"
+            "· 有消息的群**一律保留**（删了会让那个群的摘要静默失效）\n"
+            "· 删的只是群列表里的条目，不涉及任何消息数据\n\n"
+            "继续吗？",
+            parent=self.root,
+        ):
+            self.status.set("已取消「只保留当前账号的群」")
+            return
+        r = self.refresh_groups(prune=True)
+        if not r:
+            self.status.set("清理失败：服务不可达或协议端未连接（群列表未改动）")
+            return
+        deleted = r.get("deleted") or []
+        protected = r.get("protected") or []
+        if deleted:
+            self._log_ui(f"[界面] 已清理 {len(deleted)} 个不属于当前账号的空群：{', '.join(deleted)}\n")
+        if protected:
+            self._log_ui(f"[界面] 保留（有消息，未删）：{', '.join(protected)}\n")
 
     # ---------------- 服务进程 ----------------
 
@@ -1063,6 +1142,57 @@ class App:
             "[界面] NapCat 要先注入 QQ 再登录，通常需要 10~30 秒。\n"
             "[界面] 连上后上方「协议端(NapCat)」会自己变成「已连接」，无需重启服务。\n"
         )
+        if self.napcat_dir():
+            self.qr_watching = True
+            threading.Thread(target=self._watch_qrcode, daemon=True).start()
+
+    def restart_napcat(self) -> None:
+        """一键重置协议端：把所有注入器与 QQ.exe **全退掉**，再重新拉起。
+
+        和「启动协议端(NapCat)」的区别只在一件事上：**先清场**。
+        协议端卡住时（连着、能应答 API，却一条消息都不推），再点「启动」只会多注入
+        一份实例 —— 两份各自往 ``cache\\qrcode.png`` 写二维码互相覆盖，扫哪一次都可能
+        立刻失效，表现仍然是「消息一直不来」。所以卡住时该点的是这个按钮。
+
+        代价要说清楚：QQ 会被一起重启，**大概率需要重新扫码登录**。
+        这不是缺陷，是「重新登一次」这个动作本身的一部分。
+        """
+        script = napcat_mod.restart_script(self.cfg)
+        if script is None or not script.exists():
+            messagebox.showerror(
+                "无法重置",
+                "没有找到重置脚本。请在 config.toml 的 [napcat] restart_script 里指定，"
+                "默认是 tools\\重启协议端.bat。",
+                parent=self.root,
+            )
+            return
+        if not messagebox.askyesno(
+            "重置协议端（全退 + 重登）",
+            "这一步会：\n"
+            "  1. 强行结束**所有** NapCat 注入器和 QQ.exe（包括你自己的 QQ 窗口）\n"
+            "  2. 再重新注入并拉起 QQ\n"
+            "  3. **需要重新扫码登录**（二维码会自动弹出）\n\n"
+            "这是「消息冻结」唯一可靠的动作。要现在做吗？",
+            parent=self.root,
+        ):
+            self.status.set("已取消重置协议端")
+            return
+
+        self._log_ui("[界面] 正在请求重置协议端（会弹一次 UAC，请点「是」）…\n")
+        self.status.set("已请求重置 —— 请在 UAC 窗口点「是」，然后扫码登录")
+        try:
+            r = napcat_mod.restart(self.cfg)
+        except Exception as exc:  # noqa: BLE001
+            self._log_ui(f"[界面] 重置协议端异常：{exc}\n")
+            messagebox.showerror("重置失败", str(exc), parent=self.root)
+            return
+        if not r.get("ok"):
+            self._log_ui(f"[界面] 重置协议端失败：{r.get('error')}\n")
+            messagebox.showerror("重置失败", str(r.get("error") or "未知错误"), parent=self.root)
+            return
+        self._log_ui(f"[界面] {r.get('note') or ''}\n")
+        self._log_ui(f"[界面] 重置记录：{r.get('log')}（界面「协议端日志」按钮可查看）\n")
+        # 重置过程中协议端会断、再连回来；把行/二维码监听起来，别让用户自己去找二维码。
         if self.napcat_dir():
             self.qr_watching = True
             threading.Thread(target=self._watch_qrcode, daemon=True).start()

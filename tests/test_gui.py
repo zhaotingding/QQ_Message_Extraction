@@ -82,6 +82,15 @@ check("有增量摘要按钮", any("最新摘要" in b for b in buttons), str(bu
 # v0.5.0：原来的「全量重做」被换成「范围下拉 + 生成」——因为它没说清范围与字数，
 # 用户原话是「意义不明」。这里锁死「不再有那个按钮」+「必须有范围选择器」。
 check("不再有说不清范围的『全量重做』", not any("全量" in b for b in buttons), str(buttons))
+# v0.5.4：把 tools\重启协议端.bat 搬进界面，紧挨着「启动协议端」。
+# 两者的区别只在一件事上 —— **先清场**，而这正是排障时最容易搞错的一点：
+# 「启动」只是再注入一份（会和卡住的那份并存、二维码互相覆盖），
+# 「重启」才是先全退再重登。所以这个按钮必须在，且必须和「启动」挨着。
+check("有「重启协议端」按钮（全退 + 重登）",
+      any("重启协议端" in b for b in buttons), str(buttons))
+# v0.5.4：群列表是历次登录的并集，换过账号就会混进别的账号的群，得有个清理入口。
+check("有「只保留当前账号的群」按钮",
+      any("只保留当前账号" in b for b in buttons), str(buttons))
 combos = [w for w in allw if isinstance(w, ttk.Combobox)]
 check("有摘要范围下拉", len(combos) >= 1, f"{len(combos)} 个 Combobox")
 if combos:

@@ -9,7 +9,7 @@ from datetime import date, datetime
 
 from aiohttp import WSCloseCode
 
-from . import billing
+from . import billing, napcat
 from .config import api_key, load
 from .llm import BudgetExceeded, LLM
 from .media import MediaWorker
@@ -60,6 +60,8 @@ class Pipeline:
         # 这是未配置 NapCat HTTP API 时调 get_group_list（拿真实群名）的唯一通道。
         self._action_futs: dict[str, asyncio.Future] = {}
         self._echo_seq = 0
+        # 当前协议端登录的 QQ 号（群属主）。连上后查一次就缓存，见 login_uin()。
+        self.bot_uin = ""
         self._peer_watch: asyncio.Task | None = None
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
@@ -105,6 +107,7 @@ class Pipeline:
             asyncio.create_task(self._daily_loop(), name="daily"),
             asyncio.create_task(self._prune_loop(), name="prune"),
             asyncio.create_task(self._billing_loop(), name="billing"),
+            asyncio.create_task(self._watchdog_loop(), name="watchdog"),
         ]
         # v0.4.0 的下载缺陷误伤了一批图片（标记 failed）。启动时重置一次：
         # URL 仍有效即被挽回，已过期则再次 failed，不会死循环。
@@ -147,21 +150,45 @@ class Pipeline:
             raise RuntimeError(f"{action} 调用失败: {resp!r}")
         return resp.get("data")
 
-    async def refresh_group_names(self, timeout: float = 8.0) -> int:
-        """从协议端拉群列表，把真实群名写进 groups 表，返回群数。
+    async def refresh_group_names(self, prune: bool = False) -> dict:
+        """从协议端拉群列表，把真实群名 + **属主账号**写进 groups 表。
 
         groups 表的 name 此前只能靠 [watch] names 手填，没人填就永远是
         「(未命名) 754842541」—— NapCat 就在线上，没理由不去问它。
+
+        ``prune=True`` 时顺手删掉「不属于当前账号且没有消息」的群 —— 那就是
+        「只关注目前已登录账号的群」。默认 False：自动同步路径不能有副作用，
+        删数据必须由用户显式点一下（界面的「只保留当前账号的群」）。
         """
-        data = await self.call_action("get_group_list", {}, timeout)
-        n = 0
+        uin = await self.login_uin()
+        data = await self.call_action("get_group_list", {}, 8.0)
+        keep: set[str] = set()
         for g in data or []:
             gid = str((g or {}).get("group_id") or "")
             if gid:
-                self.store.upsert_group(gid, str((g or {}).get("group_name") or ""))
-                n += 1
-        log.info("已从协议端拉取群列表：%d 个群", n)
-        return n
+                keep.add(gid)
+                self.store.upsert_group(gid, str((g or {}).get("group_name") or ""), uin)
+        log.info("已从协议端拉取群列表：%d 个群（账号 %s）", len(keep), uin or "未知")
+        out = {"count": len(keep), "uin": uin, "deleted": [], "protected": []}
+        if prune and keep:
+            deleted, protected = self.store.prune_groups(keep)
+            out["deleted"], out["protected"] = deleted, protected
+            if deleted or protected:
+                log.info("按当前账号清理群列表：删除 %d 个，保留(有消息) %d 个",
+                         len(deleted), len(protected))
+        return out
+
+    async def login_uin(self) -> str:
+        """当前协议端登录的 QQ 号（拿不到返回空串，绝不猜）。"""
+        if self.bot_uin:
+            return self.bot_uin
+        try:
+            info = await self.call_action("get_login_info", {}, 5.0)
+            self.bot_uin = str((info or {}).get("user_id") or "")
+        except Exception as e:  # noqa: BLE001
+            log.debug("取 get_login_info 失败（群属主将留空）: %s", e)
+            self.bot_uin = ""
+        return self.bot_uin
 
     # ---------- 协议端连上 / 断开 ----------
 
@@ -169,6 +196,9 @@ class Pipeline:
         t = self._peer_watch
         if t is not None and not t.done():
             t.cancel()
+        # 换了一次登录 = 可能换了一个账号，缓存的属主必须作废，否则新账号的群
+        # 会被记到旧账号名下（而「属主」正是「只保留当前账号的群」的依据）。
+        self.bot_uin = ""
         asyncio.create_task(self._auto_refresh_names())
 
     async def _auto_refresh_names(self) -> None:
@@ -262,6 +292,11 @@ class Pipeline:
     async def handle_event(self, event: dict) -> dict:
         self.counters["received"] += 1
         self_id = str(event.get("self_id", ""))
+        # self_id 就是「收到这条消息的账号」，是群属主最直接的证据。
+        # 但**不能无脑采信**：本项目的诊断探针（diagnose_freeze）走的就是这条路，
+        # 它把 self_id 填成 0 —— 若不设防，探针会把群属主写成 "0"。
+        if self_id.isdigit() and self_id != "0" and self.bot_uin != self_id:
+            self.bot_uin = self_id
         msg: Msg | None = parse_onebot_event(event, self_id, {self_id} | self.at_ids)
         if msg is None:
             self.counters["skipped"] += 1
@@ -279,7 +314,7 @@ class Pipeline:
             return {"ok": False, "reason": f"已按过滤规则丢弃: {reason}"}
 
         name = self.group_name(msg.group_id)
-        row_id = self.store.insert_message(msg, name)
+        row_id = self.store.insert_message(msg, name, self.bot_uin)
         if row_id is None:
             self.counters["duplicate"] += 1
             return {"ok": True, "duplicate": True}
@@ -400,6 +435,72 @@ class Pipeline:
                 raise
             except Exception as e:  # noqa: BLE001
                 log.warning("清理异常: %s", e)
+
+    # ---------- 看门狗 ----------
+
+    async def _watchdog_loop(self) -> None:
+        """协议端「连着却不推消息」时主动告警（v0.5.4）。
+
+        要解决的问题：协议端可以**连着、能应答 API，却一条消息都不推**。
+        这种状态下 `/health` 一切正常，界面上「协议端已连接」是绿的，
+        唯一征兆是消息不再进来 —— 实测最长挂了 9 小时，全靠用户自己发现。
+
+        **判据必须同时满足四条，少一条都会误报**（这是本项目的血泪）：
+          ① 协议端连着 —— 断开有另一条专门的告警，这里不重复报；
+          ② 桌面 QQ 的消息库 `nt_msg.db-wal` 长时间没写入 —— 上游的直接证据；
+          ③ 本库同期也没有新消息 —— 排除「QQ 库在写、只是没写我们的群」；
+          ④ 这个小时按历史基线**本该是活跃的** —— 否则凌晨一点必然误报，
+             而深夜没人讲话是常态，不是故障。
+
+        只报一次：告警后解除武装，等 ② 恢复（QQ 库重新开始写）才重新武装。
+        **只通知、不自动重启** —— 半夜自动去动用户的账号是更大的风险。
+        """
+        wg = self.cfg.get("watchdog") or {}
+        if not wg.get("enabled", True):
+            return
+        every = max(30, int(wg.get("check_seconds", 300)))
+        stale_s = max(300, int(wg.get("stale_minutes", 30)) * 60)
+        busy_min = int(wg.get("busy_min_messages", 5))
+        days = int(wg.get("baseline_days", 7))
+        armed = True
+        while not self._stop.is_set():
+            try:
+                await asyncio.sleep(every)
+                age = napcat.qq_msg_db_age()
+                if age is None:
+                    continue  # 查不到 QQ 数据目录 —— 不据此下任何结论
+                if age < stale_s:
+                    armed = True  # 上游活着，重新武装
+                    continue
+                if not self.ws_peers:
+                    continue  # 协议端没连着：那是另一种告警，这里不抢
+                if self.store.messages_since(int(time.time()) - stale_s):
+                    continue  # 还在收消息，说明只是 QQ 库的 mtime 没动（别的号在写）
+                hour = datetime.now().hour
+                base = self.store.hour_baseline(hour, days)
+                if base < busy_min:
+                    log.debug("看门狗：%d 点历史基线仅 %d 条，判定『本来就没人说话』，不告警", hour, base)
+                    armed = True
+                    continue
+                if not armed:
+                    continue
+                armed = False
+                log.warning("看门狗：QQ 消息库已 %.0f 分钟无写入，本库同期也无新消息"
+                            "（%d 点历史基线 %d 条）—— 判定消息冻结", age / 60, hour, base)
+                with contextlib.suppress(Exception):
+                    await self.notifier.notify(
+                        "消息可能已冻结",
+                        f"桌面 QQ 已 {age / 60:.0f} 分钟没有新消息写入本地库，"
+                        f"而 {hour} 点按历史本该有 {base} 条左右。\n"
+                        "界面上「协议端已连接」在这种状态下**依然是绿的**。\n"
+                        "处置：点界面上的「重启协议端」（全退再重登，可能要重扫码）。",
+                        level="P1",
+                        play_sound=True,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("看门狗异常: %s", e)
 
     # ---------- 账单 ----------
 

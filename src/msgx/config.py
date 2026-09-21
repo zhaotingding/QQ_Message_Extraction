@@ -87,10 +87,24 @@ DEFAULTS: dict = {
     #   qq_path      —— QQ.exe 路径。留空 = 从注册表 UninstallString 自动推导
     "napcat": {
         "start_script": "",
+        # v0.5.4：「重启协议端」按钮执行的脚本。它做的是「先把所有注入器与 QQ.exe
+        # 全退掉，再重新拉起」—— 这是「消息冻结」唯一可靠的动作。见 pipeline/napcat.py。
+        "restart_script": "",
         "dir": "",
         "hidden": True,
         "log_file": "data/logs/napcat.log",
         "qq_path": "",
+    },
+    # 主动看门狗（v0.5.4）。协议端会「连着、能应答 API，却一条消息都不推」——
+    # 这种状态以前只能靠用户自己发现（最长一次挂了 9 小时）。看门狗定期检查
+    # 「桌面 QQ 的消息库是不是不写了」，命中就弹通知。
+    # **只通知、不自动重启**：半夜自动动用户的账号是更大的风险。
+    "watchdog": {
+        "enabled": True,
+        "check_seconds": 300,     # 检查间隔
+        "stale_minutes": 30,      # QQ 消息库超过这么久没写入 ⇒ 可疑
+        "busy_min_messages": 5,   # 该小时历史中位数低于它就认为「本来就没人说话」，不报
+        "baseline_days": 7,
     },
     # 真实账单数据源。余额和消费用的是**两套凭证**（见 billing.py）：
     #   [llm] api_key  → 官方 GET /user/balance，查真实余额（始终可用）

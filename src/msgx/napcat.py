@@ -129,6 +129,11 @@ def start_script(cfg: dict) -> Path | None:
     return _resolve((cfg.get("napcat") or {}).get("start_script"))
 
 
+def restart_script(cfg: dict) -> Path | None:
+    """``[napcat] restart_script`` 的绝对路径（一键重置：全退 + 重登）。"""
+    return _resolve((cfg.get("napcat") or {}).get("restart_script"))
+
+
 def log_path(cfg: dict) -> Path:
     nc = cfg.get("napcat") or {}
     p = _resolve(nc.get("log_file") or "data/logs/napcat.log")
@@ -464,3 +469,92 @@ def launch(cfg: dict, visible: bool = False) -> dict:
         "log": str(lp),
         "note": "已以隐藏方式拉起（无控制台窗口）。先点 UAC 的「是」，随后完成扫码登录。",
     }
+
+
+# ---------------------------------------------------------------- 一键重置
+
+def restart(cfg: dict) -> dict:
+    """把「全退再重登」做成一次调用：清场 + 重新拉起，**只弹一次 UAC**。
+
+    为什么不能靠 ``launch()``：它只做「再注入一份 + 再拉起一份 QQ」，**不清场**。
+    卡住的那份会和新的一份并存，两份各自往 ``cache/qrcode.png`` 写二维码互相覆盖，
+    扫哪一次都可能立刻失效。所以「消息冻结」的正确动作是先全退、再重登。
+
+    这里的做法是把整个动作交给 ``tools/重启协议端.bat``，并**由本函数直接提权**启动它 ——
+    这样 bat 内部的 ``net session`` 判定会直接走 ``:reset`` 分支，全程只有**一个**控制台窗口、
+    **一次** UAC。若只是 ``os.startfile`` 那个 bat，会先起一个非提权的窗口、再由它
+    ``Start-Process -Verb RunAs`` 拉起第二个 —— 白白多一层窗口。
+    """
+    script = restart_script(cfg)
+    if script is None:
+        return {"ok": False, "error": "未配置 [napcat] restart_script（默认 tools/重启协议端.bat）"}
+    if not script.exists():
+        return {"ok": False, "error": f"重置脚本不存在：{script}"}
+
+    d = resolve_dir(cfg)
+    if d is None:
+        return {"ok": False, "error": "没有配置 NapCat 目录：请在 config.toml 的 [napcat] dir 里填上安装目录"}
+    if not (d / "launcher.bat").exists():
+        return {"ok": False, "error": f"{d} 里没有 launcher.bat —— 目录不对，重置会拉起别的东西"}
+
+    lp = log_path(cfg)
+    _append_log(lp, f"\n[{_stamp()}] ---- 重置协议端（全退 + 重登）----\n  脚本 : {script}\n  目录 : {d}\n")
+    # 目录同时用**两种**方式告诉脚本，因为其中一种很容易被引号坑掉：
+    #   1. 命令行参数（bat 的 %~1）—— cmd 的引号规则很绕，路径里有空格/中文时尤其
+    #   2. 环境变量 NAPCAT_HOME —— 提权后的子进程会继承它，完全不经过引号解析
+    # 任一条通了就够；两条都给，能省掉一类「点了没反应」的悬案。
+    os.environ["NAPCAT_HOME"] = str(d)
+    params = f'/c ""{script}" "{d}""'
+    rc = _shell_execute_runas("cmd.exe", params)
+    if rc <= 32:
+        hint = "（很可能是 UAC 授权窗口被取消了）" if rc == 5 else ""
+        return {"ok": False, "error": f"提权启动失败，ShellExecuteW 返回 {rc}{hint}"}
+    _append_log(lp, "  结果 : 已请求提权并启动（会有一个控制台窗口显示进度）\n")
+    return {
+        "ok": True,
+        "dir": str(d),
+        "log": str(lp),
+        "note": "已请求重置：会弹一次 UAC，点「是」后控制台里会依次显示「结束注入器 / 结束 QQ / 复查 / 重新拉起」。完成后请扫码登录。",
+    }
+
+
+# ---------------------------------------------------------------- 上游健康
+
+# QQ 数据目录的候选根。v0.5.4 的看门狗要用它判断「桌面 QQ 自己还在不在收消息」。
+QQ_DATA_ROOTS = (
+    Path("D:/App/QQ/QQ聊天消息/Tencent Files"),
+    Path("C:/Users/Public/Documents/Tencent Files"),
+)
+
+
+def qq_msg_db_age() -> float | None:
+    """桌面 QQ 的账号消息库「最后一次写入」距今多少秒；找不到返回 None。
+
+    ``nt_msg.db-wal`` 的 mtime 就是「QQ 最后一次把消息写进本地库」的时刻。
+    它是判断**第 4 种冻结形态**（QQ 客户端自己就没收到）的唯一外部证据 ——
+    此时服务侧、协议端侧全都正常，只有它不动。
+
+    返回 None（而不是 0 或一个大数）表示**查不到**：调用方必须区别对待，
+    「查不到」不能当成「健康」，也不能当成「有病」。
+
+    ``QQ_DATA_ROOT`` 环境变量是**覆盖**而不是追加：显式指定了就只信它。
+    追加会让「指定了一个目录，却仍被别处的旧库算进来」，排查时会非常费解。
+    """
+    roots: list[Path] = []
+    env = os.environ.get("QQ_DATA_ROOT", "").strip()
+    if env:
+        roots.append(Path(env))
+    else:
+        roots.extend(QQ_DATA_ROOTS)
+    newest: float | None = None
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+            for w in root.glob("*/nt_qq/nt_db/nt_msg.db-wal"):
+                m = w.stat().st_mtime
+                if newest is None or m > newest:
+                    newest = m
+        except OSError:
+            continue
+    return None if newest is None else max(0.0, time.time() - newest)

@@ -159,13 +159,19 @@ async def _billing(request: web.Request) -> web.Response:
 
 
 async def _groups_refresh(request: web.Request) -> web.Response:
-    """通过协议端拉取真实群名并写库。协议端不在线时返回 502，由界面回退本地库。"""
+    """通过协议端拉取真实群名并写库。协议端不在线时返回 502，由界面回退本地库。
+
+    带 ``?prune=1`` 时顺手删掉「不属于当前账号且没有消息」的群 ——
+    这就是「只关注目前已登录账号的群」。**默认不删**：自动路径不能有副作用，
+    删数据必须由用户显式点一下。
+    """
     pipe = request.app["pipe"]
+    prune = str(request.query.get("prune", "")).lower() in ("1", "true", "yes")
     try:
-        n = await pipe.refresh_group_names()
+        r = await pipe.refresh_group_names(prune=prune)
     except Exception as e:  # noqa: BLE001
         return web.json_response({"ok": False, "error": str(e)}, status=502)
-    return web.json_response({"ok": True, "groups": n})
+    return web.json_response({"ok": True, "groups": r["count"], **r})
 
 
 def build_app(cfg: dict, pipeline) -> web.Application:

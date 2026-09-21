@@ -23,6 +23,7 @@ SUITES = [
     ("LLM 调用层", "test_llm.py"),
     ("纪要长度", "test_digest.py"),
     ("媒体校验", "test_media.py"),
+    ("群列表属主", "test_groups.py"),
     ("服务生命周期", "test_service.py"),
     ("界面构建", "test_gui.py"),
 ]

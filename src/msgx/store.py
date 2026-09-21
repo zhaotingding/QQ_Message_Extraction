@@ -11,7 +11,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS groups (
   id         TEXT PRIMARY KEY,
   name       TEXT DEFAULT '',
-  added_at   INTEGER DEFAULT 0
+  added_at   INTEGER DEFAULT 0,
+  bot_uin    TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -109,6 +110,17 @@ MESSAGE_MIGRATIONS = (
     ("vision_tries", "INTEGER DEFAULT 0"),
 )
 
+# groups 表 v0.5.4 加 bot_uin：**这个群属于哪个协议端账号**。
+#
+# 为什么非要有它：`groups` 原先只记 (id, name, added_at)，于是「群列表」是
+# **历次登录的并集** —— 谁登进来一次，它的全部群就永久留在库里。
+# 实测：误登一次主号，33 个群（30 个一条消息都没有）就灌进来了，用户在下拉框里
+# 再也找不到自己关心的那 3 个群。**没有「属主」这一维，就永远分不清谁是谁。**
+# 它同时也是「只保留当前账号的群」这个动作的依据。
+GROUP_MIGRATIONS = (
+    ("bot_uin", "TEXT DEFAULT ''"),
+)
+
 # 语义补跑的最大次数（attempts）。三次都失败基本可判定是图本身的问题。
 VISION_MAX_TRIES = 3
 
@@ -126,7 +138,11 @@ class Store:
 
     def _migrate(self) -> None:
         """幂等补齐老库缺失的列。"""
-        for table, migs in (("usage", USAGE_MIGRATIONS), ("messages", MESSAGE_MIGRATIONS)):
+        for table, migs in (
+            ("usage", USAGE_MIGRATIONS),
+            ("messages", MESSAGE_MIGRATIONS),
+            ("groups", GROUP_MIGRATIONS),
+        ):
             cols = {c[1] for c in self.conn.execute(f"PRAGMA table_info({table})")}
             for name, spec in migs:
                 if name not in cols:
@@ -148,20 +164,112 @@ class Store:
 
     # ---------- groups ----------
 
-    def upsert_group(self, group_id: str, name: str = "") -> None:
+    def upsert_group(self, group_id: str, name: str = "", bot_uin: str = "") -> None:
+        """登记/更新一个群。``bot_uin`` 是它的属主账号，留空 = 不动已有属主。
+
+        空名与空属主都**不覆盖**已有值：群名可能一时拿不到（待配置补全），
+        属主可能在拿不到 get_login_info 时未知 —— 都不能因此把已知信息抹掉。
+        """
         self.conn.execute(
-            "INSERT INTO groups(id, name, added_at) VALUES(?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE groups.name END",
-            (group_id, name, int(time.time())),
+            "INSERT INTO groups(id, name, added_at, bot_uin) VALUES(?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            " name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE groups.name END,"
+            " bot_uin=CASE WHEN excluded.bot_uin<>'' THEN excluded.bot_uin ELSE groups.bot_uin END",
+            (group_id, name, int(time.time()), bot_uin),
         )
         self.conn.commit()
 
     def group_names(self) -> dict:
         return {r["id"]: r["name"] for r in self.conn.execute("SELECT id, name FROM groups")}
 
+    def groups_with_owner(self) -> list[dict]:
+        """群列表 + 属主 + 消息条数（界面「统计哪些群」用）。"""
+        rows = self.conn.execute(
+            "SELECT g.id, g.name, g.bot_uin,"
+            " (SELECT COUNT(*) FROM messages m WHERE m.group_id = g.id) AS n"
+            " FROM groups g ORDER BY g.id"
+        )
+        return [dict(r) for r in rows]
+
+    def prune_groups(self, keep_ids: set[str]) -> tuple[list[str], list[str]]:
+        """删掉「不在 keep_ids 里 **且** 一条消息都没有」的群。
+
+        返回 ``(已删, 因有消息而保留)``。
+
+        为什么必须带「没有消息」这个条件：`groups` 表是**摘要调度的遍历源**
+        （`group_names()`），删掉一个有消息的群会让它的摘要静默失效。
+        而协议端返回的列表可能因为一次 API 抖动就是空的 —— 那时若照着删，
+        用户的群会被自己的一次抖动清光。**有消息 = 有既成事实，一律保留。**
+        """
+        ids = [str(r["id"]) for r in self.conn.execute("SELECT id FROM groups")]
+        stale = [i for i in ids if i not in keep_ids]
+        if not stale:
+            return [], []
+        with_msg = {
+            str(r["group_id"]) for r in self.conn.execute("SELECT DISTINCT group_id FROM messages")
+        }
+        deleted = [i for i in stale if i not in with_msg]
+        protected = [i for i in stale if i in with_msg]
+        if deleted:
+            self.conn.executemany("DELETE FROM groups WHERE id=?", [(i,) for i in deleted])
+            self.conn.commit()
+        return deleted, protected
+
+    def messages_since(self, since_ts: int) -> int:
+        """某个时刻之后的**真实**消息条数（排除本工具的【链路自检】探针）。"""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM messages"
+            " WHERE ts >= ? AND COALESCE(text,'') NOT LIKE '【链路自检】%'",
+            (since_ts,),
+        ).fetchone()
+        return int(row[0] or 0)
+
+    def hour_baseline(self, hour: int, days: int = 7) -> int:
+        """最近若干天里，``hour`` 点这一小时每天消息条数的**中位数**。
+
+        干什么用：区分「现在这个点本来就没人说话」与「消息冻结了」。
+        没有它，看门狗会在凌晨一点准点误报 —— 深夜没人发言是常态，不是故障。
+
+        两个刻意的选择：
+        * **用中位数而不是均值** —— 某天一次刷屏会把均值抬到不可能达到的高度，
+          于是看门狗变成哑巴。
+        * **缺数据的那天按 0 计入**（只统计「库里本来就有数据的那些天」）——
+          一条都没说的日子恰恰是「这个点常常很安静」的证据。若把它整个跳过，
+          基线会被系统性抬高，同样导致误报。更早的日子（程序还没跑）不算，
+          那不是「没人说话」。
+        """
+        now = int(time.time())
+        since = now - days * 86400
+        rows = self.conn.execute(
+            "SELECT date(ts,'unixepoch','localtime') AS d, COUNT(*) AS n"
+            " FROM messages"
+            " WHERE ts >= ? AND CAST(strftime('%H', ts,'unixepoch','localtime') AS INTEGER) = ?"
+            "   AND COALESCE(text,'') NOT LIKE '【链路自检】%'"
+            " GROUP BY d",
+            (since, hour),
+        ).fetchall()
+        first = self.conn.execute(
+            "SELECT MIN(ts) FROM messages WHERE COALESCE(text,'') NOT LIKE '【链路自检】%'"
+        ).fetchone()[0]
+        if first is None:
+            return 0  # 一条真实消息都没有：没有基线可言
+        counts = {r["d"]: int(r["n"]) for r in rows}
+        # 按小时步进铺满，绝不漏掉任何一天（比按 86400 步进更稳，能容忍时区跳变）
+        span: dict[str, int] = {}
+        t = max(since, int(first))
+        while t <= now:
+            d = time.strftime("%Y-%m-%d", time.localtime(t))
+            span[d] = counts.get(d, 0)
+            t += 3600
+        vals = sorted(span.values())
+        if not vals:
+            return 0
+        mid = len(vals) // 2
+        return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) // 2
+
     # ---------- messages ----------
 
-    def insert_message(self, m: Msg, group_name: str = "") -> int | None:
+    def insert_message(self, m: Msg, group_name: str = "", bot_uin: str = "") -> int | None:
         """返回自增 id；重复消息返回 None。"""
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO messages"
@@ -189,7 +297,10 @@ class Store:
             return None
         # 无条件注册群：群名可能暂时为空（待配置补全），但群必须出现在 groups 表里，
         # 否则摘要调度遍历 group_names() 时看不到这个群。upsert_group 内部已保护空名不覆盖已有名字。
-        self.upsert_group(m.group_id, group_name)
+        #
+        # bot_uin 是**最可靠的属主来源**：消息只可能来自当前登录的那个账号。
+        # 靠 get_group_list 判属主会受 API 抖动影响，而「收到了消息」是既成事实。
+        self.upsert_group(m.group_id, group_name, bot_uin)
         return int(cur.lastrowid)
 
     def set_media_result(
