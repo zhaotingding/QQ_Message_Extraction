@@ -12,8 +12,6 @@ import aiohttp
 
 log = logging.getLogger("msgx.llm")
 
-PROBE_FILE = "vision_probe.json"
-
 
 class BudgetExceeded(Exception):
     pass
@@ -47,8 +45,6 @@ class LLM:
         self.llm = cfg["llm"]
         self.key = ""
         self._session: aiohttp.ClientSession | None = None
-        self._vision: bool | None = None
-        self._lock = asyncio.Lock()
 
     # ---------- lifecycle ----------
 
@@ -368,83 +364,10 @@ class LLM:
 
     # ---------- vision ----------
 
-    def _probe_path(self) -> Path:
-        from .config import ROOT
-
-        p = Path(self.cfg["app"]["db_path"])
-        if not p.is_absolute():
-            p = ROOT / p
-        return p.parent / PROBE_FILE
-
-    def vision_supported(self) -> bool:
-        """是否支持图片输入。未探测过时返回 False（保守）。"""
-        if self._vision is not None:
-            return self._vision
-        p = self._probe_path()
-        if p.exists():
-            try:
-                self._vision = bool(json.loads(p.read_text("utf-8")).get("vision"))
-            except Exception:
-                self._vision = False
-        else:
-            self._vision = False
-        return self._vision
-
-    async def probe_vision(self, force: bool = False) -> bool:
-        """发一张自制的小图给模型，判断是否支持图片输入。结果落盘缓存。"""
-        async with self._lock:
-            if self.vision_supported() and not force:
-                return True
-            if not self.available:
-                return False
-            try:
-                from PIL import Image, ImageDraw
-            except ImportError:
-                log.warning("缺少 Pillow，跳过多模态探测")
-                return False
-
-            tmp = self._probe_path().parent / "_probe.png"
-            tmp.parent.mkdir(parents=True, exist_ok=True)
-            img = Image.new("RGB", (320, 100), "white")
-            ImageDraw.Draw(img).text((16, 40), "MSGX-7301", fill="black")
-            img.save(tmp)
-
-            b64 = base64.b64encode(tmp.read_bytes()).decode()
-            payload = {
-                "model": self.llm.get("vision_model", self.llm["model"]),
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "图中的编号是什么？只回答编号本身。"},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{b64}"},
-                            },
-                        ],
-                    }
-                ],
-                "max_tokens": 512,
-                "stream": False,
-                "reasoning_effort": "none",
-            }
-            ok = False
-            detail = ""
-            try:
-                data = await self._accounted_post(payload, "图片能力检测", None)
-                content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-                ok = "7301" in content
-                detail = content.strip()[:120]
-            except Exception as e:  # noqa: BLE001
-                detail = str(e)[:200]
-            self._vision = ok
-            self._probe_path().write_text(
-                json.dumps({"vision": ok, "detail": detail, "ts": int(time.time())}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            tmp.unlink(missing_ok=True)
-            log.info("多模态探测结果: %s (%s)", ok, detail)
-            return ok
+    @property
+    def vision_available(self) -> bool:
+        """配置允许解析真实图片；不发送测试图片，也不读取旧探测缓存。"""
+        return self.available and bool(self.cfg.get("media", {}).get("vision_enabled", True))
 
     def _prepare_image(self, path: Path) -> tuple[bytes, str]:
         """把待上传的图片压到合适尺寸，返回 (字节, mime)。
@@ -490,7 +413,10 @@ class LLM:
         `done`，于是这张图永远不会再被处理。现在由调用方落 `vision_state`，
         之后可以重跑。
         """
-        if not (self.available and self.vision_supported()):
+        if not self.vision_available:
+            return "", False
+        if not self.budget_ok():
+            log.warning("今日预算已达上限，跳过图片解析")
             return "", False
         p = Path(path)
         if not p.exists():

@@ -33,13 +33,9 @@ class FakeLLM:
             raise reply
         return reply
 
-class FakeNotifier:
-    async def notify(self, *args, **kwargs):
-        pass
-
 def make(llm, tmp):
     sm = S.Summarizer({"app": {"report_dir": tmp}, "summary": {"chunk_char_budget": 1}, "llm": {}},
-                      Store(Path(tmp) / "test.db"), llm, FakeNotifier())
+                      Store(Path(tmp) / "test.db"), llm)
     llm.sm = sm
     return sm
 

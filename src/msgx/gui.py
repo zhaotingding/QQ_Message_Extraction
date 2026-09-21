@@ -44,7 +44,6 @@ LOG_FG = "#d6dbe5"
 LOG_RED = "#ff7b72"
 LOG_GREEN = "#7ee787"
 OK_COLOR = "#1a7f37"
-BAD_COLOR = "#b42318"
 MUTED = "#6b6b68"
 
 
@@ -393,7 +392,7 @@ class App:
 
         起因是 NapCat 那个 CMD 黑框：以前有人习惯盯着协议端窗口看消息到底进没进来。
         既然要把黑框干掉，就得在界面里给一个**更好的**替代品 —— 这里能看到
-        入库后的真实内容（含文本、图片处理状态、是否被 @），比协议端滚屏有用得多。
+        入库后的真实内容（含文本和图片处理状态），比协议端滚屏有用得多。
         """
         tab = ttk.Frame(nb, padding=14)
         nb.add(tab, text="实时消息")
@@ -429,15 +428,14 @@ class App:
         self.rt.configure(yscrollcommand=sb.set)
         self.rt.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        # 交替行色 + 被 @ 的行标红，扫一眼就能看出有没有需要立刻处理的
+        # 交替行色便于阅读；被 @ 的消息按普通消息呈现。
         self.rt.tag_configure("odd", background="#f5f7fa")
-        self.rt.tag_configure("atme", foreground=BAD_COLOR)
         self.rt.tag_configure("failed", foreground="#a15c00")
 
         ttk.Label(
             tab,
-            text="显示最近入库的消息（新的在最上面）。「图片」列 = none 无图 / 完成 / 待处理 / "
-                 "失败 / 语义失败 —— 语义失败会自动补跑，最多 3 次。",
+            text="显示最近入库的消息（新的在最上面）。图片仅在消息附带文字时解析；"
+                 "处理结果显示在「图片」列。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(8, 0))
 
@@ -466,11 +464,11 @@ class App:
         self._scroll_canvas = canvas
 
         # --- 关键词 ---
-        kw = ttk.LabelFrame(tab, text="关注关键词", padding=12)
+        kw = ttk.LabelFrame(tab, text="热点关注词", padding=12)
         kw.pack(fill="both", expand=False)
         ttk.Label(
             kw,
-            text="一行一个。命中即进入候选池，再由模型判定是否值得提醒。留空表示沿用 config.toml 里的设置。",
+            text="一行一个，用于跨群热点摘要。留空表示沿用 config.toml 里的设置。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(0, 6))
         self.txt_keywords = tk.Text(kw, height=6, wrap="word", font=(FONT, 10), relief="solid", borderwidth=1)
@@ -537,7 +535,8 @@ class App:
         ft.pack(fill="x", pady=(12, 0))
         ttk.Label(
             ft,
-            text="过滤的图片/表情仅留简要记录，不下载、不识别、不进摘要；其他命中过滤的消息直接丢弃。",
+            text="过滤的图片/表情仅留简要记录，不下载、不识别、不进摘要；其他命中过滤的消息直接丢弃。\n"
+                 "图片只有在消息附带文字时才调用 API 解析，与图片内部是否有文字无关。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(0, 6))
         self.v_filters = {
@@ -550,7 +549,7 @@ class App:
         grid.pack(fill="x")
         labels = [
             ("skip_face_only", "纯表情 / 表情包"),
-            ("skip_image_only", "纯图片（不含任何文字）"),
+            ("skip_image_only", "纯图片（消息未附带文字）"),
             ("skip_forward", "合并转发"),
             ("skip_record", "语音消息"),
         ]
@@ -576,7 +575,7 @@ class App:
         ).pack(anchor="w")
         ttk.Label(
             nc,
-            text="勾上 = 启动协议端时不出现 CMD 窗口，任务栏干干净净；启动失败会弹消息框提示。\n"
+            text="勾上 = 启动协议端时不出现 CMD 窗口；启动失败会显示在状态栏和日志中。\n"
                  "取消勾选 = 回到「看得见」的模式，会弹控制台并显示完整自检输出（排障时用）。\n"
                  "两种方式都绕不过 UAC 授权弹窗 —— NapCat 要往 QQ 进程注入 DLL，这是管理员操作。",
             style="Hint.TLabel",
@@ -739,13 +738,15 @@ class App:
             data = self._collect()
         except ValueError as exc:
             if not silent:
-                messagebox.showerror("设置有误", str(exc), parent=self.root)
+                self.status.set(f"设置有误：{exc}")
+                self._log_ui(f"[界面] 设置有误：{exc}\n")
             return False
         try:
             prefs_mod.save(data, self.prefs_file)
         except OSError as exc:
             if not silent:
-                messagebox.showerror("保存失败", str(exc), parent=self.root)
+                self.status.set(f"保存失败：{exc}")
+                self._log_ui(f"[界面] 保存失败：{exc}\n")
             return False
         self.prefs = data
         n_groups = len(data["groups"]) or "全部"
@@ -842,12 +843,7 @@ class App:
     def prune_groups(self) -> None:
         """「只保留当前账号的群」：让服务按当前登录账号删掉别的账号留下的空群。"""
         if self.proc is None:
-            messagebox.showinfo(
-                "需要服务在运行",
-                "这个动作要让服务去问协议端「当前登录的是哪个账号」，"
-                "所以得先启动服务。",
-                parent=self.root,
-            )
+            self.status.set("请先启动服务，再向协议端查询当前账号的群。")
             return
         if not messagebox.askyesno(
             "只保留当前账号的群",
@@ -1045,7 +1041,8 @@ class App:
             )
         except OSError as exc:
             self.proc = None
-            messagebox.showerror("启动失败", str(exc), parent=self.root)
+            self.status.set(f"服务启动失败：{exc}")
+            self._log_ui(f"[界面] 服务启动失败：{exc}\n")
             return
 
         self.v_service.set("运行中")
@@ -1060,7 +1057,8 @@ class App:
         try:
             self.stop_file.touch()
         except OSError as exc:
-            messagebox.showerror("停止失败", str(exc), parent=self.root)
+            self.status.set(f"服务停止失败：{exc}")
+            self._log_ui(f"[界面] 服务停止失败：{exc}\n")
             return
         self.btn_stop.configure(state="disabled")
         self.status.set("已发出停止信号，正在等待服务安全退出…")
@@ -1077,7 +1075,8 @@ class App:
         if self._summary_busy:
             return
         if self.proc is None:
-            messagebox.showinfo("服务未运行", "请先启动服务，再生成摘要。", parent=self.root)
+            self.v_summary.set("请先启动服务，再生成摘要。")
+            self.status.set(self.v_summary.get())
             return
         self._summary_busy = True
         self._summary_started = time.time()
@@ -1142,7 +1141,7 @@ class App:
         if v == "failed":
             return "图片未识别"
         if v == "skipped":
-            return "仅 OCR"
+            return "仅 OCR" if row.get("ocr_text") else "已跳过"
         return "完成"
 
     def refresh_messages(self) -> None:
@@ -1198,8 +1197,6 @@ class App:
             tags: list[str] = []
             if i % 2:
                 tags.append("odd")
-            if r.get("at_me"):
-                tags.append("atme")
             if state == "图片未识别":
                 tags.append("failed")
             self.rt.insert(
@@ -1224,12 +1221,7 @@ class App:
     def refresh_billing(self) -> None:
         """让服务去 DeepSeek 抓一次真实账单（余额 + 逐日消费）。"""
         if self.proc is None:
-            messagebox.showinfo(
-                "服务未运行",
-                "账单是服务去抓的，请先启动服务。\n\n"
-                "（余额用 API Key 查；消费明细需要平台 token，见设置页。）",
-                parent=self.root,
-            )
+            self.status.set("请先启动服务，再刷新账单。")
             return
         port = int(self.cfg["onebot"]["http_port"])
         self.status.set("正在向 DeepSeek 抓取真实账单…")
@@ -1398,11 +1390,11 @@ class App:
             r = napcat_mod.launch(self.cfg, visible=visible)
         except Exception as exc:  # noqa: BLE001
             self._log_ui(f"[界面] 启动协议端异常：{exc}\n")
-            messagebox.showerror("启动失败", str(exc), parent=self.root)
+            self.status.set(f"启动协议端失败：{exc}")
             return
         if not r.get("ok"):
             self._log_ui(f"[界面] 启动协议端失败：{r.get('error')}\n")
-            messagebox.showerror("启动失败", str(r.get("error") or "未知错误"), parent=self.root)
+            self.status.set(f"启动协议端失败：{r.get('error') or '未知错误'}")
             return
         self._log_ui(f"[界面] {r.get('note') or ''}\n")
         self._log_ui(f"[界面] 启动记录：{r.get('log')}（运行状态页下方「日志」可切换到「协议端日志」查看）\n")
@@ -1426,12 +1418,8 @@ class App:
         """
         script = napcat_mod.restart_script(self.cfg)
         if script is None or not script.exists():
-            messagebox.showerror(
-                "无法重置",
-                "没有找到重置脚本。请在 config.toml 的 [napcat] restart_script 里指定，"
-                "默认是 tools\\重启协议端.bat。",
-                parent=self.root,
-            )
+            self.status.set("无法重置：没有找到重置脚本，请检查 config.toml 的 [napcat] restart_script。")
+            self._log_ui(f"[界面] {self.status.get()}\n")
             return
         if not messagebox.askyesno(
             "重置协议端（全退 + 重登）",
@@ -1454,11 +1442,11 @@ class App:
             r = napcat_mod.restart(self.cfg)
         except Exception as exc:  # noqa: BLE001
             self._log_ui(f"[界面] 重置协议端异常：{exc}\n")
-            messagebox.showerror("重置失败", str(exc), parent=self.root)
+            self.status.set(f"重置协议端失败：{exc}")
             return
         if not r.get("ok"):
             self._log_ui(f"[界面] 重置协议端失败：{r.get('error')}\n")
-            messagebox.showerror("重置失败", str(r.get("error") or "未知错误"), parent=self.root)
+            self.status.set(f"重置协议端失败：{r.get('error') or '未知错误'}")
             return
         self._log_ui(f"[界面] {r.get('note') or ''}\n")
         self._log_ui(f"[界面] 重置记录：{r.get('log')}（运行状态页下方「日志」可切换到「协议端日志」查看）\n")
@@ -1774,11 +1762,11 @@ class App:
             self._apply_billing(b)
 
         if not data.get("llm_available"):
-            self.v_llm.set("未配置 API Key（仅规则模式，不生成摘要）")
-        elif data.get("vision_supported"):
-            self.v_llm.set("正常 · 支持图片输入")
+            self.v_llm.set("未配置 API Key（不生成摘要或解析图片）")
+        elif data.get("vision_enabled"):
+            self.v_llm.set("已配置 · 带配文图片解析已开启")
         else:
-            self.v_llm.set("正常 · 图片走本地 OCR")
+            self.v_llm.set("已配置 · 图片解析 API 已关闭")
 
     def _log_ui(self, text: str) -> None:
         # 按**行**插入才能按行上色（v0.5.5）。所有调用方传进来的都是完整行

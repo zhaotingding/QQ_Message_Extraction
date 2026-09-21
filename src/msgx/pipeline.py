@@ -11,12 +11,10 @@ from aiohttp import WSCloseCode
 
 from . import billing, napcat
 from .config import api_key, load
-from .llm import BudgetExceeded, LLM
+from .llm import LLM
 from .media import MediaWorker
 from .models import Msg, parse_onebot_event
-from .notify import Notifier
 from .prefs import skip_reason
-from .score import Scorer
 from .store import Store
 from .summarize import Summarizer
 
@@ -24,17 +22,15 @@ log = logging.getLogger("msgx.pipeline")
 
 
 class Pipeline:
-    """消息总线：接入 → 入库 → 媒体理解 → 打分 → 通知 → 周期摘要。"""
+    """消息总线：接入 → 入库 → 带配文图片解析 → 周期摘要。"""
 
     def __init__(self, cfg: dict | None = None):
         self.cfg = cfg or load()
         self.store = Store(self._db_path())
         self.llm = LLM(self.cfg, self.store)
         self.llm.configure(api_key(self.cfg))
-        self.notifier = Notifier(self.cfg)
         self.media = MediaWorker(self.cfg, self.store, self.llm)
-        self.scorer = Scorer(self.cfg, self.store, self.llm)
-        self.summarizer = Summarizer(self.cfg, self.store, self.llm, self.notifier)
+        self.summarizer = Summarizer(self.cfg, self.store, self.llm)
 
         # 老库的历史金额回填（幂等、一次性）。放在这里而不是 start()：`msgx stats`
         # 这类只读命令不会调 start()，但同样要显示「累计花费」，所以两条路都得走到。
@@ -42,7 +38,6 @@ class Pipeline:
 
         self.watch = {str(g) for g in self.cfg["watch"].get("groups", [])}
         self.names = {str(k): str(v) for k, v in (self.cfg["watch"].get("names") or {}).items()}
-        self.at_ids = {str(x) for x in (self.cfg["watch"].get("at_qq") or [])}
 
         # 接入队列：WebSocket 回调只做入队（不能阻塞协议端），由 _ingest_loop 串行消费。
         self.ingest_q: asyncio.Queue[dict] = asyncio.Queue(maxsize=5000)
@@ -78,7 +73,6 @@ class Pipeline:
             "duplicate": 0,
             "skipped": 0,
             "filtered": 0,
-            "alerts": 0,
         }
 
     def _db_path(self) -> str:
@@ -93,11 +87,8 @@ class Pipeline:
 
     async def start(self) -> None:
         log.info("LLM 可用: %s | 预算上限 %.2f 元/日", self.llm.available, self.cfg["llm"]["max_daily_cost_cny"])
-        if self.llm.available:
-            await self.llm.probe_vision()
-            log.info("多模态支持: %s", self.llm.vision_supported())
-        else:
-            log.warning("未检测到 DEEPSEEK_API_KEY，将运行在「仅规则」模式：不生成摘要、不做模型复核")
+        if not self.llm.available:
+            log.warning("未检测到 DEEPSEEK_API_KEY，仅接收和存储消息，不调用模型")
         self._tasks = [
             # ingest 必须在这里启动：_ws 回调只往 ingest_q 里塞事件，
             # 少了这个消费者，消息会全部堆在队列里（上限 5000）然后在进程退出时静默丢失，
@@ -211,13 +202,7 @@ class Pipeline:
             log.debug("自动拉取群列表失败（不影响消息接收）: %s", e)
 
     def on_peer_disconnected(self) -> None:
-        """最后一条协议端连接断开：60s 内没重连就 P0 告警。
-
-        实测案例：07:28 协议端断开后 6.6 小时无人察觉 —— NapCat 的 5s 自动重连
-        只在它自己活着时有效，QQ 会话掉线 / 进程退出后就永远不会再连，而服务侧
-        毫无异常，唯一征兆就是 ws_peers 变空。等 60s 是为了过滤「5 秒重连」的
-        正常抖动，不制造噪音。
-        """
+        """最后一条协议端连接断开超过 60 秒时，仅记录日志。"""
         if self._stop.is_set() or self.ws_peers:
             return
 
@@ -226,14 +211,6 @@ class Pipeline:
             if self._stop.is_set() or self.ws_peers:
                 return
             log.warning("协议端已断开超过 60s 且未重连 —— 消息不再入库")
-            with contextlib.suppress(Exception):
-                await self.notifier.notify(
-                    "协议端已断开",
-                    "NapCat 超过 60 秒未重连，消息已停止入库。\n"
-                    "请在界面点「启动协议端(NapCat)」重新拉起。",
-                    level="P0",
-                    play_sound=True,
-                )
 
         self._peer_watch = asyncio.create_task(_watch())
 
@@ -263,7 +240,6 @@ class Pipeline:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.llm.close()
         await self.media.close()
-        await self.notifier.close()
         self.store.close()
 
     # ---------- ingest ----------
@@ -299,7 +275,7 @@ class Pipeline:
         # 它把 self_id 填成 0 —— 若不设防，探针会把群属主写成 "0"。
         if self_id.isdigit() and self_id != "0" and self.bot_uin != self_id:
             self.bot_uin = self_id
-        msg: Msg | None = parse_onebot_event(event, self_id, {self_id} | self.at_ids)
+        msg: Msg | None = parse_onebot_event(event, self_id, {self_id})
         if msg is None:
             self.counters["skipped"] += 1
             return {"ok": False, "reason": "非群消息或空消息"}
@@ -331,76 +307,27 @@ class Pipeline:
             return {"ok": True, "duplicate": True}
 
         self.counters["stored"] += 1
-        self.scorer.record_links(msg.group_id, msg.sender_id, msg.text)
 
         if msg.image_urls:
-            # 图片消息不能在这里打分：OCR / 多模态结果还没出来，而报错截图的
-            # 识别文本正是打分依据。交给媒体循环按 media_state='pending' 轮询处理，
-            # 处理完它会立刻回头调用 _score。
+            # 交给媒体循环处理；只有消息带配文时才允许解析图片。
             return {"ok": True, "row_id": row_id, "queued_media": True}
 
-        await self._score(row_id)
         return {"ok": True, "row_id": row_id}
-
-    async def _score(self, row_id: int) -> None:
-        row = self.store.get_message(row_id)
-        if row is None:
-            return
-        gname = self.group_name(row["group_id"])
-        try:
-            result = await self.scorer.score(row, gname)
-        except BudgetExceeded:
-            log.warning("今日预算已用尽，后续消息仅走规则判定")
-            result = {"score": 0.0, "level": "P2", "reason": "预算已用尽"}
-        except Exception as e:  # noqa: BLE001
-            log.warning("打分失败: %s", e)
-            return
-
-        if result["level"] not in ("P0", "P1"):
-            return
-
-        excerpt = (row["text"] or row["ocr_text"] or "")[:300]
-        alert_id = self.store.add_alert(
-            row["group_id"], row["msg_id"], result["level"], result["score"], result["reason"], excerpt
-        )
-        self.counters["alerts"] += 1
-
-        # v0.5.7：全体提醒即使被模型评为 P0，也不打断用户；仍保留消息与评分。
-        if result["level"] == "P0" and not row["at_all"]:
-            await self.notifier.notify(
-                f"P0 · {gname or row['group_id']} · {row['sender_name']}",
-                f"{excerpt}\n\n理由：{result['reason']}",
-                level="P0",
-                play_sound=True,
-            )
-            self.store.mark_notified(alert_id)
-        log.info("[%s] %s | %s | %s", result["level"], gname or row["group_id"], result["reason"], excerpt[:60])
 
     # ---------- background loops ----------
 
     async def _media_loop(self) -> None:
-        """轮询待处理图片；处理完立刻打分（此时 OCR 结果已就绪）。
-
-        空闲轮里顺带补跑历史失败的图片语义。为什么要放在这里：语义失败是
-        **瞬时连接抖动**造成的（本机到 api.deepseek.com 偶发被撤连接，约 1/8），
-        隔一会儿重发基本就能成 —— 但没人补跑的话，那张图的信息就永久丢了。
-        每 20 个空闲轮（≈60 秒）补一小批，避免一次网络恢复后对模型发起一堆并发。
-        """
+        """轮询图片队列；允许解析的失败图片按既有次数上限补跑。"""
         idle_rounds = 0
         while not self._stop.is_set():
             try:
                 done = await self.media.process_pending(20)
                 if done:
                     idle_rounds = 0
-                    for row_id in done:
-                        await self._score(row_id)
                     continue
                 idle_rounds += 1
                 if idle_rounds % 20 == 0:
-                    # 补跑成功的那些必须重新打分：报错截图的语义文本正是打分依据，
-                    # 第一遍提取失败 = 这一条从来没被正确评过。
-                    for row_id in await self.media.retry_vision(4):
-                        await self._score(row_id)
+                    await self.media.retry_vision(4)
                 await asyncio.sleep(3)
             except asyncio.CancelledError:
                 raise
@@ -451,7 +378,7 @@ class Pipeline:
     # ---------- 看门狗 ----------
 
     async def _watchdog_loop(self) -> None:
-        """协议端「连着却不推消息」时主动告警（v0.5.4）。
+        """协议端「连着却不推消息」时记录警告（v0.5.4）。
 
         要解决的问题：协议端可以**连着、能应答 API，却一条消息都不推**。
         这种状态下 `/health` 一切正常，界面上「协议端已连接」是绿的，
@@ -464,8 +391,8 @@ class Pipeline:
           ④ 这个小时按历史基线**本该是活跃的** —— 否则凌晨一点必然误报，
              而深夜没人讲话是常态，不是故障。
 
-        只报一次：告警后解除武装，等 ② 恢复（QQ 库重新开始写）才重新武装。
-        **只通知、不自动重启** —— 半夜自动去动用户的账号是更大的风险。
+        只记录一次：警告后解除武装，等 ② 恢复（QQ 库重新开始写）才重新武装。
+        仅记录日志，不弹窗、不发声、不推送，也不自动重启。
         """
         wg = self.cfg.get("watchdog") or {}
         if not wg.get("enabled", True):
@@ -499,16 +426,6 @@ class Pipeline:
                 armed = False
                 log.warning("看门狗：QQ 消息库已 %.0f 分钟无写入，本库同期也无新消息"
                             "（%d 点历史基线 %d 条）—— 判定消息冻结", age / 60, hour, base)
-                with contextlib.suppress(Exception):
-                    await self.notifier.notify(
-                        "消息可能已冻结",
-                        f"桌面 QQ 已 {age / 60:.0f} 分钟没有新消息写入本地库，"
-                        f"而 {hour} 点按历史本该有 {base} 条左右。\n"
-                        "界面上「协议端已连接」在这种状态下**依然是绿的**。\n"
-                        "处置：点界面上的「重启协议端」（全退再重登，可能要重扫码）。",
-                        level="P1",
-                        play_sound=True,
-                    )
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -764,7 +681,7 @@ class Pipeline:
             "ok": True,
             "uptime_seconds": int(time.time() - self.started_at),
             "llm_available": self.llm.available,
-            "vision_supported": self.llm.vision_supported() if self.llm.available else False,
+            "vision_enabled": self.llm.vision_available,
             "spent_today_cny": round(self.llm.spent_today_cny(), 4),
             "budget_cny": self.cfg["llm"]["max_daily_cost_cny"],
             # 真实账单快照（可能为空：启动后 20 秒内还没抓第一次）。只读缓存，不打网络。

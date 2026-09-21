@@ -204,11 +204,10 @@ PAGE = """<!DOCTYPE html>
 
 
 class Summarizer:
-    def __init__(self, cfg: dict, store, llm, notifier):
+    def __init__(self, cfg: dict, store, llm):
         self.cfg = cfg
         self.store = store
         self.llm = llm
-        self.notifier = notifier
         self.scfg = cfg["summary"]
         self.report_dir: Path = abs_path(cfg, "report_dir")
         self.report_dir.mkdir(parents=True, exist_ok=True)
@@ -240,8 +239,6 @@ class Summarizer:
                     created.append(item)
             except Exception as e:  # noqa: BLE001
                 log.warning("群 %s 摘要失败: %s", group_id, e)
-        if created:
-            await self._notify_periodic(created, names)
         return created
 
     async def _summarize_hotspots(self, now: int) -> dict | None:
@@ -431,13 +428,6 @@ class Summarizer:
             "%s 已生成（%d 条消息 / %d 块 / %d 字 / 目标 %d 字）",
             kind_label, len(rows), len(chunks), len(content), limit,
         )
-        await self.notifier.notify(
-            title,
-            f"{len(rows)} 条消息 · {len(content)} 字",
-            level="P1",
-            action=path.as_uri(),
-            action_label="打开纪要",
-        )
         return {
             "id": sid,
             "group_id": "digest",
@@ -538,27 +528,6 @@ class Summarizer:
         )
         return path
 
-    async def _notify_periodic(self, created: list[dict], names: dict) -> None:
-        total = sum(c["count"] for c in created)
-        hot = next((c for c in created if c.get("group_id") == "hotspot"), None)
-        if hot:
-            # 有热点时以热点为标题 —— 这是读者最该先看的东西
-            title = f"跨群热点 {hot['n_hotspots']} 个（覆盖 {total} 条消息）"
-        else:
-            title = f"群摘要已生成（{len(created)} 个群 / {total} 条）"
-        lines = [
-            f"{names.get(c['group_id']) or c['title']}: {c['count']} 条"
-            for c in created[:6]
-        ]
-        newest = max(created, key=lambda c: c["id"])
-        await self.notifier.notify(
-            title,
-            "\n".join(lines),
-            level="P1",
-            action=Path(newest["path"]).as_uri(),
-            action_label="查看热点" if hot else "查看摘要",
-        )
-
     # ---------- daily ----------
 
     async def run_daily(self) -> str | None:
@@ -585,11 +554,5 @@ class Summarizer:
 
         title = f"群消息日报 {time.strftime('%Y-%m-%d')}"
         path = self._write_report(title, merged, "全部", since, int(time.time()), len(rows))
-        await self.notifier.notify(
-            title,
-            f"已汇总 {len(rows)} 份摘要，点击查看",
-            level="P1",
-            action=path.as_uri(),
-            action_label="打开日报",
-        )
+        log.info("日报已生成：%s", path)
         return str(path)

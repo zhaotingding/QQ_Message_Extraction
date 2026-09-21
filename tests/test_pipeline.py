@@ -1,4 +1,4 @@
-"""v0.5.7：通知抑制与过滤记录的实际入库链路；临时数据库，不访问模型或 QQ。"""
+"""收消息与启动不推理、不评分、不通知；临时数据库，不访问模型或 QQ。"""
 from __future__ import annotations
 
 import asyncio
@@ -35,33 +35,37 @@ async def main() -> None:
         cfg = copy.deepcopy(DEFAULTS)
         cfg["app"].update(db_path=str(Path(tmp) / "test.db"),
                           media_dir=str(Path(tmp) / "media"), report_dir=str(Path(tmp) / "reports"))
-        cfg["llm"]["enabled"] = False
         pipe = Pipeline(cfg)
-        pipe.scorer.score = AsyncMock(return_value={"level": "P0", "score": 10, "reason": "测试高分"})
-        pipe.notifier.notify = AsyncMock()
+        pipe.llm.configure("test-key-no-network")
+        pipe.llm._post = AsyncMock(side_effect=AssertionError("消息接收不得调用模型"))
+        pipe._billing_loop = AsyncMock()  # 账单网络独立，测试不访问真实服务。
         try:
+            await pipe.start()
+            await asyncio.sleep(0)
+            check("启动不发起模型探测", pipe.llm._post.await_count == 0)
+            check("评分器和通知器已从管道移除", not hasattr(pipe, "scorer") and not hasattr(pipe, "notifier"))
             for mid, message in enumerate([
                 [{"type": "at", "data": {"qq": "all"}}, {"type": "text", "data": {"text": "紧急通知"}}],
                 "[CQ:at,qq=all]紧急通知",
             ], 1):
                 await pipe.handle_event(event(mid, message))
-            check("两种格式的 @全体成员 即使 P0 也不弹通知", pipe.notifier.notify.await_count == 0)
-            check("全体消息正常保留且未标记已通知",
+            check("两种格式的 @全体成员 均不触发推理", pipe.llm._post.await_count == 0)
+            check("全体消息正常保留且不生成告警",
                   len(pipe.store.recent_messages()) == 2
-                  and all(not r["notified"] for r in pipe.store.recent_alerts()))
+                  and not pipe.store.recent_alerts())
             await pipe.handle_event(event(3, [
                 {"type": "at", "data": {"qq": "100"}}, {"type": "text", "data": {"text": "请回答"}},
             ]))
-            check("单独 @我 仍然通知", pipe.notifier.notify.await_count == 1)
+            check("单独 @我 不推理或生成告警", pipe.llm._post.await_count == 0 and not pipe.store.recent_alerts())
             await pipe.handle_event(event(4, "文档里提到 @全体成员 这几个字"))
-            check("普通文本不因出现同名文字而误抑制", pipe.notifier.notify.await_count == 2)
+            check("普通文本直接入库不推理", pipe.llm._post.await_count == 0)
             await pipe.handle_event(event(5, "很长的正文" * 5000 + "[CQ:at,qq=all]"))
-            check("原始载荷被截断的长消息仍能抑制全体通知", pipe.notifier.notify.await_count == 2)
+            check("长消息直接入库不推理", pipe.llm._post.await_count == 0)
             await pipe.handle_event(event(6, "[CQ:at,qq=100][CQ:at,qq=all]同时点名"))
-            check("包含全体提醒和单独点名时仍不弹窗", pipe.notifier.notify.await_count == 2)
+            check("同时点名和全体提醒仍不生成告警", not pipe.store.recent_alerts())
+            check("收消息没有产生任何 API 消费记录", not pipe.store.api_usage_details()["items"])
 
             cfg["filters"].update(skip_face_only=True, skip_image_only=True)
-            pipe.scorer.score.reset_mock()
             cases = [
                 {"type": "face", "data": {"id": "1"}},
                 {"type": "mface", "data": {"url": "https://invalid.test/face.png"}},
@@ -72,7 +76,7 @@ async def main() -> None:
                 check(f"过滤消息 {mid} 留有简要记录", result.get("filtered") is True and bool(result.get("row_id")))
             rows = [dict(r) for r in pipe.store.recent_messages() if r["media_state"] == "filtered"]
             check("表情、表情包和纯图片均标记已过滤", len(rows) == 3)
-            check("过滤消息不进入图片队列或评分", not pipe.store.pending_media() and pipe.scorer.score.await_count == 0)
+            check("过滤消息不进入图片队列或调用模型", not pipe.store.pending_media() and pipe.llm._post.await_count == 0)
             stored = pipe.store.conn.execute("SELECT * FROM messages WHERE media_state='filtered'").fetchall()
             check("过滤记录不保留图片链接或原始载荷",
                   len(stored) == 3 and all(json.loads(r["image_urls"]) == [] and not r["raw"] for r in stored))
@@ -85,7 +89,7 @@ async def main() -> None:
             check("带文字的图片仍进入处理队列", len(pipe.store.pending_media()) == 1)
             cfg["filters"].update(skip_face_only=False, skip_image_only=False)
             await pipe.handle_event(event(21, [cases[2]]))
-            check("关闭过滤后纯图片恢复处理", len(pipe.store.pending_media()) == 2)
+            check("关闭入库过滤后保留纯图，仍由媒体层跳过解析", len(pipe.store.pending_media()) == 2)
         finally:
             await pipe.stop()
 

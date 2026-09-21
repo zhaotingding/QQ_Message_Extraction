@@ -11,14 +11,9 @@ If WScript.Arguments.Count < 1 Then
 End If
 dir = WScript.Arguments(0)
 If Not fso.FileExists(dir & "\launcher.bat") Then
-    MsgBox "launcher.bat not found in:" & vbCrLf & dir, 16, "msgx - NapCat"
     WScript.Quit 2
 End If
 sh.CurrentDirectory = dir
 ' 0 = hidden window, True = wait for it to finish
 rc = sh.Run("""" & dir & "\launcher.bat""", 0, True)
-If rc <> 0 Then
-    MsgBox "NapCat launcher.bat exited with code " & rc & vbCrLf & vbCrLf & _
-           "Run tools\start_napcat.bat manually to see the full output.", 16, "msgx - NapCat"
-End If
 WScript.Quit rc

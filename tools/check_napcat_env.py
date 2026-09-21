@@ -212,7 +212,7 @@ def probe(ws_port: int, http_port: int) -> None:
             body = json.loads(r.read().decode("utf-8"))
         print(
             f"  status={r.status} ok={body.get('ok')} llm={body.get('llm_available')} "
-            f"vision={body.get('vision_supported')}"
+            f"vision_enabled={body.get('vision_enabled')}"
         )
     except Exception as e:  # noqa: BLE001
         print(f"  !! 失败: {type(e).__name__}: {e}")

@@ -124,7 +124,7 @@ check("消息渲染成行", len(rows) == 2, str(len(rows)))
 vals = [app.rt.item(r, "values") for r in rows]
 check("按新的在前排序（列表顺序即服务返回顺序）", vals[0][3] == "第二条", str(vals[0]))
 check("空文本回落到 OCR 内容", vals[1][3] == "报错截图", str(vals[1]))
-check("被 @ 的行有专属标记", "atme" in app.rt.item(rows[0], "tags"), str(app.rt.item(rows[0], "tags")))
+check("被 @ 的行按普通消息呈现", "atme" not in app.rt.item(rows[0], "tags"), str(app.rt.item(rows[0], "tags")))
 check("语义失败的行有专属标记", "failed" in app.rt.item(rows[1], "tags"), str(app.rt.item(rows[1], "tags")))
 
 print("\n=== 图片状态标注 ===")
@@ -133,7 +133,8 @@ labels = {
     app._media_label({"media_state": "pending"}): "待处理",
     app._media_label({"media_state": "failed"}): "下载失败",
     app._media_label({"media_state": "done", "vision_state": "failed"}): "图片未识别",
-    app._media_label({"media_state": "done", "vision_state": "skipped"}): "仅 OCR",
+    app._media_label({"media_state": "done", "vision_state": "skipped", "ocr_text": "旧记录文字"}): "仅 OCR",
+    app._media_label({"media_state": "done", "vision_state": "skipped"}): "已跳过",
     app._media_label({"media_state": "done", "vision_state": "ok"}): "完成",
 }
 for got, want in labels.items():
@@ -151,20 +152,22 @@ app._apply_health({
     "spent_today_cny": 0.0286,
     "budget_cny": 10.0,
     "llm_available": True,
-    "vision_supported": True,
+    "vision_enabled": True,
 })
 check("协议端显示已连接", "已连接" in app.v_peer.get(), app.v_peer.get())
 check("入库数显示", "33" in app.v_stored.get(), app.v_stored.get())
 check("过滤数显示", "2" in app.v_stored.get(), app.v_stored.get())
 check("花费显示（无账单快照时标明是估算）", "估算" in app.v_cost.get(), app.v_cost.get())
-check("模型状态显示", "支持图片" in app.v_llm.get(), app.v_llm.get())
+check("模型状态仅说明已配置和解析已开启", app.v_llm.get() == "已配置 · 带配文图片解析已开启", app.v_llm.get())
+app._apply_health({"llm_available": True, "vision_enabled": False})
+check("图片解析关闭时状态准确", app.v_llm.get() == "已配置 · 图片解析 API 已关闭", app.v_llm.get())
 check("运行状态不再展示图片语义失败计数", not hasattr(app, "v_vision"))
 
 print("\n=== 账单显示（平台真实数据 vs 本地估算）===")
 app._apply_health({
     "ok": True, "ws_peers": [], "counters": {}, "stats": {},
     "spent_today_cny": 0.47, "budget_cny": 10,
-    "llm_available": True, "vision_supported": True,
+    "llm_available": True, "vision_enabled": True,
     "billing": {
         "source": "platform", "today_cny": 1.107, "total_cny": 3.5, "currency": "CNY",
         "from_day": "2026-09-18", "platform_error": "",
@@ -260,7 +263,7 @@ app._apply_billing({
 app._apply_health({
     "ok": True, "ws_peers": [], "counters": {}, "stats": {},
     "spent_today_cny": 0, "budget_cny": 10,
-    "llm_available": False, "vision_supported": False,
+    "llm_available": False, "vision_enabled": False,
 })
 # 文案要既点明「未连接」，又说清缺的是协议端 NapCat —— 只说「未连接」用户不知道下一步做什么
 peer_txt = app.v_peer.get()
@@ -269,7 +272,7 @@ check(
     "未连接" in peer_txt and ("NapCat" in peer_txt or "协议端" in peer_txt),
     peer_txt,
 )
-check("无 API Key 时提示准确", "仅规则模式" in app.v_llm.get(), app.v_llm.get())
+check("无 API Key 时提示准确", "不生成摘要或解析图片" in app.v_llm.get(), app.v_llm.get())
 
 print("\n=== 协议端启动脚本解析 ===")
 app.cfg["napcat"] = {"start_script": ""}
@@ -756,6 +759,49 @@ with patch("msgx.gui.threading.Thread") as _thread:
     check("切换记录后不混入过期来源响应", "过期响应" not in app.usage_detail.get("1.0", "end"))
     app.usage_table.selection_remove("7")
 app.proc = _saved_proc
+
+print("\n=== 状态和错误仅在界面内显示，不弹通知 ===")
+_labels = [str(w.cget("text")) for w in allw if isinstance(w, (ttk.Label, ttk.LabelFrame, ttk.Checkbutton))]
+check("关注词用途不再涉及评分或提醒", "热点关注词" in _labels and
+      not any("模型判定是否值得提醒" in value for value in _labels))
+check("图片规则明确按消息配文判断", any("消息附带文字时才调用 API" in value for value in _labels)
+      and "纯图片（消息未附带文字）" in _labels)
+with patch.object(_mb, "showinfo") as _info, patch.object(_mb, "showerror") as _error:
+    app.summary_now()
+    check("未启动时生成摘要仅显示页内说明", "先启动服务" in app.v_summary.get())
+    app.refresh_billing()
+    check("未启动时刷新账单仅显示状态栏", "先启动服务" in app.status.get())
+    app.prune_groups()
+    check("未启动时查询群仅显示状态栏", "先启动服务" in app.status.get())
+
+    _interval = app.v_interval.get()
+    app.v_interval.set("不是整数")
+    check("无效设置直接指出问题", not app.save_prefs() and "摘要间隔必须是整数" in app.status.get())
+    app.v_interval.set(_interval)
+    with patch("msgx.gui.prefs_mod.save", side_effect=OSError("测试保存失败")):
+        check("保存失败留在状态栏和日志", not app.save_prefs() and "测试保存失败" in app.status.get()
+              and "测试保存失败" in app.log.get("1.0", "end"))
+
+    with patch.object(app, "save_prefs", return_value=True), patch.object(Path, "unlink"), \
+            patch("msgx.gui.subprocess.Popen", side_effect=OSError("测试服务启动失败")):
+        app.start_service()
+    check("服务启动失败留在状态栏和日志", app.proc is None and "测试服务启动失败" in app.status.get()
+          and "测试服务启动失败" in app.log.get("1.0", "end"))
+    app.proc = object()
+    with patch.object(Path, "touch", side_effect=OSError("测试服务停止失败")):
+        app.stop_service()
+    check("服务停止失败留在状态栏和日志", "测试服务停止失败" in app.status.get()
+          and "测试服务停止失败" in app.log.get("1.0", "end"))
+    app.proc = _saved_proc
+
+    with patch.object(N, "running_instances", return_value={"injectors": 0}), \
+            patch.object(N, "launch", return_value={"ok": False, "error": "测试协议端启动失败"}):
+        app.start_napcat()
+    check("协议端失败留在状态栏和日志", "测试协议端启动失败" in app.status.get()
+          and "测试协议端启动失败" in app.log.get("1.0", "end"))
+    app._dispatch_event("exit", 1)
+    check("服务异常退出留在状态栏", "服务异常退出" in app.status.get())
+    check("以上操作均不弹通知框", not _info.called and not _error.called)
 
 root.update()
 root.destroy()

@@ -19,7 +19,7 @@
 - 未冻结（用 python 直接跑本文件调试）：项目根 = 本文件的上上级目录。
 
 因为 exe 用 `--noconsole` 构建，**没有任何控制台输出**，
-所以这里所有失败路径都必须弹窗 + 落盘，否则用户只会看到「双击没反应」。
+所以这里所有失败路径都落盘到 .ui/exe_error.log，供排查启动故障。
 """
 from __future__ import annotations
 
@@ -40,18 +40,12 @@ LOG_PATH = PROJECT_DIR / ".ui" / "exe_error.log"
 
 
 def _report(title: str, detail: str) -> None:
-    """把失败原因同时呈现给用户和日志文件（无控制台，否则无从排查）。"""
+    """把启动失败原因写入日志，不弹出通知。"""
     full = f"{title}\n\n{detail}"
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         LOG_PATH.write_text(full, encoding="utf-8")
     except OSError:
-        pass
-    try:
-        import ctypes
-
-        ctypes.windll.user32.MessageBoxW(None, full[:1500], "消息萃取 启动失败", 0x10)
-    except Exception:  # noqa: BLE001
         pass
 
 

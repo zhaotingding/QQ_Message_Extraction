@@ -22,5 +22,4 @@ PyYAML==6.0.3
 rapidocr-onnxruntime==1.2.3
 shapely==2.1.2
 six==1.17.0
-winotify==1.1.0
 yarl==1.25.1

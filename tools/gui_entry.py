@@ -2,7 +2,7 @@
 
 由 tools/start_gui.cmd 用 pythonw.exe 调用，所以**没有控制台窗口**。
 这意味着任何未捕获的异常都不会有输出 —— 因此这里必须自己兜住异常并把
-错误信息弹给用户 + 落盘到 .ui/gui_error.log，否则「双击没反应」将无从排查。
+错误信息落盘到 .ui/gui_error.log，供排查启动故障。
 """
 from __future__ import annotations
 
@@ -15,21 +15,12 @@ sys.path.insert(0, str(ROOT / "src"))
 
 
 def _report(detail: str) -> None:
-    """把启动失败的原因同时呈现给用户和日志文件。"""
+    """把启动失败原因写入日志，不弹出通知。"""
     log_dir = ROOT / ".ui"
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "gui_error.log").write_text(detail, encoding="utf-8")
     except OSError:
-        pass
-    try:
-        import tkinter.messagebox as mb
-
-        mb.showerror(
-            "消息萃取 启动失败",
-            f"{detail[:1500]}\n\n完整信息已写入：\n{log_dir / 'gui_error.log'}",
-        )
-    except Exception:  # noqa: BLE001
         pass
 
 

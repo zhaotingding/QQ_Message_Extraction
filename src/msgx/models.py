@@ -73,8 +73,12 @@ def _from_cq_string(s: str, at_ids: set) -> tuple[str, list, bool]:
             out.append("")
         elif ctype == "file":
             out.append(f"[文件:{cparams.get('name', '')}]")
-        else:
-            out.append(f"[{ctype}]")
+        elif ctype == "record":
+            out.append("[语音]")
+        elif ctype == "video":
+            out.append("[视频]")
+        elif ctype == "forward":
+            out.append("[合并转发]")
     out.append(s[pos:])
     return "".join(out), images, at_me
 

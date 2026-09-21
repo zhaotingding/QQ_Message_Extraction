@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import sys
+import json
 from io import BytesIO
 from pathlib import Path
 
@@ -127,6 +128,127 @@ check("failed 图片被重新入队", n == 1)
 check("状态恢复为 pending", row["media_state"] == "pending")
 check("重复调用不产生副作用", st.requeue_failed_media() == 0)
 st.close()
+
+print("\n=== 仅消息带配文的图片允许解析 ===")
+
+from msgx.config import DEFAULTS  # noqa: E402
+from msgx.media import MediaWorker, _has_caption  # noqa: E402
+from msgx.models import Msg, parse_onebot_event  # noqa: E402
+import copy  # noqa: E402
+
+async def captioned_image_tests():
+    with tempfile.TemporaryDirectory() as directory:
+        cfg = copy.deepcopy(DEFAULTS)
+        cfg["app"]["media_dir"] = str(Path(directory) / "media")
+        store = Store(str(Path(directory) / "media.db"))
+        image = Path(directory) / "source.png"
+        image.write_bytes(png())
+
+        class FakeLLM:
+            vision_available = True
+            def __init__(self):
+                self.calls = []
+            async def describe_image(self, path, prompt, **kwargs):
+                self.calls.append((path, prompt, kwargs))
+                return "图片中展示了错误日志", True
+
+        llm = FakeLLM()
+        worker = MediaWorker(cfg, store, llm)
+        downloaded = []
+        async def download(url):
+            downloaded.append(url)
+            return image
+        worker._download = download
+        worker._ocr_sync = lambda path: ""
+
+        def insert(mid, text):
+            return store.insert_message(Msg(msg_id=mid, group_id="g", text=text,
+                                            image_urls=[image.as_uri()], msg_type="mixed"))
+
+        for index, text in enumerate(("[图片]", "[图片][表情][表情包]", "@全体成员[图片]",
+                                      "[图片][文件:资料.pdf][语音][视频][合并转发]", "  ",
+                                      "[图片][record][video][forward]")):
+            row_id = insert(f"bare-{index}", text)
+            await worker._process_row(store.get_message(row_id))
+            row = store.get_message(row_id)
+            check(f"无配文或仅占位符 {index + 1} 跳过且不耗重试次数",
+                  row["vision_state"] == "skipped" and row["vision_tries"] == 0)
+        check("无配文图片完全不下载、不调用 API", not downloaded and not llm.calls)
+
+        event = {"post_type": "message", "message_type": "group", "message_id": "at-only",
+                 "group_id": "g", "message": [{"type": "at", "data": {"qq": "123"}},
+                                              {"type": "image", "data": {"url": image.as_uri()}}]}
+        at_only = store.insert_message(parse_onebot_event(event, "123"))
+        await worker._process_row(store.get_message(at_only))
+        check("只有点名和图片也不算配文", not downloaded and not llm.calls)
+
+        for segment_type, marker in (("record", "[语音]"), ("video", "[视频]"),
+                                     ("forward", "[合并转发]"), ("json", "")):
+            cq_event = {"post_type": "message", "message_type": "group", "group_id": "g",
+                        "message_id": f"cq-{segment_type}",
+                        "message": f"[CQ:{segment_type},file=attachment][CQ:image,url={image.as_uri()}]"}
+            cq_msg = parse_onebot_event(cq_event, "123")
+            array_event = {**cq_event, "message": [{"type": segment_type, "data": {"file": "attachment"}},
+                                                    {"type": "image", "data": {"url": image.as_uri()}}]}
+            array_msg = parse_onebot_event(array_event, "123")
+            check(f"CQ {segment_type} 与数组格式占位符一致", cq_msg.text == array_msg.text == marker + "[图片]")
+            cq_id = store.insert_message(cq_msg)
+            await worker._process_row(store.get_message(cq_id))
+            check(f"图片与 {segment_type} 混合但无配文不会解析", not downloaded and not llm.calls)
+            # 复现旧版入库格式，包括未知 CQ 类型产生的英文占位符。
+            store.conn.execute("UPDATE messages SET text=?, media_path=?, vision_state='failed' WHERE id=?",
+                               (f"[{segment_type}][图片]", str(image), cq_id))
+            store.conn.commit()
+            recovered = await worker.retry_vision()
+            check(f"旧 {segment_type} 占位符不能通过重试绕过配文门槛",
+                  not recovered and not llm.calls and store.get_message(cq_id)["vision_state"] == "skipped")
+
+        for message in (f"[ERROR][CQ:image,url={image.as_uri()}]",
+                        [{"type": "text", "data": {"text": "[ERROR]"}},
+                         {"type": "image", "data": {"url": image.as_uri()}}]):
+            error_event = {**event, "message_id": "error-caption", "message": message}
+            parsed = parse_onebot_event(error_event, "123")
+            check("正文里的 [ERROR] 是真实配文，不会被当协议占位符删除",
+                  _has_caption({"raw": json.dumps(parsed.raw), "text": parsed.text}))
+        check("旧 raw 截断时仍识别已知英文占位符",
+              not _has_caption({"raw": '{"message":', "text": "[record][video][forward][图片]"}))
+
+        captioned = insert("captioned", "部署时出现这个错误[图片]")
+        await worker._process_row(store.get_message(captioned))
+        check("真实配文图片无需能力探测且不依赖 OCR 检出文字", len(llm.calls) == 1
+              and store.get_message(captioned)["ocr_text"] == "")
+        check("图片请求关联原消息且不再解释表情包",
+              llm.calls[0][2] == {"source_ids": [captioned], "purpose": "图片理解"}
+              and "梗" not in llm.calls[0][1] and "情绪" not in llm.calls[0][1])
+        duplicate = insert("duplicate", "另一个群也遇到了[图片]")
+        await worker._process_row(store.get_message(duplicate))
+        check("配文同图复用已成功结果，不重复花费", len(llm.calls) == 1
+              and store.get_message(duplicate)["vision_state"] == "ok")
+        bare_duplicate = insert("bare-duplicate", "[图片]")
+        count = len(downloaded)
+        await worker._process_row(store.get_message(bare_duplicate))
+        check("无配文同图不能通过去重复用绕过门槛", len(downloaded) == count
+              and store.get_message(bare_duplicate)["vision_text"] == "")
+
+        old_bare = insert("old-bare", "[图片]")
+        store.set_media_result(old_bare, ocr_text="旧 OCR 内容", vision_text="旧结果", media_path=str(image),
+                               state="done", vision_state="failed")
+        recovered = await worker.retry_vision()
+        old_row = store.get_message(old_bare)
+        check("旧无配文失败队列不再烧 Token", not recovered and len(llm.calls) == 1
+              and old_row["vision_state"] == "skipped" and old_row["vision_tries"] == 0)
+        check("跳过旧记录时保留已有内容和路径", old_row["ocr_text"] == "旧 OCR 内容"
+              and old_row["vision_text"] == "旧结果" and old_row["media_path"] == str(image))
+        old_caption = insert("old-caption", "这些报错是什么[图片]")
+        store.set_media_result(old_caption, media_path=str(image), state="done", vision_state="failed")
+        recovered = await worker.retry_vision()
+        check("带配文的失败图片仍可在次数限制内补跑", recovered == [old_caption]
+              and store.get_message(old_caption)["vision_tries"] == 1 and len(llm.calls) == 2)
+        check("补跑费用仍关联原消息", llm.calls[-1][2] == {"source_ids": [old_caption], "purpose": "图片理解重试"})
+        await worker.close()
+        store.close()
+
+asyncio.run(captioned_image_tests())
 
 print()
 if fails:

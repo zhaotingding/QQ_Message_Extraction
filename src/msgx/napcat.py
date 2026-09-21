@@ -61,7 +61,7 @@ REQUIRED_FILES = (
 #
 # 关键点：
 #   * WshShell.Run(cmd, 0, True) —— 0 = 窗口隐藏；True = 等它结束，
-#     这样才能拿到退出码、在失败时弹框（成功则悄无声息地退出）。
+#     这样才能拿到退出码；失败也不弹窗。
 #   * 直接 Run 一个 .bat，不经 cmd /c 拼重定向 —— 省掉 cmd 那套
 #     「首字符是引号且引号多于两个就掐头去尾」的解析陷阱。
 VBS_SOURCE = r'''Option Explicit
@@ -77,16 +77,11 @@ If WScript.Arguments.Count < 1 Then
 End If
 dir = WScript.Arguments(0)
 If Not fso.FileExists(dir & "\launcher.bat") Then
-    MsgBox "launcher.bat not found in:" & vbCrLf & dir, 16, "msgx - NapCat"
     WScript.Quit 2
 End If
 sh.CurrentDirectory = dir
 ' 0 = hidden window, True = wait for it to finish
 rc = sh.Run("""" & dir & "\launcher.bat""", 0, True)
-If rc <> 0 Then
-    MsgBox "NapCat launcher.bat exited with code " & rc & vbCrLf & vbCrLf & _
-           "Run tools\start_napcat.bat manually to see the full output.", 16, "msgx - NapCat"
-End If
 WScript.Quit rc
 '''
 

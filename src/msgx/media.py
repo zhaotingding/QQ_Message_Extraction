@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from pathlib import Path
@@ -9,6 +10,8 @@ from pathlib import Path
 import aiohttp
 
 from .config import abs_path
+from .models import CQ_RE
+from .prefs import plain_text
 
 log = logging.getLogger("msgx.media")
 
@@ -16,11 +19,26 @@ VISION_PROMPT = (
     "这是一张从技术群聊里抓到的图片。请：\n"
     "1) 完整提取图中所有可读文字（代码、报错、命令、终端输出、图表标签都要，按原样保留）；\n"
     "2) 用一句话说明这是什么内容。\n"
-    "若图片是表情包或梗图，没有实质文字，则只输出一句话说明它的情绪/梗义（20 字内）。\n"
     "不要输出任何额外解释。"
 )
 
 ERROR_HINTS = ("error", "exception", "traceback", "failed", "报错", "错误", "失败", "异常")
+
+
+def _has_caption(row) -> bool:
+    """只认可原消息的正文；协议占位符和 OCR 结果不算配文。"""
+    try:
+        event = json.loads(row["raw"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        event = {}
+    segments = event.get("message") if isinstance(event, dict) else None
+    if isinstance(segments, list):
+        return any(str((seg.get("data") or {}).get("text", "")).strip()
+                   for seg in segments if isinstance(seg, dict) and seg.get("type") == "text")
+    if isinstance(segments, str):
+        return bool(CQ_RE.sub("", segments).strip())
+    # 早期导入数据可能没有原事件，超长原事件也可能被截断。
+    return bool(plain_text(row["text"]))
 
 
 def _sniff_ext(data: bytes) -> str:
@@ -223,7 +241,9 @@ class MediaWorker:
         return done
 
     async def _process_row(self, row) -> None:
-        import json
+        if not _has_caption(row):
+            self._skip_uncaptioned(row)
+            return
 
         urls = json.loads(row["image_urls"] or "[]")
         if not urls:
@@ -255,7 +275,7 @@ class MediaWorker:
         if self.mcfg.get("ocr_enabled", True):
             ocr_text = await asyncio.to_thread(self._ocr_sync, path)
 
-        vision_text, vision_state = await self._run_vision(path, int(row["id"]))
+        vision_text, vision_state = await self._run_vision(path, row)
         if vision_state != "skipped":
             # 第一次尝试也计数：否则「首跑失败」的行会白得一次额外重试机会，
             # 而补跑计数只覆盖后续轮次，上限就不是真正的上限了。
@@ -271,18 +291,26 @@ class MediaWorker:
             vision_state=vision_state,
         )
 
-    async def _run_vision(self, path: Path, row_id: int, retry: bool = False) -> tuple[str, str]:
+    def _skip_uncaptioned(self, row) -> None:
+        """旧待办和失败记录也只按消息配文放行，保留已有识别结果。"""
+        self.store.set_media_result(
+            row["id"], ocr_text=row["ocr_text"] or "", vision_text=row["vision_text"] or "",
+            media_path=row["media_path"] or "", media_hash=row["media_hash"] or "",
+            state="done", vision_state="skipped",
+        )
+
+    async def _run_vision(self, path: Path, row, retry: bool = False) -> tuple[str, str]:
         """跑图片语义，返回 ``(文本, 状态)``。状态见 store.MESSAGE_MIGRATIONS。
 
         为什么要把「失败」单独记下来：失败不落状态的话，这张图以后永远不会
         再被尝试（实测因此丢掉 62 张）。记成 'failed' 后由 `retry_vision()`
         在后续轮次里补跑 —— 图片已在本地，补跑只是重发一次推理请求。
         """
-        if not self.mcfg.get("vision_enabled", True):
+        if not _has_caption(row):
             return "", "skipped"
-        if not self.llm.vision_supported():
+        if not self.llm.vision_available:
             return "", "skipped"
-        text, ok = await self.llm.describe_image(path, VISION_PROMPT, source_ids=[row_id],
+        text, ok = await self.llm.describe_image(path, VISION_PROMPT, source_ids=[int(row["id"])],
                                                  purpose="图片理解重试" if retry else "图片理解")
         return text, ("ok" if ok else "failed")
 
@@ -294,20 +322,22 @@ class MediaWorker:
         永远读不出来的图会被每一轮补跑反复送去推理，安静地烧钱。次数用满后
         它就停在 'failed'，不再进入 `failed_vision` 的结果集。
 
-        返回**这一次补出内容**的行 id，交给调用方重新打分：报错截图的语义文本
-        正是打分依据，第一遍提取失败等于这一条从来没被正确评过。
+        返回**这一次补出内容**的行 id，供后续摘要使用。
         """
-        if not self.mcfg.get("vision_enabled", True) or not self.llm.vision_supported():
+        if not self.llm.vision_available:
             return []
         rows = self.store.failed_vision(limit)
-        scored: list[int] = []
+        done: list[int] = []
         for row in rows:
+            if not _has_caption(row):
+                self._skip_uncaptioned(row)
+                continue
             self.store.bump_vision_tries(row["id"])
             path = Path(row["media_path"])
             if not path.exists():
                 continue  # 文件被清理了，保持 failed 即可
             async with self._sem:
-                text, state = await self._run_vision(path, int(row["id"]), retry=True)
+                text, state = await self._run_vision(path, row, retry=True)
             self.store.set_media_result(
                 row["id"],
                 ocr_text=row["ocr_text"] or "",
@@ -318,10 +348,10 @@ class MediaWorker:
                 vision_state="ok" if state == "ok" else "failed",
             )
             if state == "ok":
-                scored.append(int(row["id"]))
-        if scored:
-            log.info("补跑图片语义成功 %d 张（本轮尝试 %d 张）", len(scored), len(rows))
-        return scored
+                done.append(int(row["id"]))
+        if done:
+            log.info("补跑图片语义成功 %d 张（本轮取出 %d 张）", len(done), len(rows))
+        return done
 
     @staticmethod
     def looks_like_error(text: str) -> bool:

@@ -66,7 +66,7 @@ async def cmd_run(cfg: dict, stop_file: str | None = None) -> None:
     log.info("  本地注入测试     : POST http://%s:%s/inject", host, http_port)
     log.info("  健康检查         : http://%s:%s/health", host, http_port)
     if not pipe.llm.available:
-        log.warning("  未设置 DEEPSEEK_API_KEY —— 当前为「仅规则」模式")
+        log.warning("  未设置 DEEPSEEK_API_KEY —— 当前仅接收和存储消息")
     log.info("=" * 62)
 
     stop_evt = asyncio.Event()
@@ -147,20 +147,6 @@ async def cmd_inject(cfg: dict, payload: str) -> None:
         for ev in events:
             r = await pipe.handle_event(ev)
             print(json.dumps(r, ensure_ascii=False))
-    finally:
-        await pipe.stop()
-
-
-async def cmd_vision(cfg: dict, force: bool) -> None:
-    pipe = Pipeline(cfg)
-    try:
-        if not pipe.llm.available:
-            print("未配置 api_key，无法探测")
-            return
-        ok = await pipe.llm.probe_vision(force=force)
-        print(f"图片输入支持：{'是' if ok else '否'}")
-        if not ok:
-            print("→ 已自动降级为「本地 OCR only」模式，功能不受影响。")
     finally:
         await pipe.stop()
 
@@ -248,9 +234,6 @@ def main(argv: list[str] | None = None) -> int:
     p_inj = sub.add_parser("inject", help="直接向管道注入 OneBot 事件（调试用）")
     p_inj.add_argument("json", help="事件 JSON 字符串")
 
-    p_vis = sub.add_parser("vision", help="探测模型是否支持图片输入")
-    p_vis.add_argument("--force", action="store_true")
-
     sub.add_parser("stats", help="查看运行状态与用量")
     sub.add_parser("prune", help="按保留策略清理旧数据")
 
@@ -269,7 +252,6 @@ def main(argv: list[str] | None = None) -> int:
         "run": lambda: cmd_run(cfg, args.stop_file),
         "summary": lambda: cmd_summary(cfg, args.kind, args.hours),
         "inject": lambda: cmd_inject(cfg, args.json),
-        "vision": lambda: cmd_vision(cfg, args.force),
         "stats": lambda: cmd_stats(cfg),
         "prune": lambda: cmd_prune(cfg),
     }[args.cmd]

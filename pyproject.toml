@@ -12,7 +12,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "msgx"
 dynamic = ["version"]
-description = "QQ 群消息萃取服务：接收 → 落库 → 媒体理解 → 打分 → 摘要 → 本机提醒"
+description = "QQ 群消息萃取服务：接收 → 落库 → 带配文图片解析 → 摘要"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
@@ -21,7 +21,6 @@ license = { text = "Proprietary" }
 dependencies = [
   "aiohttp>=3.9",
   "pillow>=10.0",
-  "winotify>=1.1.0",
   "rapidocr-onnxruntime==1.2.3",
 ]
 

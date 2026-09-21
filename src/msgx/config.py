@@ -24,7 +24,7 @@ DEFAULTS: dict = {
         "http_port": 6701,
         "access_token": "",
     },
-    "watch": {"groups": [], "names": {}, "at_qq": []},
+    "watch": {"groups": [], "names": {}},
     "llm": {
         "enabled": True,
         "base_url": "https://api.deepseek.com",
@@ -64,18 +64,8 @@ DEFAULTS: dict = {
         "chunk_char_budget": 6000,
         "min_messages": 8,
     },
-    "score": {
+    "score": {  # 仅保留热点关键词的旧配置键，已无消息评分。
         "keywords": [],
-        "link_domains": [],
-        "p0_min_score": 8,
-        "p1_min_score": 5,
-        "llm_review_min_score": 2,
-    },
-    "notify": {
-        "backend": "auto",
-        "sound": True,
-        "webhook_url": "",
-        "webhook_type": "wecom",
     },
     # 协议端（NapCat）。本服务只监听协议端连入，**不负责启动它**，所以默认都是空的。
     #   start_script —— 填上后界面出现「启动协议端(NapCat)」按钮（可见排障模式用）
@@ -97,8 +87,7 @@ DEFAULTS: dict = {
     },
     # 主动看门狗（v0.5.4）。协议端会「连着、能应答 API，却一条消息都不推」——
     # 这种状态以前只能靠用户自己发现（最长一次挂了 9 小时）。看门狗定期检查
-    # 「桌面 QQ 的消息库是不是不写了」，命中就弹通知。
-    # **只通知、不自动重启**：半夜自动动用户的账号是更大的风险。
+    # 「桌面 QQ 的消息库是不是不写了」，命中仅写警告日志，不通知或重启。
     "watchdog": {
         "enabled": True,
         "check_seconds": 300,     # 检查间隔

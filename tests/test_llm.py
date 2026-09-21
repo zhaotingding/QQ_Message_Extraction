@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import tempfile
 from pathlib import Path
 
 PROJ = Path(__file__).resolve().parent.parent
@@ -206,6 +207,43 @@ async def exhausted(llm: LLM):
 
 msg = asyncio.run(exhausted(make_llm(post_retries=3)))
 check("重试用尽后抛出可读错误（含尝试次数）", "已重试 3 次" in msg, msg[:80])
+
+print("\n=== 图片解析不依赖收费能力探测 ===")
+
+async def image_without_probe():
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory() as tmp:
+        llm = make_llm()
+        llm.cfg["app"] = {"db_path": str(Path(tmp) / "test.db")}
+        old_cache = Path(tmp) / "vision_probe.json"
+        old_cache.write_text('{"vision": false}', encoding="utf-8")
+        image = Path(tmp) / "image.png"
+        Image.new("RGB", (12, 12), "white").save(image)
+        sent = []
+        async def fake_post(payload):
+            sent.append(payload)
+            return ok_response("图片中的运行日志")
+        llm._post = fake_post
+        check("收费探测入口及支持缓存接口已删除",
+              not hasattr(llm, "probe_vision") and not hasattr(llm, "vision_supported"))
+        check("图片可用性只读配置，不调用模型", llm.vision_available and not sent)
+        text, ok = await llm.describe_image(image, "提取图片", source_ids=[12])
+        check("旧失败探测缓存不会阻止真实图片解析", ok and text == "图片中的运行日志")
+        check("解析图片只有一次请求，没有前置测试图片", len(sent) == 1)
+        check("解析费用关联原消息", llm.store.details[0]["source_ids"] == [12])
+        check("旧探测文件原样保留", old_cache.read_text("utf-8") == '{"vision": false}')
+        llm.cfg["media"] = {"vision_enabled": False}
+        result = await llm.describe_image(image, "提取图片")
+        check("关闭图片解析后不会调用 API", result == ("", False) and len(sent) == 1)
+        llm.cfg["media"]["vision_enabled"] = True
+        llm.llm["max_daily_cost_cny"] = 0
+        result = await llm.describe_image(image, "提取图片")
+        check("超出每日预算不会调用图片 API", result == ("", False) and len(sent) == 1)
+        llm.configure("")
+        check("无 API Key 时图片解析不可用", not llm.vision_available)
+
+asyncio.run(image_without_probe())
 
 print()
 if fails:
