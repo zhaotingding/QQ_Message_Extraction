@@ -383,6 +383,7 @@ llm_review_min_score = 2   # 规则分达到多少才交给模型复核（直接
 | 清理过期数据 | — | `python -m msgx.main prune` |
 | 灌注演示数据 | — | `python tools/make_demo.py --post --reset` |
 | **诊断「消息不来了」** | — | `python tools\diagnose_freeze.py` |
+| **一键重置协议端（全退 + 重登）** | 双击 `tools\重启协议端.bat` | `tools\重启协议端.bat` |
 | 清理重复的协议端实例 | — | `python tools\kill_dup_napcat.py --elevate` |
 | 跑测试 | — | `python tests/run_all.py` |
 
@@ -635,6 +636,7 @@ python tools/make_demo.py --post --reset
 │   ├── check_napcat_env.py   ← NapCat 环境体检（只读）
 │   ├── diagnose_freeze.py    ← 「消息不来了」一条命令诊断（进程/连接/队列探针/二维码/库）
 │   ├── kill_dup_napcat.py    ← 清理重复启动的协议端实例（--elevate 自提权）
+│   ├── 重启协议端.bat        ← 一键「全退 + 重登」协议端（双击，一次 UAC）
 │   ├── START_HERE.cmd/.vbs   ← 备用入口（默认开界面，--cli 进菜单）
 │   ├── 启动服务.bat          ← 备用：只跑服务，无界面
 │   └── 查看状态.bat          ← 备用：查看状态与用量
@@ -781,31 +783,43 @@ python tools\diagnose_freeze.py
 最常见的形态是：**状态显示「已连接」，消息却停了** —— 这多半是 **QQ 登录态掉了**，
 NapCat 退回「等扫码」。确认方法：看 `<NapCat 目录>\cache\qrcode.png` 的修改时间，
 如果它**刚刚还在刷新**，就说明协议端正停在扫码界面等你扫码。
-处置：**先关掉多余的实例**（见下），点一次「启动协议端」，扫**一次**码。
 
-> ⚠️ **不要连点「启动协议端」。** 点一次 = 注入一份 NapCat **并且再拉起一份 QQ**。
-> 连点会产生多份实例，各自往 `cache/qrcode.png` 写二维码互相覆盖 ——
-> 扫哪一次都可能立刻被下一份覆盖掉，结果**谁也登不上去**，看起来就是「点了很多次都没用」。
-> v0.5.2 起，界面检测到已有实例时会先弹确认框拦住你；协议端日志页也会直接列出实例个数。
+**处置：双击 `tools\重启协议端.bat`**（一次点击、一次 UAC、一次扫码）：
 
-要清理重复实例（**需要管理员权限** —— 这些进程由提权后的 NapCat 拉起，普通权限杀不掉）：
+```
+双击 tools\重启协议端.bat
+  → 弹 UAC，点「是」
+  → 它会：结束所有 NapCat 注入器 → 结束所有 QQ.exe → 等 2 秒复查补刀
+          → 重新注入并拉起 QQ
+  → NapCat 写下二维码，扫码登录
+```
+
+> **为什么必须「先全退再重登」，而不是直接再点一次「启动协议端」**：
+> 「启动协议端」**不会先清场**，它只是再注入一份、再拉起一份 QQ。卡住的那一份还在，
+> 两份各自往 `cache/qrcode.png` 写二维码互相覆盖 —— 扫哪一次都可能立刻失效。
+> 所以「消息冻结」时正确的动作是**先全部退出，再重新登录**，
+> 这也正是 `重启协议端.bat` 做的事。
+>
+> 另：**不要连点「启动协议端」**（点一次 = 注入一份 NapCat **并且再拉起一份 QQ**）。
+> v0.5.2 起界面检测到已有实例会先弹确认框拦住你；协议端日志页也会直接列出实例个数。
+
+只想看有多少实例、不动手（**读数为 0/1 才正常，≥2 说明连点过**）：
 
 ```powershell
-python tools\kill_dup_napcat.py            # 先看有多少个（不动任何东西）
-python tools\kill_dup_napcat.py --elevate  # 自己请求管理员权限再干（弹一次 UAC，点「是」）
+python tools\kill_dup_napcat.py            # 只看不动
+python tools\kill_dup_napcat.py --elevate  # 只清场，不重启（要自己再点「启动协议端」）
 ```
 
 （也可以在管理员终端里用 `--yes`，或直接到任务管理器结束**所有**
-`NapCatWinBootMain.exe` 与 `QQ.exe`。顺序无所谓于结果，但脚本会**先杀注入器再杀 QQ** ——
+`NapCatWinBootMain.exe` 与 `QQ.exe` —— 但顺序要紧：脚本会**先杀注入器再杀 QQ**，
 反过来的话注入器还活着会把 QQ 重新拉起来。）
-
-清空后只启动**一次**、只扫**一次**码。
-本项目从不发消息，重新扫码登录只是重建接收通道，代价约一分钟。
 
 > 正常状态下 `QQ.exe` 本来就有 **3~4 个**（1 主进程 + 渲染/GPU 等辅助进程），
 > 只有 `NapCatWinBootMain.exe` 的个数才有诊断意义（0 = 没启动过 / 1 = 正常 / ≥2 = 连点过）。
-> 顺带说一句：`<NapCat 目录>\logs\` 原本一直是空的 —— NapCat 4.x **默认不落盘**。
-> 现在 `config\napcat.json` 里已把 `fileLog` 打开（级别 `info`），协议端自己的日志才查得到。
+> ⚠️ **<NapCat 目录>\logs\ 空着是常态**，不是故障：NapCat 4.x 默认不落盘，
+> 而且 `fileLog` 是**账号级**配置 —— 只改 `config\napcat.json` 不算数，
+> 每个账号的 `config\napcat_<uin>.json` 里还有一份，**优先级更高**，两份都要改，
+> 且**改完必须重启协议端**才生效。
 
 ### NapCat 窗口一闪而过
 
