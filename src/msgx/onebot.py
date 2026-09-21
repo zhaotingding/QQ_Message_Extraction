@@ -114,6 +114,14 @@ async def _alerts(request: web.Request) -> web.Response:
 
 
 async def _summary_now(request: web.Request) -> web.Response:
+    try:
+        return await _summary_request(request)
+    except Exception as exc:
+        log.warning("摘要请求失败: %s", exc)
+        return web.json_response({"ok": False, "error": str(exc)}, status=502)
+
+
+async def _summary_request(request: web.Request) -> web.Response:
     pipe = request.app["pipe"]
     kind = request.query.get("kind", "digest")
     if kind == "daily":
@@ -158,6 +166,14 @@ async def _billing(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, **data})
 
 
+async def _usage_details(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, **request.app["pipe"].store.api_usage_details()})
+
+
+async def _usage_sources(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, **request.app["pipe"].store.api_call_sources(int(request.match_info["call_id"]))})
+
+
 async def _groups_refresh(request: web.Request) -> web.Response:
     """通过协议端拉取真实群名并写库。协议端不在线时返回 502，由界面回退本地库。
 
@@ -186,6 +202,8 @@ def build_app(cfg: dict, pipeline) -> web.Application:
     app.router.add_get("/alerts", _alerts)
     app.router.add_get("/messages/recent", _messages_recent)
     app.router.add_get("/billing", _billing)
+    app.router.add_get("/usage/details", _usage_details)
+    app.router.add_get(r"/usage/calls/{call_id:\d+}", _usage_sources)
     app.router.add_post("/summary/now", _summary_now)
     app.router.add_post("/groups/refresh", _groups_refresh)
     return app

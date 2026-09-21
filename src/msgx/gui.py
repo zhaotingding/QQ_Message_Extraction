@@ -22,6 +22,7 @@ import threading
 import time
 import tkinter as tk
 import urllib.request
+import urllib.error
 from pathlib import Path
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -79,6 +80,11 @@ class App:
         # 实时消息页：拉取是否在进行中（避免慢响应时叠请求）、上次用的条数
         self._rt_busy = False
         self._rt_limit = 80
+        self._summary_busy = False
+        self._summary_started = 0.0
+        self._summary_path = ""
+        self._usage_busy = False
+        self._usage_items = {}
         # 登录二维码弹窗。Tkinter 只能在主线程碰控件，所以监视线程只把路径
         # 丢进 events 队列，由 _drain 在主线程里弹窗。
         self.qr_win: tk.Toplevel | None = None
@@ -152,6 +158,8 @@ class App:
         # 想确认「到底收进来了没有、内容对不对」时，不用再去翻 data/msgx.db。
         self._build_realtime_tab(nb)
         self._build_settings_tab(nb)
+        self._build_usage_tab(nb)
+        self._build_report_tab(nb)
 
         self.status = tk.StringVar(value="就绪")
         ttk.Label(outer, textvariable=self.status, foreground="#245cc4").pack(
@@ -170,7 +178,6 @@ class App:
         self.v_service = tk.StringVar(value="未运行")
         self.v_peer = tk.StringVar(value="—")
         self.v_stored = tk.StringVar(value="—")
-        self.v_vision = tk.StringVar(value="—")
         self.v_cost = tk.StringVar(value="—")
         self.v_total = tk.StringVar(value="—")
         self.v_balance = tk.StringVar(value="—")
@@ -180,7 +187,7 @@ class App:
         # 所以这两个必须是同一行的左右邻居，而不是上下两行。
         rows = [
             [("服务进程", self.v_service), ("协议端(NapCat)", self.v_peer)],
-            [("已入库消息", self.v_stored), ("图片语义失败", self.v_vision)],
+            [("已入库消息", self.v_stored)],
             [("今日花费", self.v_cost), ("累计花费", self.v_total)],
             [("账户余额", self.v_balance), ("模型状态", self.v_llm)],
         ]
@@ -225,9 +232,8 @@ class App:
         self.cb_range.pack(side="left")
         self.v_range_desc = tk.StringVar(value=self._range_desc(DIGEST_RANGES[0][0]))
         self.cb_range.bind("<<ComboboxSelected>>", lambda _e: self._on_range_change())
-        ttk.Button(buttons, text="生成", command=self.summary_by_range, width=6).pack(
-            side="left", padx=6
-        )
+        self.btn_summary_range = ttk.Button(buttons, text="生成", command=self.summary_by_range, width=6)
+        self.btn_summary_range.pack(side="left", padx=6)
         ttk.Button(buttons, text="打开数据目录", command=self.open_data_dir).pack(side="right")
 
         buttons2 = ttk.Frame(tab)
@@ -246,6 +252,13 @@ class App:
                 buttons2, text="启动协议端(NapCat)", command=self.start_napcat
             ).pack(side="right")
         ttk.Button(buttons2, text="刷新账单", command=self.refresh_billing).pack(side="right", padx=8)
+
+        progress = ttk.Frame(tab)
+        progress.pack(fill="x", pady=(6, 0))
+        self.summary_bar = ttk.Progressbar(progress, mode="indeterminate", length=110)
+        self.summary_bar.pack(side="left")
+        self.v_summary = tk.StringVar(value="摘要待生成，目标约 3000 字")
+        ttk.Label(progress, textvariable=self.v_summary, wraplength=740).pack(side="left", padx=8)
 
         # ---- 日志区（v0.5.5：服务日志 / 协议端日志在这里切换，不再弹独立窗口）----
         # 用户的原话：「我希望这个 UI 界面就是所有的程序载体，什么功能都能在上面，
@@ -284,7 +297,7 @@ class App:
     def _range_desc(label: str) -> str:
         for text, hours, chars in DIGEST_RANGES:
             if text == label:
-                return f"目标约 {chars} 字（窗口越长允许写越长），数据源为最近 {hours // 24} 天"
+                return f"模型总结目标约 {chars} 字，完整保留生成结果；数据源为最近 {hours // 24} 天"
         return ""
 
     @staticmethod
@@ -857,6 +870,143 @@ class App:
         if protected:
             self._log_ui(f"[界面] 保留（有消息，未删）：{', '.join(protected)}\n")
 
+    # ---------------- 消费明细与摘要全文（v0.6.0） ----------------
+
+    def _build_usage_tab(self, nb: ttk.Notebook) -> None:
+        tab = ttk.Frame(nb, padding=12)
+        nb.add(tab, text="消费明细")
+        self.usage_tab = tab
+        ttk.Button(tab, text="刷新消费明细", command=self.refresh_usage).pack(anchor="w")
+        self.v_usage = tk.StringVar(value="升级后开始逐次记录；Token 来自 API，金额按配置费率估算。")
+        ttk.Label(tab, textvariable=self.v_usage, wraplength=880).pack(fill="x", pady=6)
+        self.usage_groups = ttk.Treeview(tab, columns=("purpose", "type", "calls", "input", "output", "cost"),
+                                        show="headings", height=6)
+        for key, label, width in (("purpose", "用途", 150), ("type", "消息类型", 120), ("calls", "请求数", 70),
+                                  ("input", "输入 Token", 100), ("output", "输出 Token", 100), ("cost", "金额（元）", 110)):
+            self.usage_groups.heading(key, text=label)
+            self.usage_groups.column(key, width=width, stretch=True)
+        self.usage_groups.pack(fill="x", pady=(0, 10))
+        ttk.Label(tab, text="最近 500 次请求（上方分类汇总覆盖全部明细）；选中一行查看关联消息").pack(anchor="w")
+        frame = ttk.Frame(tab)
+        frame.pack(fill="both", expand=True)
+        columns = ("time", "purpose", "source", "input", "output", "cache", "cost", "state")
+        self.usage_table = ttk.Treeview(frame, columns=columns, show="headings", height=9)
+        for key, label, width in zip(columns, ("时间", "用途", "消息/任务", "输入", "输出", "缓存命中", "元（估算）", "结果"),
+                                   (125, 100, 115, 70, 70, 75, 95, 130)):
+            self.usage_table.heading(key, text=label)
+            self.usage_table.column(key, width=width, stretch=True)
+        scroll = ttk.Scrollbar(frame, command=self.usage_table.yview)
+        self.usage_table.configure(yscrollcommand=scroll.set)
+        self.usage_table.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.usage_table.bind("<<TreeviewSelect>>", self._usage_selected)
+        self.usage_detail = ScrolledText(tab, height=8, wrap="word", font=(FONT, 10), state="disabled")
+        self.usage_detail.pack(fill="both", pady=(8, 0))
+        nb.bind("<<NotebookTabChanged>>", lambda _e: self.refresh_usage() if nb.select() == str(tab) else None, add="+")
+
+    def refresh_usage(self) -> None:
+        if self._usage_busy:
+            return
+        if self.proc is None:
+            self.v_usage.set("请启动服务后刷新；旧版每日合计无法还原到具体消息。")
+            return
+        self._usage_busy = True
+        port = int(self.cfg["onebot"]["http_port"])
+        def work() -> None:
+            try:
+                op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with op.open(f"http://127.0.0.1:{port}/usage/details", timeout=10) as response:
+                    self.events.put(("usage", json.loads(response.read().decode("utf-8"))))
+            except Exception as exc:
+                self.events.put(("usage", {"error": str(exc)}))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_usage(self, data: dict) -> None:
+        self._usage_busy = False
+        if data.get("error"):
+            self.v_usage.set(f"消费明细读取失败：{data['error']}")
+            return
+        self.v_usage.set(f"已归因 ¥{data.get('recorded_cost_cny', 0):.6f}；历史未归因 ¥{data.get('historical_unattributed_cny', 0):.6f}。"
+                         "Token 为 API 返回值，金额按配置费率估算；无返回用量的失败显示未知。")
+        self.usage_groups.delete(*self.usage_groups.get_children())
+        for row in data.get("groups", []):
+            self.usage_groups.insert("", "end", values=(row["purpose"], row["source_type"], row["calls"],
+                row["in_tokens"] or 0, row["out_tokens"] or 0,
+                f"{row['cost_cny']:.6f}" + (f" + {row['unknown_calls']} 次未知" if row["unknown_calls"] else "")))
+        self.usage_table.delete(*self.usage_table.get_children())
+        self._usage_items = {str(r["id"]): r for r in data.get("items", [])}
+        for iid, row in self._usage_items.items():
+            self.usage_table.insert("", "end", iid=iid, values=(time.strftime("%m-%d %H:%M:%S", time.localtime(row["ts"])),
+                row["purpose"], row["source_label"], *[row[k] if row[k] is not None else "未知" for k in ("in_tokens", "out_tokens", "cache_hit_tokens")],
+                f"{row['cost_cny']:.6f}" if row["cost_cny"] is not None else "未知", row["status"]))
+
+    def _usage_selected(self, _event=None) -> None:
+        selection = self.usage_table.selection()
+        if not selection:
+            return
+        iid = selection[0]
+        row = self._usage_items[iid]
+        self.usage_detail.configure(state="normal")
+        self.usage_detail.delete("1.0", "end")
+        self.usage_detail.insert("end", f"{row['purpose']} · {row['source_type']} · 模型 {row['model']}\n正在读取关联消息…")
+        self.usage_detail.configure(state="disabled")
+        port = int(self.cfg["onebot"]["http_port"])
+        def work() -> None:
+            try:
+                op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with op.open(f"http://127.0.0.1:{port}/usage/calls/{iid}", timeout=10) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                text = f"共关联 {data['total']} 条消息，最多显示前 100 条；已清理的原消息无法展示。\n"
+                text += "\n\n".join(f"群 {r['group_id']} · {r['sender_name']} · 消息 {r['msg_id']}（#{r['id']}）\n{r['text']}" for r in data["items"])
+            except Exception as exc:
+                text = f"关联消息读取失败：{exc}"
+            self.events.put(("usage_sources", (iid, text)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _build_report_tab(self, nb: ttk.Notebook) -> None:
+        self.report_tab = ttk.Frame(nb, padding=12)
+        nb.add(self.report_tab, text="摘要全文")
+        self.v_report_path = tk.StringVar(value="生成完成后在这里展示全文及完整文件路径。")
+        ttk.Label(self.report_tab, textvariable=self.v_report_path, wraplength=880).pack(fill="x")
+        self.btn_open_report = ttk.Button(self.report_tab, text="打开完整 HTML 文件", state="disabled",
+                                         command=lambda: open_path(Path(self._summary_path)))
+        self.btn_open_report.pack(anchor="w", pady=6)
+        self.report_text = ScrolledText(self.report_tab, wrap="word", font=(FONT, 11), state="disabled")
+        self.report_text.tag_configure("title", font=(FONT, 17, "bold"), spacing3=16)
+        self.report_text.tag_configure("heading", font=(FONT, 12, "bold"), spacing1=10, spacing3=6)
+        self.report_text.pack(fill="both", expand=True)
+
+    def _summary_finished(self, data: dict) -> None:
+        self._summary_busy = False
+        self.summary_bar.stop()
+        self.btn_summary.configure(state="normal")
+        self.btn_summary_range.configure(state="normal")
+        if data.get("error"):
+            note = f"摘要生成失败：{data['error']}"
+        elif not data.get("created"):
+            note = "本时间范围没有可总结的新消息"
+        else:
+            item = data["created"][0]
+            self._summary_path = str(Path(item["path"]).resolve())
+            self.v_report_path.set(self._summary_path)
+            self.btn_open_report.configure(state="normal")
+            self.report_text.configure(state="normal")
+            self.report_text.delete("1.0", "end")
+            for line in item.get("content", "").splitlines():
+                if line.startswith("# "):
+                    self.report_text.insert("end", line[2:] + "\n", "title")
+                else:
+                    for part in re.split(r"(\*\*.+?\*\*)", line):
+                        self.report_text.insert("end", part[2:-2] if part.startswith("**") else part,
+                                                "heading" if part.startswith("**") else "")
+                    self.report_text.insert("end", "\n")
+            self.report_text.configure(state="disabled")
+            self.nb.select(self.report_tab)
+            note = f"摘要已生成（{item.get('chars', 0)} 字），完整文件：{self._summary_path}"
+        self.v_summary.set(note)
+        self._log_ui(f"[界面] {note}\n")
+        self.status.set(note)
+
     # ---------------- 服务进程 ----------------
 
     def start_service(self) -> None:
@@ -924,50 +1074,46 @@ class App:
             self.events.put(("exit", proc.wait()))
 
     def summary_now(self, kind: str = "digest", hours: int | None = None) -> None:
+        if self._summary_busy:
+            return
         if self.proc is None:
             messagebox.showinfo("服务未运行", "请先启动服务，再生成摘要。", parent=self.root)
             return
+        self._summary_busy = True
+        self._summary_started = time.time()
+        self.btn_summary.configure(state="disabled")
+        self.btn_summary_range.configure(state="disabled")
+        self.summary_bar.start(12)
+        target = f"最近 {hours // 24} 天" if kind == "range" and hours else "增量"
+        note = f"开始生成{target}摘要，目标约 3000 字；正在读取消息并调用 DeepSeek…"
+        self.v_summary.set(note)
+        self.status.set(note)
+        self._log_ui(f"[界面] {note}\n")
         port = int(self.cfg["onebot"]["http_port"])
-        if kind == "range":
-            label = f"近 {hours} 小时" if hours and hours < 24 else f"近 {(hours or 24) // 24} 天"
-            target = f"按范围重做（{label}）"
-        else:
-            label = "增量"
-            target = "最新摘要"
-        self.status.set(f"正在请求生成{target}…")
 
         def work() -> None:
             try:
-                # digest：接着上次已总结过的消息继续（默认）；range：把最近 hours
-                # 小时的消息重做一份，目标字数由服务侧按窗口长度取 600~1500。
-                # 两条路径都不受「每组 ≥8 条」的增量门槛限制，避免点按钮却回 0 份。
                 url = f"http://127.0.0.1:{port}/summary/now?kind={kind}"
                 if kind == "range" and hours:
                     url += f"&hours={int(hours)}"
                 req = urllib.request.Request(url, data=b"", method="POST")
                 op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                with op.open(req, timeout=600) as r:
-                    body = json.loads(r.read().decode("utf-8"))
-                items = body.get("created") or []
-                if items:
-                    it = items[0]
-                    chars = it.get("chars")
-                    extra = (
-                        f"（{chars} 字，目标 {it.get('target_chars')} 字，{it['count']} 条消息）"
-                        if chars else ""
-                    )
-                    self.events.put(("note", f"{target}已生成{extra}，详见 data/reports/"))
-                else:
-                    self.events.put(
-                        ("note", f"{label}窗口内没有可总结的消息（或自上次以来没有新消息）")
-                    )
-            except Exception as exc:  # noqa: BLE001
-                self.events.put(("note", f"摘要请求失败：{exc}"))
+                with op.open(req, timeout=1800) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                self.events.put(("summary_done", body))
+            except urllib.error.HTTPError as exc:
+                try:
+                    detail = json.loads(exc.read().decode("utf-8")).get("error") or str(exc)
+                except (ValueError, UnicodeError):
+                    detail = str(exc)
+                self.events.put(("summary_done", {"error": detail}))
+            except Exception as exc:
+                self.events.put(("summary_done", {"error": str(exc)}))
 
         threading.Thread(target=work, daemon=True).start()
 
     def summary_by_range(self) -> None:
-        """按选定的时间范围重做摘要。窗口越长，服务侧允许的目标字数越高。"""
+        """按选定时间范围重做约 3000 字的完整摘要。"""
         label = self.v_range.get()
         hours = DIGEST_RANGES[0][1]
         for text, h, _c in DIGEST_RANGES:
@@ -994,7 +1140,7 @@ class App:
         if m == "failed":
             return "下载失败"
         if v == "failed":
-            return "语义失败"
+            return "图片未识别"
         if v == "skipped":
             return "仅 OCR"
         return "完成"
@@ -1054,7 +1200,7 @@ class App:
                 tags.append("odd")
             if r.get("at_me"):
                 tags.append("atme")
-            if state == "语义失败":
+            if state == "图片未识别":
                 tags.append("failed")
             self.rt.insert(
                 "",
@@ -1474,7 +1620,6 @@ class App:
         elif self.proc is None:
             self.v_peer.set("—")
             self.v_stored.set("—")
-            self.v_vision.set("—")
             self.v_cost.set("—")
             self.v_total.set("—")
             self.v_balance.set("—")
@@ -1557,6 +1702,17 @@ class App:
             self.status.set("账单已刷新")
         elif kind == "messages":
             self._render_messages(value)
+        elif kind == "summary_done":
+            self._summary_finished(value)
+        elif kind == "usage":
+            self._render_usage(value)
+        elif kind == "usage_sources":
+            iid, text = value
+            if self.usage_table.selection() == (iid,):
+                self.usage_detail.configure(state="normal")
+                self.usage_detail.delete("2.0", "end")
+                self.usage_detail.insert("end", "\n" + text)
+                self.usage_detail.configure(state="disabled")
         elif kind == "qrcode":
             gen, path = value
             if gen == self.qr_gen and self.qr_watching and not self.closing:
@@ -1601,14 +1757,10 @@ class App:
             f"（本次运行新收 {c.get('received', 0)}，"
             f"其中已过滤 {c.get('filtered', 0)}）"
         )
-        n_fail = int(s.get("vision_failed", 0) or 0)
-        n_retry = int(s.get("vision_retry", 0) or 0)
-        if not n_fail:
-            self.v_vision.set("0 张")
-        elif n_retry:
-            self.v_vision.set(f"{n_fail} 张（{n_retry} 张会自动补跑，最多 3 次）")
-        else:
-            self.v_vision.set(f"{n_fail} 张（已试满 3 次，不再重试）")
+        progress = data.get("summary_progress") or {}
+        if self._summary_busy and progress.get("state") == "running":
+            elapsed = int(time.time() - self._summary_started)
+            self.v_summary.set(f"{progress.get('message', '正在生成')} · 已用 {elapsed} 秒")
 
         # 账单：优先用服务抓到的真实数据；没抓到就退回本地估算，并标明是估算。
         budget = float(data.get("budget_cny") or 0)

@@ -132,7 +132,7 @@ labels = {
     app._media_label({"media_state": "none"}): "—",
     app._media_label({"media_state": "pending"}): "待处理",
     app._media_label({"media_state": "failed"}): "下载失败",
-    app._media_label({"media_state": "done", "vision_state": "failed"}): "语义失败",
+    app._media_label({"media_state": "done", "vision_state": "failed"}): "图片未识别",
     app._media_label({"media_state": "done", "vision_state": "skipped"}): "仅 OCR",
     app._media_label({"media_state": "done", "vision_state": "ok"}): "完成",
 }
@@ -158,7 +158,7 @@ check("入库数显示", "33" in app.v_stored.get(), app.v_stored.get())
 check("过滤数显示", "2" in app.v_stored.get(), app.v_stored.get())
 check("花费显示（无账单快照时标明是估算）", "估算" in app.v_cost.get(), app.v_cost.get())
 check("模型状态显示", "支持图片" in app.v_llm.get(), app.v_llm.get())
-check("语义失败数显示", "4" in app.v_vision.get(), app.v_vision.get())
+check("运行状态不再展示图片语义失败计数", not hasattr(app, "v_vision"))
 
 print("\n=== 账单显示（平台真实数据 vs 本地估算）===")
 app._apply_health({
@@ -713,6 +713,49 @@ check("普通无图消息仍显示横线", App._media_label({"media_state": "non
 _trace = (PROJ / "data" / "logs" / "gui.log").read_text(encoding="utf-8")
 check("持久日志包含版本与进程", "启动 version=" in _trace and f"pid={os.getpid()}" in _trace)
 check("持久日志能定位检测与展示环节", "检测到二维码" in _trace and "已弹出扫码窗口" in _trace)
+
+print("\n=== 生成进度、完整摘要与消费明细（v0.6.0）===")
+check("消费明细紧邻设置，全文有独立页", [app.nb.tab(t, "text") for t in app.nb.tabs()] ==
+      ["运行状态", "实时消息", "设置", "消费明细", "摘要全文"])
+_saved_proc = app.proc
+app.proc = object()  # 仅模拟已启动；拦截线程，禁止真实请求。
+with patch("msgx.gui.threading.Thread") as _thread:
+    app.summary_now("range", 72)
+    app.summary_now("range", 72)
+    check("点击立即标记忙碌并阻止重复请求", app._summary_busy and _thread.call_count == 1)
+    check("生成期间两个入口禁用", app.btn_summary.instate(["disabled"]) and app.btn_summary_range.instate(["disabled"]))
+    check("无需等 API 即可看到开始日志", "开始生成最近 3 天摘要" in app.log.get("1.0", "end"))
+    app._apply_health({"summary_progress": {"state": "running", "message": "正在总结第 2/6 块"}})
+    check("阶段进度和耗时可见", "第 2/6 块" in app.v_summary.get() and "秒" in app.v_summary.get())
+    app._summary_finished({"error": "模型输出未完成"})
+    check("失败恢复按钮并明确原因", not app._summary_busy and app.btn_summary.instate(["!disabled"])
+          and app.btn_summary_range.instate(["!disabled"]) and "输出未完成" in app.v_summary.get())
+    _full_text = "# 本期讨论总览\n\n**工具进展**\n\n" + "完整保留的内容。" * 400 + "\n\n**后续事项**\n\n全文最后一句。"
+    _report_path = str((PROJ / "data" / "reports" / "gui-test-full.html").resolve())
+    app._summary_finished({"created": [{"path": _report_path, "content": _full_text, "chars": len(_full_text)}]})
+    check("生成后自动展示全文及末尾内容", app.nb.select() == str(app.report_tab)
+          and "全文最后一句。" in app.report_text.get("1.0", "end") and len(app.report_text.get("1.0", "end")) > 3000)
+    check("总标题和主题小标题使用加粗样式", bool(app.report_text.tag_ranges("title")) and bool(app.report_text.tag_ranges("heading")))
+    check("完整文件路径显示在页面和日志中", app.v_report_path.get() == _report_path
+          and _report_path in app.log.get("1.0", "end") and app.btn_open_report.instate(["!disabled"]))
+    app._render_usage({"recorded_cost_cny": 0.001, "historical_unattributed_cny": 0.25,
+        "groups": [{"purpose": "图片理解", "source_type": "纯图片", "calls": 2,
+                    "in_tokens": 100, "out_tokens": 20, "cost_cny": 0.001, "unknown_calls": 1}],
+        "items": [{"id": 7, "ts": time.time(), "purpose": "图片理解", "source_type": "纯图片",
+                   "source_label": "消息 #11", "model": "test-model", "in_tokens": None, "out_tokens": None,
+                   "cache_hit_tokens": None, "cost_cny": None, "status": "失败，用量未知"}]})
+    check("未知费用不显示为零", app.usage_table.item("7", "values")[3:7] == ("未知", "未知", "未知", "未知"))
+    check("按用途和消息类型汇总且明确估算与历史费用", "纯图片" in app.usage_groups.item(app.usage_groups.get_children()[0], "values")
+          and "估算" in app.v_usage.get() and "0.250000" in app.v_usage.get())
+    app.usage_table.selection_set("7")
+    app._usage_selected()
+    app._dispatch_event("usage_sources", ("7", "消息原文已经读取"))
+    check("来源加载完成后移除等待提示", "消息原文已经读取" in app.usage_detail.get("1.0", "end")
+          and "正在读取" not in app.usage_detail.get("1.0", "end"))
+    app._dispatch_event("usage_sources", ("8", "旧选择的过期响应"))
+    check("切换记录后不混入过期来源响应", "过期响应" not in app.usage_detail.get("1.0", "end"))
+    app.usage_table.selection_remove("7")
+app.proc = _saved_proc
 
 root.update()
 root.destroy()

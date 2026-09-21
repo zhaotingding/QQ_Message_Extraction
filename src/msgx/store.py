@@ -86,6 +86,21 @@ CREATE TABLE IF NOT EXISTS balance_readings (
   day      TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_balance_day ON balance_readings(day, ts);
+
+-- v0.6.0：逐次请求账本；旧版只有每日合计，不能伪造历史消息归因。
+CREATE TABLE IF NOT EXISTS api_calls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL,
+  purpose TEXT NOT NULL,
+  source_ids TEXT NOT NULL DEFAULT '[]',
+  source_type TEXT NOT NULL,
+  model TEXT NOT NULL,
+  in_tokens INTEGER,
+  out_tokens INTEGER,
+  cache_hit_tokens INTEGER,
+  cost_cny REAL,
+  status TEXT NOT NULL
+);
 """
 
 # v0.4.2：计费口径改为 DeepSeek 官方的「峰谷 + 缓存命中」三档计价，金额单位由
@@ -506,6 +521,52 @@ class Store:
         return list(self.conn.execute("SELECT * FROM alerts ORDER BY created_at DESC LIMIT ?", (limit,)))
 
     # ---------- usage ----------
+
+    def record_api_call(self, *, ts: float, purpose: str, source_ids: list[int], model: str,
+                        usage: dict | None, cost_cny: float | None, status: str) -> None:
+        ids = list(dict.fromkeys(source_ids))
+        source_type = ("汇总报告" if purpose in ("日报合并", "摘要合并", "摘要成稿") else "系统检查") if not ids else "多条消息汇总"
+        if len(ids) == 1:
+            row = self.get_message(ids[0])
+            source_type = {"text": "文字消息", "image": "纯图片", "mixed": "图文/附件"}.get(
+                row["msg_type"] if row else "", "原消息已清理")
+        incoming = int(usage.get("prompt_tokens", 0)) if usage is not None else None
+        outgoing = int(usage.get("completion_tokens", 0)) if usage is not None else None
+        hit = int(usage.get("prompt_cache_hit_tokens", 0)) if usage is not None else None
+        self.conn.execute(
+            "INSERT INTO api_calls(ts,purpose,source_ids,source_type,model,in_tokens,out_tokens,cache_hit_tokens,cost_cny,status)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (ts, purpose, json.dumps(ids), source_type, model, incoming, outgoing, hit, cost_cny, status),
+        )
+        if usage is not None:
+            self.add_usage(time.strftime("%Y-%m-%d", time.localtime(ts)), incoming, outgoing,
+                           cost_cny, hit, max(0, incoming - hit))
+        else:
+            self.conn.commit()  # 无返回用量时保留未知值，不把失败伪装成免费
+
+    def api_usage_details(self, limit: int = 500) -> dict:
+        items = [dict(r) for r in self.conn.execute("SELECT * FROM api_calls ORDER BY id DESC LIMIT ?", (limit,))]
+        for item in items:
+            ids = json.loads(item["source_ids"])
+            item["source_count"] = len(ids)
+            item["source_label"] = f"消息 #{ids[0]}" if len(ids) == 1 else f"{len(ids)} 条消息" if ids else item["source_type"]
+        grouped = [dict(r) for r in self.conn.execute(
+            "SELECT purpose,source_type,COUNT(*) AS calls,SUM(in_tokens) AS in_tokens,"
+            " SUM(out_tokens) AS out_tokens,COALESCE(SUM(cost_cny),0) AS cost_cny,"
+            " SUM(cost_cny IS NULL) AS unknown_calls FROM api_calls GROUP BY purpose,source_type ORDER BY cost_cny DESC")]
+        known = sum(r["cost_cny"] for r in grouped)
+        return {"items": items, "groups": grouped, "recorded_cost_cny": known,
+                "historical_unattributed_cny": max(0.0, self.cost_totals()["cost_cny"] - known)}
+
+    def api_call_sources(self, call_id: int) -> dict:
+        row = self.conn.execute("SELECT source_ids FROM api_calls WHERE id=?", (call_id,)).fetchone()
+        ids = json.loads(row[0]) if row else []
+        items = []
+        for rid in ids[:100]:
+            msg = self.get_message(rid)
+            if msg:
+                items.append({key: msg[key] for key in ("id", "msg_id", "group_id", "sender_name", "text")})
+        return {"items": items, "total": len(ids), "shown_limit": 100}
 
     def add_usage(
         self,

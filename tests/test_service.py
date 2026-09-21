@@ -139,6 +139,11 @@ def main() -> int:
           st == 200 and body.get("ok") is True, f"{st} {str(body)[:90]}")
     check("/messages/recent 返回 items 列表", isinstance(body.get("items"), list),
           str(body.get("items")))
+    st, detail = call("/usage/details")
+    check("消费明细接口可达且新库无虚构记录", st == 200 and detail.get("items") == [] and detail.get("groups") == [])
+    st, sources = call("/usage/calls/99999")
+    check("不存在的请求来源返回空列表", st == 200 and sources.get("items") == [])
+    check("健康接口包含摘要进度", (health.get("summary_progress") or {}).get("state") == "idle")
     check("/health 带 billing 字段（界面据此显示真实账单）", "billing" in health,
           str(sorted(health))[:120])
 

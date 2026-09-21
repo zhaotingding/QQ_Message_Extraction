@@ -115,7 +115,7 @@ async def cmd_summary(cfg: dict, kind: str, hours: int = 24) -> None:
             path = await pipe.summarizer.run_daily()
             print(f"日报已生成: {path}" if path else "没有可汇总的内容")
         elif kind == "full":
-            # full = 按时间范围重做。目标字数由窗口长度决定（见 summarize.DIGEST_RANGES）
+            # full = 按时间范围重做，各范围统一以约 3000 字为目标。
             item = await pipe.summarizer.run_digest(full=True, hours=hours)
             label = f"近 {hours} 小时" if hours < 24 else f"近 {hours // 24} 天"
             if item:

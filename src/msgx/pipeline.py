@@ -772,6 +772,7 @@ class Pipeline:
             "watch_groups": sorted(self.watch) or "全部",
             "ws_peers": sorted(self.ws_peers),
             "ws_connected_at": self.ws_connected_at,
+            "summary_progress": self.summarizer.progress,
             # ⚠️ ws_peers 是「对端 IP 的**集合**」：多份 NapCat 全从 127.0.0.1 连进来时
             # 会被去重成 1 个 —— 7 份实例看起来和 1 份完全一样，这正是 2026-09-21
             # 「消息冻结」排查中最费时间的一处盲点。真正该看的是**连接条数**：

@@ -20,6 +20,7 @@ SUITES = [
     ("过滤规则", "test_filters.py"),
     ("跨群热点", "test_hotspot.py"),
     ("计费口径", "test_cost.py"),
+    ("逐请求消费明细", "test_usage.py"),
     ("LLM 调用层", "test_llm.py"),
     ("纪要长度", "test_digest.py"),
     ("媒体校验", "test_media.py"),

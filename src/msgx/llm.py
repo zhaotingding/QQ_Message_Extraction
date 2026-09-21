@@ -175,6 +175,32 @@ class LLM:
 
     # ---------- core call ----------
 
+    async def _accounted_post(self, payload: dict, purpose: str, source_ids: list[int] | None) -> dict:
+        """v0.6.0：每个有返回的请求立即落账，后续重试失败也不会丢掉前次费用。"""
+        started = time.time()
+        try:
+            data = await self._post(payload)
+        except Exception:
+            self.store.record_api_call(ts=started, purpose=purpose, source_ids=source_ids or [],
+                                       model=payload["model"], usage=None, cost_cny=None, status="请求失败，用量未知")
+            raise
+        usage = data.get("usage")
+        if not usage or "prompt_tokens" not in usage or "completion_tokens" not in usage:
+            usage = None
+        cost = None
+        if usage is not None:
+            cost = self.cost_cny(int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)),
+                                 int(usage.get("prompt_cache_hit_tokens", 0)), ts=started)
+        choice = (data.get("choices") or [{}])[0]
+        status = "输出未完成" if choice.get("finish_reason") == "length" else "完成"
+        if usage is None:
+            status += "，用量未知"
+        self.store.record_api_call(ts=started, purpose=purpose, source_ids=source_ids or [],
+                                   model=payload["model"], usage=usage, cost_cny=cost, status=status)
+        log.info("API 请求成功 · %s · 输入 %s / 输出 %s Token", purpose,
+                 (usage or {}).get("prompt_tokens", "未知"), (usage or {}).get("completion_tokens", "未知"))
+        return data
+
     async def chat(
         self,
         system: str,
@@ -184,6 +210,9 @@ class LLM:
         max_tokens: int = 1500,
         temperature: float = 0.2,
         think: bool = True,
+        purpose: str = "其他文本请求",
+        source_ids: list[int] | None = None,
+        require_complete: bool = False,
     ) -> str:
         if not self.available:
             raise RuntimeError("LLM 未配置 api_key")
@@ -220,12 +249,7 @@ class LLM:
             budget = max(budget, int(self.llm.get("think_min_tokens", THINK_MIN_TOKENS)))
         payload["max_tokens"] = budget
 
-        started = time.time()  # 峰谷按调用发生的时刻判定
-        data = await self._post(payload)
-        usage = data.get("usage") or {}
-        in_tok = int(usage.get("prompt_tokens", 0))
-        out_tok = int(usage.get("completion_tokens", 0))
-        hit_tok = int(usage.get("prompt_cache_hit_tokens", 0))
+        data = await self._accounted_post(payload, purpose, source_ids)
 
         # 兜底：若还是被截断且正文为空，放大预算重试一次。
         # 没有这层保护会静默产出空摘要，用户完全察觉不到。
@@ -240,11 +264,7 @@ class LLM:
             )
             budget = bigger
             payload["max_tokens"] = budget
-            data = await self._post(payload)
-            usage = data.get("usage") or {}
-            in_tok += int(usage.get("prompt_tokens", 0))
-            out_tok += int(usage.get("completion_tokens", 0))
-            hit_tok += int(usage.get("prompt_cache_hit_tokens", 0))
+            data = await self._accounted_post(payload, purpose, source_ids)
             choice = (data.get("choices") or [{}])[0]
             if not (choice.get("message") or {}).get("content", "").strip() and choice.get(
                 "finish_reason"
@@ -256,10 +276,8 @@ class LLM:
                     budget,
                 )
 
-        cost = self.cost_cny(in_tok, out_tok, hit_tok, ts=started)
-        self.store.add_usage(
-            date.today().isoformat(), in_tok, out_tok, cost, hit_tok, max(0, in_tok - hit_tok)
-        )
+        if require_complete and choice.get("finish_reason") == "length":
+            raise RuntimeError("模型输出未完成，请重新生成；本次不保存残缺摘要")
         try:
             # **返回前 strip()**。理由：上面判定「空正文」时用的就是 strip()，
             # 如果这里把 "   " 原样返回，就等于「判定它为空、却交给调用方一个非空串」，
@@ -413,7 +431,7 @@ class LLM:
             ok = False
             detail = ""
             try:
-                data = await self._post(payload)
+                data = await self._accounted_post(payload, "图片能力检测", None)
                 content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
                 ok = "7301" in content
                 detail = content.strip()[:120]
@@ -463,7 +481,8 @@ class LLM:
         mime = {"jpg": "jpeg", "png": "png", "gif": "gif", "webp": "webp"}.get(suffix, "jpeg")
         return path.read_bytes(), f"image/{mime}"
 
-    async def describe_image(self, path: str | Path, prompt: str) -> tuple[str, bool]:
+    async def describe_image(self, path: str | Path, prompt: str, *, source_ids: list[int] | None = None,
+                             purpose: str = "图片理解") -> tuple[str, bool]:
         """让模型读图，返回 ``(文本, 是否成功)``。
 
         失败**不抛异常**（图片语义是增强项，不该拖垮媒体流水线），但必须把失败
@@ -498,21 +517,8 @@ class LLM:
             "stream": False,
             "reasoning_effort": "none",
         }
-        started = time.time()
         try:
-            resp = await self._post(payload)
-            usage = resp.get("usage") or {}
-            in_tok = int(usage.get("prompt_tokens", 0))
-            out_tok = int(usage.get("completion_tokens", 0))
-            hit_tok = int(usage.get("prompt_cache_hit_tokens", 0))
-            self.store.add_usage(
-                date.today().isoformat(),
-                in_tok,
-                out_tok,
-                self.cost_cny(in_tok, out_tok, hit_tok, ts=started),
-                hit_tok,
-                max(0, in_tok - hit_tok),
-            )
+            resp = await self._accounted_post(payload, purpose, source_ids)
             text = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
             text = text.strip()
             return text, bool(text)

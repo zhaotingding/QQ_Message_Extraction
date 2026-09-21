@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import asyncio
 import logging
 import re
 import time
@@ -11,23 +12,22 @@ from . import hotspot
 
 log = logging.getLogger("msgx.summarize")
 
-# 纪要目标字数。v0.4.2 定的是 200 字，实测太严 —— 信息会被压到只剩标题级结论。
-# v0.5.0 放宽到 600~1500，并**随窗口长度变化**：看得越远，允许写得越长。
-DIGEST_DEFAULT_CHARS = 800          # 增量纪要（通常几小时窗口）
-DIGEST_MIN_CHARS = 600
-DIGEST_MAX_CHARS = 1500             # 上限，也是本模块里「字数」的唯一来源
+# v0.6.0：这是模型总结的目标篇幅，不是客户端字符串裁剪上限。
+DIGEST_DEFAULT_CHARS = 3000
+DIGEST_MIN_CHARS = 3000
+DIGEST_MAX_CHARS = 3000
 
 # (界面标签, 小时数, 目标字数) —— 界面按这个列表渲染「按范围生成」的选项
 DIGEST_RANGES = (
-    ("最近 1 天", 24, 800),
-    ("最近 3 天", 72, 1100),
-    ("最近 7 天", 168, 1300),
-    ("最近 1 个月", 24 * 30, 1500),
+    ("最近 1 天", 24, 3000),
+    ("最近 3 天", 72, 3000),
+    ("最近 7 天", 168, 3000),
+    ("最近 1 个月", 24 * 30, 3000),
 )
 
 
 def chars_for_hours(hours: int) -> int:
-    """窗口越长允许写越长（用户要的 600~1500 区间）。"""
+    """所有时间范围统一使用约 3000 字的总结目标。"""
     for _label, h, chars in DIGEST_RANGES:
         if hours <= h:
             return chars
@@ -39,14 +39,15 @@ def digest_system(limit: int) -> str:
 他的唯一诉求：不遗漏业界动向。下面是一段时间的群聊记录（带群名、时间、发言人）。
 
 写成按主题分段的纪要，像申论正文：每段都是相对独立的内容块。
-报告页面会提供唯一的总标题，你只输出正文，不重复写总标题。
+第一行用 # 写一个概括全篇内容的总标题，然后按主题组织正文。
 
 铁律：
-1. 总长不超过 {limit} 字。宁可写不足，也不要凑字数。
+1. 总结后的正文目标约 {limit} 字，充分概括重要信息；原文信息不足时不凑字、不编造。
+   必须完整写完各段，不靠省略号或截取原文来达到篇幅要求。
 2. 写「发生了什么、结论是什么」，不写「谁说了什么」。
 3. 按内容归并为若干主题段，通常 3~6 段；只有一个有效主题时允许一段，不凑段数。
-   每段只讲一个主题，以简短主题句开头，再交代事实、进展与结论；段间用空行分隔。
-   不把无关主题塞进同一段，不写碎片化清单，不另起段落小标题。
+   每段只讲一个主题，先写 **加粗的小标题**，再交代事实、进展与结论；段间用空行分隔。
+   不把无关主题塞进同一段，不写碎片化清单。小标题必须具体，不能只有「其他」「总结」。
 4. 只留真正重要的：重要发布/更新、模型或工具行为变化、可复用的资源与结论。
    闲聊、寒暄、表情包、接龙、纯情绪、广告、账号交易一律不写。
    拿不准的内容标注（未证实）。
@@ -59,36 +60,23 @@ MERGE_SYSTEM = """把下面几段同一时间段的群聊纪要合并成一份�
 
 要求：
 1. 去掉重复，只保留最重要的信息。
-2. 同一主题的信息合并，不同主题分段，每段是可独立阅读的内容块，以主题句开头。
+2. 同一主题的信息合并，不同主题分段，每段是可独立阅读的内容块，以 **加粗的小标题** 开头。
    通常保留 3~6 个内容段，段间用空行分隔；不按来源群机械分段，也不写碎片化清单。
-3. 报告页面提供唯一总标题，只输出正文，不另写总标题、小标题、前缀与结尾评价。
+3. 第一行用 # 写唯一的全篇总标题；删去输入各分块的重复总标题，不写前缀与结尾评价。
 """
 
 
 # 中间层：此时还没到最后一步，先别丢信息
 MERGE_MID_RULE = """
-4. 这一轮先不要丢信息：把所有要点都保留下来，可以写到 1200 字左右。
+4. 这一轮先不要丢信息：保留全部重要要点及未证实标注，可以写到 3500 字左右。
 """
 
 
 def merge_final_rule(limit: int) -> str:
     return f"""
-4. 总长不超过 {limit} 字；只留最重要的事实与结论。
+4. 由你总结为约 {limit} 字的完整成稿；覆盖主要主题，不能通过截断结尾缩短篇幅。
 """
 
-
-def compress_system(limit: int) -> str:
-    return f"""把下面的群消息纪要压缩为更精炼的多个主题段。
-
-规则：
-1. **只删不加**：只留最重要的事实与结论，删掉次要细节、举例、重复表述与铺垫。
-2. **把最重要的信息放在最前面**，越往后越次要。
-3. 总长控制在 {limit} 字以内（不到更好）。
-4. 保留主题分段，每段只讲一项相对独立的内容，以简短主题句开头，段间用空行分隔。
-   优先精简每段细节，不得为了省字把不同主题合成一大段。
-   不写清单、小标题、前缀与结尾评价；报告页面提供唯一总标题。
-5. 直接输出压缩后的正文，不要说明你做了什么。
-"""
 
 HOTSPOT_SYSTEM = """你在为一位科研 + 工程双线作战的用户做「跨群热点」归纳。
 下面每个热点都已统计好：出现在几个群、几个不同的人、提到几次，并附有原文片段。
@@ -161,6 +149,7 @@ def md_to_html(md: str) -> str:
         if not line.strip():
             continue
         esc = html.escape(line)
+        esc = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", esc)
         esc = re.sub(r"(https?://[^\s<]+)", r'<a href="\1" target="_blank">\1</a>', esc)
         if line.startswith("### "):
             out.append(f"<h3>{esc[4:]}</h3>")
@@ -223,6 +212,12 @@ class Summarizer:
         self.scfg = cfg["summary"]
         self.report_dir: Path = abs_path(cfg, "report_dir")
         self.report_dir.mkdir(parents=True, exist_ok=True)
+        self._digest_lock = asyncio.Lock()
+        self.progress = {"state": "idle", "message": "", "started_at": 0.0}
+
+    def _progress(self, message: str) -> None:
+        self.progress["message"] = message
+        log.info("摘要生成进度：%s", message)
 
     # ---------- periodic ----------
 
@@ -273,7 +268,8 @@ class Summarizer:
         body = hotspot.format_for_llm(hotspots, self.store.group_names())
         try:
             content = await self.llm.chat(
-                HOTSPOT_SYSTEM, body, max_tokens=2000, temperature=0.2, think=False
+                HOTSPOT_SYSTEM, body, max_tokens=2000, temperature=0.2, think=False,
+                purpose="跨群热点", source_ids=[int(r["id"]) for r in rows], require_complete=True,
             )
         except Exception as e:  # noqa: BLE001
             log.warning("热点归纳调用失败: %s", e)
@@ -313,24 +309,29 @@ class Summarizer:
         chunks = _chunk(rows, budget)
         limit = DIGEST_DEFAULT_CHARS
         parts: list[str] = []
+        part_sources: list[list[int]] = []
         for ch in chunks:
             body = f"（下面是「{group_name or group_id}」这个群的记录）\n\n" + _rows_to_text(ch)
             try:
                 part = await self.llm.chat(
-                    digest_system(limit), body, max_tokens=limit * 2, temperature=0.2, think=False
+                    digest_system(limit), body, max_tokens=9000, temperature=0.2, think=False,
+                    purpose="群摘要分块", source_ids=[int(r["id"]) for r in ch], require_complete=True,
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("分块摘要调用失败: %s", e)
-                break
-            if part.strip() and "无有效信息" not in part[:40]:
+                raise
+            if not (part or "").strip():
+                raise RuntimeError("模型分块摘要为空，请重新生成；本次不保存残缺摘要")
+            if "无有效信息" not in part[:40]:
                 parts.append(part.strip())
+                part_sources.append([int(r["id"]) for r in ch])
 
         if not parts:
             content = "本时段无有效信息。"
         else:
-            content = await self._merge_all(parts, limit)
+            content = await self._merge_all(parts, limit, part_sources)
 
-        content = await self._fit_length(content, limit)
+        content = await self._finalize_digest(content, limit, [int(r["id"]) for r in rows])
 
         title = f"{group_name or group_id} 摘要 {time.strftime('%m-%d %H:%M', time.localtime(start))}~{time.strftime('%H:%M', time.localtime(now))}"
         path = self._write_report(title, content, group_name, start, now, len(rows))
@@ -343,13 +344,26 @@ class Summarizer:
         hours: int = 24,
         target_chars: int | None = None,
     ) -> dict | None:
-        """「群消息纪要」：跨群合并成一份 600~1500 字的精华总结。
+        if self._digest_lock.locked():
+            raise RuntimeError("已有摘要正在生成，请等待完成，避免重复请求")
+        async with self._digest_lock:
+            self.progress = {"state": "running", "message": "正在读取消息", "started_at": time.time()}
+            log.info("开始生成摘要，目标约 %d 字", DIGEST_DEFAULT_CHARS)
+            try:
+                result = await self._run_digest(full, hours, target_chars)
+                self.progress.update(state="done", message="摘要已生成" if result else "没有可总结的新消息")
+                return result
+            except Exception as exc:
+                self.progress.update(state="failed", message=f"摘要生成失败：{exc}")
+                raise
+
+    async def _run_digest(self, full: bool, hours: int, target_chars: int | None) -> dict | None:
+        """跨群合并成约 3000 字的完整总结。
 
         - 增量（默认）：接着**上次已经被总结过的消息**继续，游标是 kind='digest'，
           与热点、各群周期摘要的游标互不干扰，因此不会重复总结同一批消息。
         - 按范围（full=True + hours）：把最近 hours 小时的全部消息总结一遍。
-          窗口越大目标字数越高（见 `chars_for_hours`），这是用户要的「最近 1 天 /
-          3 天 / 7 天 / 1 个月」四种口径。
+          支持「最近 1 天 / 3 天 / 7 天 / 1 个月」四种口径，统一约 3000 字。
 
         两种模式都**不受 min_messages 门槛限制**：用户主动点击就意味着
         「把手上已有的东西总结给我」，否则会出现「明明收了几十条、点按钮却回 0 份」。
@@ -374,28 +388,34 @@ class Summarizer:
 
         names = self.store.group_names()
         chunks = _chunk(rows, int(self.scfg.get("chunk_char_budget", 6000)))
+        source_ids = [int(r["id"]) for r in rows]
         parts: list[str] = []
+        part_sources: list[list[int]] = []
         for i, ch in enumerate(chunks, 1):
+            self._progress(f"正在总结第 {i}/{len(chunks)} 组消息，共 {len(rows)} 条")
             head = f"（第 {i}/{len(chunks)} 段；先各自成稿，最后会合并成一份纪要。）\n\n"
             try:
                 part = await self.llm.chat(
                     digest_system(limit), head + _rows_to_text_multi(ch, names),
-                    max_tokens=limit * 2, temperature=0.2, think=False,
+                    max_tokens=9000, temperature=0.2, think=False,
+                    purpose="纪要分块", source_ids=[int(r["id"]) for r in ch], require_complete=True,
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("纪要分块调用失败: %s", e)
-                break
+                raise  # 不能把漏掉后半批消息的摘要作为全量成稿交付
             part = (part or "").strip()
-            if part and "无有效信息" not in part[:20]:
+            if not part:
+                raise RuntimeError("模型分块摘要为空，请重新生成；本次不保存残缺摘要")
+            if "无有效信息" not in part[:20]:
                 parts.append(part)
+                part_sources.append([int(r["id"]) for r in ch])
         if not parts:
             return None
 
-        content = await self._merge_all(parts, limit)
-
-        if len(content) > limit * 2:
-            log.warning("纪要 %d 字，明显超出 %d 字上限（提示词未压住）", len(content), limit)
-        content = await self._fit_length(content, limit)
+        self._progress("正在合并主题并组织完整纪要")
+        content = await self._merge_all(parts, limit, part_sources)
+        self._progress("正在检查总标题、小标题与篇幅")
+        content = await self._finalize_digest(content, limit, source_ids)
 
         kind_label = "全量纪要" if full else "群消息纪要"
         span = f"近 {hours // 24} 天" if full and hours >= 24 else (
@@ -423,20 +443,23 @@ class Summarizer:
             "group_id": "digest",
             "title": title,
             "path": str(path),
+            "content": content,
             "count": len(rows),
             "chars": len(content),
             "target_chars": limit,
             "hours": hours if full else None,
         }
 
-    async def _merge_all(self, parts: list[str], limit: int = DIGEST_DEFAULT_CHARS) -> str:
-        """分层合并多段纪要，最后一层收口到 ≤limit。
+    async def _merge_all(self, parts: list[str], limit: int = DIGEST_DEFAULT_CHARS,
+                         source_groups: list[list[int]] | None = None, purpose: str = "摘要合并") -> str:
+        """分层合并多段纪要，最后一层请求模型写成约 limit 字。
 
         为什么不分一次合并：一次把 20 段塞给模型、要求压到目标字数，压缩比接近 20:1，
         模型必然做不到（实测只从 440 压到 415）。分层后每步只需压 4:1 左右，
         成稿质量与长度都明显更可控。层数 = ceil(log_4(段数))，代价可忽略。
         """
         level = [p for p in parts if p and p.strip()]
+        sources = source_groups or [[] for _ in level]
         if not level:
             return ""
         if len(level) == 1:
@@ -446,8 +469,11 @@ class Summarizer:
         while True:
             last_round = len(level) <= GROUP
             nxt: list[str] = []
+            next_sources: list[list[int]] = []
             for i in range(0, len(level), GROUP):
                 batch = level[i : i + GROUP]
+                batch_ids = list(dict.fromkeys(rid for group in sources[i:i + GROUP] for rid in group))
+                next_sources.append(batch_ids)
                 if len(batch) == 1:
                     nxt.append(batch[0])
                     continue
@@ -455,107 +481,51 @@ class Summarizer:
                 try:
                     out = await self.llm.chat(
                         sys_prompt, "\n\n---\n\n".join(batch),
-                        max_tokens=max(600, limit), temperature=0.2, think=False,
+                        max_tokens=9000, temperature=0.2, think=False,
+                        purpose=purpose, source_ids=batch_ids, require_complete=True,
                     )
                     out = (out or "").strip()
                 except Exception as e:  # noqa: BLE001
-                    log.warning("纪要分层合并失败，使用拼接: %s", e)
-                    out = ""
-                nxt.append(out or "\n\n".join(batch))
+                    log.warning("纪要分层合并失败: %s", e)
+                    raise
+                if not out:
+                    raise RuntimeError("模型合并结果为空，请重新生成")
+                nxt.append(out)
             level = nxt
+            sources = next_sources
             if last_round:
                 return level[0]
 
-    async def _fit_length(self, content: str, limit: int = DIGEST_DEFAULT_CHARS) -> str:
-        """把纪要硬性收敛到 limit 字以内。
-
-        实测：提示词写明「不超过 N 字」，模型仍会写到 350~700 字 ——
-        提示词只能「引导」，不能「约束」，靠调措辞去赌长度是不收敛的。
-        因此这里做两道**确定性**收敛：
-          1) 让模型重写一轮，并把 max_tokens 卡到写不出超长文本（物理上限）；
-          2) 若仍超（或调用失败 / 反而更长），按句子边界硬截断。
-        绝不放行超长原稿 —— 那等于这道工序不存在。
-        """
-        # v0.5.8：字数合格不代表结构合格。先纠正长篇单段，再约束总长。
-        # 短讯或没有完整句子的片段不强行分段，避免为少量内容多调模型。
-        blocks = [p.strip() for p in content.splitlines() if p.strip()]
-        if len(blocks) == 1 and len(content) > 320 and len(re.findall(r"[。！？]", content)) >= 3:
-            try:
-                formatted = await self.llm.chat(
-                    digest_system(limit),
-                    "仅将以下已有纪要按主题整理成多个内容段，保留事实与未证实标注：\n\n" + content,
-                    max_tokens=limit * 2, temperature=0.1, think=False,
-                )
-                if len([p for p in (formatted or "").splitlines() if p.strip()]) > 1:
-                    content = formatted.strip()
-            except Exception as e:  # noqa: BLE001
-                log.warning("纪要分段整理失败，保留原文并按句界分段: %s", e)
-            if len([p for p in content.splitlines() if p.strip()]) == 1:
-                # 模型不可用时只调整阅读间隔，不臆测主题、不增加事实。
-                paragraphs, current = [], ""
-                for sentence in re.split(r"(?<=[。！？])", content):
-                    current += sentence
-                    if len(current) >= 180:
-                        paragraphs.append(current)
-                        current = ""
-                if current:
-                    paragraphs.append(current)
-                content = "\n\n".join(paragraphs)
-        if len(content) <= limit:
+    async def _finalize_digest(self, content: str, limit: int = DIGEST_DEFAULT_CHARS,
+                               source_ids: list[int] | None = None) -> str:
+        """v0.6.0：篇幅与结构交给模型重写，绝不裁剪正文或拼接替代总结。"""
+        if "无有效信息" in content[:30]:
             return content
-
-        # 最多压两轮：单轮实测只能压掉 ~15%，两轮能明显接近目标；
-        # 轮数再多收益递减，且每一步都是额外调用，不值得。
-        for attempt in range(1, 3):
-            try:
-                shorter = await self.llm.chat(
-                    compress_system(limit),
-                    content,
-                    max_tokens=int(limit * 0.75) + 60,
-                    temperature=0.1,
-                    think=False,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning("纪要压缩第 %d 轮调用失败，改走硬截断: %s", attempt, e)
-                break
-            shorter = (shorter or "").strip()
-            # 只在「确实更短」时采纳：模型偶尔会把压缩写成扩写
-            if not shorter or len(shorter) >= len(content):
-                break
-            if (len([p for p in content.splitlines() if p.strip()]) > 1
-                    and len([p for p in shorter.splitlines() if p.strip()]) < 2):
-                break  # v0.5.8：不接受靠抹掉主题分段达成的压缩，改走逐段裁剪
-            content = shorter
-            if len(content) <= limit:
-                return content
-
-        # v0.5.8：按段分配剩余预算，避免第一段过长时后续主题被整段截掉。
-        blocks = [p.strip() for p in content.splitlines() if p.strip()]
-        kept = []
-        remaining = limit - 2 * (len(blocks) - 1)  # 段间空行也计入总长
-        for i, block in enumerate(blocks):
-            budget = max(1, remaining // (len(blocks) - i))
-            part = block[:budget]
-            if len(block) > budget:
-                m = re.search(r"[。！？；!?;][^。！？；!?;]*$", part)
-                if m and m.start() >= int(budget * 0.6):
-                    part = part[:m.start() + 1]
-                else:
-                    part = block[:budget - 1].rstrip("，,、；;：: \n\t") + "…"
-            kept.append(part)
-            remaining -= len(part)
-        cut = "\n\n".join(kept)[:limit]
-        log.warning(
-            "纪要仍超 %d 字（压缩后 %d 字），已硬截断至 %d 字",
-            limit, len(content), len(cut),
-        )
-        return cut
+        structured = content.startswith("# ") and re.search(r"(?m)^\*\*[^*\n]+\*\*", content)
+        if not structured or len(content) > limit * 1.2:
+            content = await self.llm.chat(
+                digest_system(limit),
+                "请基于以下材料重新整理为完整总结，保留事实、各主题与未证实标注：\n\n" + content,
+                max_tokens=9000, temperature=0.2, think=False,
+                purpose="摘要成稿", source_ids=source_ids, require_complete=True,
+            )
+            content = (content or "").strip()
+        if not content:
+            raise RuntimeError("模型返回了空摘要，请重新生成")
+        if not content.startswith("# ") or not re.search(r"(?m)^\*\*[^*\n]+\*\*", content):
+            raise RuntimeError("模型未按总标题与加粗小标题生成，请重新生成")
+        if len(content) > limit * 1.2:
+            log.warning("摘要实际 %d 字，超出约 %d 字的目标；保留完整模型结果，不截断", len(content), limit)
+        return content
 
     def _write_report(self, title, content, group_name, start, end, count) -> Path:
         sub = self.report_dir / time.strftime("%Y%m%d")
         sub.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^\w\u4e00-\u9fff.-]", "_", title)[:60]
-        path = sub / f"{safe}.html"
+        path = sub / f"{safe}_{time.time_ns()}.html"  # 同一分钟重做也保留各次完整结果
+        if content.startswith("# "):
+            heading, _, content = content.partition("\n")
+            title = heading[2:].strip()
         meta = (
             f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(start))} — "
             f"{time.strftime('%H:%M', time.localtime(end))} · {count} 条消息"
@@ -607,20 +577,11 @@ class Summarizer:
             gname = names.get(r["group_id"]) or r["group_id"]
             blocks.append(f"## {gname} · {time.strftime('%m-%d %H:%M', time.localtime(r['window_end']))}\n{r['content']}")
 
-        merged = "\n\n".join(blocks)
-        if self.llm.available and self.llm.budget_ok():
-            try:
-                merged = await self.llm.chat(
-                    "把下列多个群的摘要合并成一份当日总览：先按群分组，再把跨群重复的话题合并，"
-                    "把最值得当天阅读的 3-5 条信息提到最前面作为「今日重点」。保留所有链接与命令原文。"
-                    "直接输出 Markdown。",
-                    merged[:24000],
-                    max_tokens=3000,
-                    temperature=0.2,
-                    think=False,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning("日报合并失败，使用原始拼接: %s", e)
+        if not self.llm.available or not self.llm.budget_ok():
+            log.warning("日报暂不能调用模型，本次不生成")
+            return None
+        merged = await self._merge_all(blocks, purpose="日报合并")
+        merged = await self._finalize_digest(merged)
 
         title = f"群消息日报 {time.strftime('%Y-%m-%d')}"
         path = self._write_report(title, merged, "全部", since, int(time.time()), len(rows))

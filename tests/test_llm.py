@@ -42,12 +42,16 @@ class FakeStore:
 
     def __init__(self) -> None:
         self.usage: list[tuple] = []
+        self.details: list[dict] = []
 
     def daily_cost_cny(self, day: str) -> float:
         return 0.0
 
     def add_usage(self, *a) -> None:
         self.usage.append(a)
+
+    def record_api_call(self, **data) -> None:
+        self.details.append(data)
 
 
 def make_llm(**over) -> LLM:

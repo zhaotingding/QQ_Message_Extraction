@@ -255,7 +255,7 @@ class MediaWorker:
         if self.mcfg.get("ocr_enabled", True):
             ocr_text = await asyncio.to_thread(self._ocr_sync, path)
 
-        vision_text, vision_state = await self._run_vision(path)
+        vision_text, vision_state = await self._run_vision(path, int(row["id"]))
         if vision_state != "skipped":
             # 第一次尝试也计数：否则「首跑失败」的行会白得一次额外重试机会，
             # 而补跑计数只覆盖后续轮次，上限就不是真正的上限了。
@@ -271,7 +271,7 @@ class MediaWorker:
             vision_state=vision_state,
         )
 
-    async def _run_vision(self, path: Path) -> tuple[str, str]:
+    async def _run_vision(self, path: Path, row_id: int, retry: bool = False) -> tuple[str, str]:
         """跑图片语义，返回 ``(文本, 状态)``。状态见 store.MESSAGE_MIGRATIONS。
 
         为什么要把「失败」单独记下来：失败不落状态的话，这张图以后永远不会
@@ -282,7 +282,8 @@ class MediaWorker:
             return "", "skipped"
         if not self.llm.vision_supported():
             return "", "skipped"
-        text, ok = await self.llm.describe_image(path, VISION_PROMPT)
+        text, ok = await self.llm.describe_image(path, VISION_PROMPT, source_ids=[row_id],
+                                                 purpose="图片理解重试" if retry else "图片理解")
         return text, ("ok" if ok else "failed")
 
     async def retry_vision(self, limit: int = 8) -> list[int]:
@@ -306,7 +307,7 @@ class MediaWorker:
             if not path.exists():
                 continue  # 文件被清理了，保持 failed 即可
             async with self._sem:
-                text, state = await self._run_vision(path)
+                text, state = await self._run_vision(path, int(row["id"]), retry=True)
             self.store.set_media_result(
                 row["id"],
                 ocr_text=row["ocr_text"] or "",
