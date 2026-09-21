@@ -1,5 +1,4 @@
 """一条命令回答：**消息为什么不来了？**
-
 ## 为什么需要它
 
 2026-09-21 排查「消息冻结」时，现场是「服务在跑 + 协议端已连接 + 一条消息都不来」，
@@ -21,7 +20,12 @@
    ⚠️ 必须用 `/onebot`，**不能用 `/inject`** —— 后者直接调 handle_event、绕过队列，
    测了等于没测。固定 `msg_id` 让探针可反复运行而只入库一次。
 4. **二维码**：隔几秒采两次 mtime，还在涨 ⇒ 协议端正停在扫码界面等登录。
-5. **数据库**：最后一条消息是什么时候，落在哪些群。
+5. **上游 QQ**（2026-09-21 新增，第 4 种形态）：**桌面 QQ 自己**有没有在写消息库？
+   → `<QQ 数据目录>\\<uin>\\nt_qq\\nt_db\\nt_msg.db-wal` 的 mtime 不涨 ⇒ 消息在更上游就断了，
+     NapCat 与本项目都无辜。顺手报一下 Clash 里 QQ 有没有走直连、以及历史同期活跃度。
+6. **数据库**：最后一条消息是什么时候，落在哪些群。
+
+前 4 节全绿而消息仍不来时，**别再从零猜**——⑤ 通常就是答案。
 
 ## 用法
 
@@ -36,6 +40,8 @@ import argparse
 import ctypes
 import ctypes.wintypes as wt
 import json
+import os
+import re
 import sqlite3
 import sys
 import time
@@ -105,6 +111,144 @@ def ancestry(pid: int, table: dict[int, tuple[str, int]], limit: int = 12) -> li
 
 def section(title: str) -> None:
     print(f"\n{'─' * 62}\n{title}\n{'─' * 62}")
+
+
+# ---------------------------------------------------------------------------
+# 第 4 种形态：桌面 QQ 自己就没收到消息
+#
+# 判据只有一个，但是硬的：**QQ 自己的消息库有没有在写**。
+#   <QQ 数据目录>\<uin>\nt_qq\nt_db\nt_msg.db-wal 的 mtime = 最后一条消息落库时间
+# 它不涨 ⇒ 桌面 QQ 一条新消息都没收到 ⇒ NapCat 再正常也转发不出东西。
+#
+# 三条纪律（都是踩过的）：
+#   1. 出站目标显示成 Clash 的 198.18.x.x **不能**证明「走了代理」——TUN 下所有流量
+#      都长这样，即使最终规则是 DIRECT。别据此下结论。
+#   2. 枚举窗口看不到 QQ 窗口**不能**当结论——缩到托盘时 IsWindowVisible 也是 False。
+#   3. 「这个点群本来就没说话」要先自己排掉（按小时聚合历史消息），别让用户去证伪。
+# ---------------------------------------------------------------------------
+QQ_DATA_ROOTS = [
+    Path(r"D:\App\QQ\QQ聊天消息\Tencent Files"),
+    Path.home() / "Documents" / "Tencent Files",
+]
+CLASH_DIR = Path(os.environ.get("APPDATA", "")) / "io.github.clash-verge-rev.clash-verge-rev"
+
+
+def _find_qq_msg_wal() -> list[Path]:
+    """找所有「账号消息库」的 -wal 文件（每个账号一份）。"""
+    out: list[Path] = []
+    for root in QQ_DATA_ROOTS:
+        if root.is_dir():
+            out.extend(root.glob("*/nt_qq/nt_db/nt_msg.db-wal"))
+    return out
+
+
+def _clash_qq_direct() -> str:
+    """运行时生效的配置里，QQ.exe 有没有走直连？读不到就明说读不到，不下否定结论。"""
+    checked, missing = [], True
+    for rel in ("clash-verge.yaml", "profiles/rB43mplmKrrR.yaml"):
+        f = CLASH_DIR / rel
+        try:
+            if not f.is_file():
+                continue
+            txt = f.read_text(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            continue
+        checked.append(rel)
+        if re.search(r"PROCESS-NAME\s*,\s*QQ\.exe\s*,\s*DIRECT", txt, re.I):
+            return f"✓ 已配置（{rel}）—— QQ 的流量走直连"
+    if not checked:
+        return "? 读不到 Clash 配置，未判定（不据此说「没配」）"
+    return f"⚠ 未见 `PROCESS-NAME,QQ.exe,DIRECT`（已查 {', '.join(checked)}）"
+
+
+def _hour_rhythm(conn: sqlite3.Connection, hour: int, days: int = 7) -> list[int]:
+    """历史上同一个「小时」有多少条消息 —— 用来排除「这个点群本来就没说话」。"""
+    rows = conn.execute(
+        "SELECT strftime('%m-%d', ts, 'unixepoch', 'localtime') d, COUNT(*) "
+        "FROM messages WHERE strftime('%H', ts, 'unixepoch', 'localtime') = ? "
+        "AND COALESCE(text, '') NOT LIKE '【链路自检】%' "
+        "GROUP BY d ORDER BY d DESC LIMIT ?",
+        (f"{hour:02d}", days),
+    ).fetchall()
+    return [(r[0], r[1]) for r in rows]
+
+
+def qq_db_report(verdicts: list[tuple[str, str]]) -> str:
+    """返回要打印的正文；有异常时往 verdicts 里追加结论。"""
+    wals = _find_qq_msg_wal()
+    lines: list[str] = []
+    if not wals:
+        lines.append("没找到 QQ 的消息库（检查 QQ 数据目录是否在 D:\\App\\QQ\\QQ聊天消息\\Tencent Files）。")
+        lines.append("→ 这一步没做成，**不要**据此认为「QQ 侧没问题」。")
+        lines.append(f"Clash 里的 QQ 直连规则：{_clash_qq_direct()}")
+        return "\n".join(lines)
+
+    now = time.time()
+    newest: tuple[float, Path] | None = None
+    for w in wals:
+        m = w.stat().st_mtime
+        uin = w.parents[2].name  # <uin>/nt_qq/nt_db/nt_msg.db-wal
+        lines.append(f"{uin:>12}  nt_msg.db-wal  {time.strftime('%m-%d %H:%M:%S', time.localtime(m))}"
+                     f"  （{(now - m) / 60:.1f} 分钟前）")
+        if newest is None or m > newest[0]:
+            newest = (m, w)
+
+    assert newest is not None
+    wal_age = now - newest[0]
+    lines.append("")
+    lines.append("说明：`nt_msg.db-wal` 的 mtime 就是「桌面 QQ 最后一次把消息写进本地库」的时间。")
+
+    # 拿自己库里的最新消息做对照
+    db = ROOT / "data" / "msgx.db"
+    db_last = None
+    rhythm: list[tuple[str, int]] = []
+    if db.exists():
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            # 必须把本工具自己注入的探针排除掉，否则「本库最新一条」永远是探针那一刻，
+            # 与 QQ 库做时间差对照就永远对不上（踩过：探针把 00:45 顶成 01:12）。
+            row = conn.execute(
+                "SELECT MAX(ts) FROM messages WHERE COALESCE(text, '') NOT LIKE '【链路自检】%'"
+            ).fetchone()
+            db_last = row[0] if row else None
+            rhythm = _hour_rhythm(conn, time.localtime().tm_hour)
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if db_last:
+        drift = abs(newest[0] - db_last)
+        lines.append(f"本库最新一条消息：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(db_last))}"
+                     f"；与 QQ 库的时间差 {drift:.0f} 秒")
+        if drift <= 120 and wal_age > 600:
+            verdicts.append((
+                f"桌面 QQ 自己已经 {wal_age / 60:.0f} 分钟没往本地库写消息了",
+                "消息在这台机器的「上游」就断了 —— 与 NapCat/本项目无关。"
+                "处置：重启协议端（会连同 QQ 一起重启、可能要重扫码）；"
+                "同时确认 Clash 里 QQ 走直连，别让国内 IM 的长连接落在代理节点上。",
+            ))
+    elif wal_age > 600:
+        verdicts.append((
+            f"桌面 QQ 的本地消息库已经 {wal_age / 60:.0f} 分钟没有写入",
+            "上游 QQ 可能已停止接收消息（本库为空，没法做时间差对照，"
+            "但「QQ 库不动」本身就是可疑信号）。处置：重启协议端并重新扫码。",
+        ))
+
+    if rhythm:
+        lines.append("")
+        lines.append(f"历史同期对照（每天 {time.localtime().tm_hour} 点这个小时，近 {len(rhythm)} 天）：")
+        lines.append("  " + "  ".join(f"{d}:{n}条" for d, n in rhythm))
+        today = time.strftime("%m-%d")
+        past = [n for d, n in rhythm if d != today]
+        if past and max(past) >= 20 and wal_age > 900:
+            verdicts.append((
+                f"这个小时历史上是活跃的（近 {len(past)} 天最高 {max(past)} 条），今天却静默",
+                "基本可以排除「群本来没人说话」，问题在接收端（见上一条）。",
+            ))
+
+    lines.append("")
+    lines.append(f"Clash 里的 QQ 直连规则：{_clash_qq_direct()}")
+    return "\n".join(lines)
 
 
 def health() -> dict | None:
@@ -252,9 +396,9 @@ def main() -> int:
             if n_conn:
                 verdicts.append((
                     "协议端连着、能应答 API，但就是不推消息事件",
-                    "本次冻结就是这个形态。契约上「已连接」只证明 socket 通了，"
-                    "不证明 QQ 登录态正常。处置：清掉重复实例（kill_dup_napcat.py --elevate）"
-                    "→ 只启动一份 → 只扫一次码；再看 D:\\App\\NapCat\\logs\\（已开 fileLog）。",
+                    "「已连接」只证明 socket 通了，既不证明 QQ 登录态正常、更不证明有新消息进来。"
+                    "先看下面的 ⑤：若 QQ 自己的消息库也没在写，问题就不在协议端。"
+                    "协议端侧可查 D:\\App\\NapCat\\logs\\（需含账号级的 fileLog: true，且要重启协议端才生效）。",
                 ))
 
     # ---------- 4. 二维码 ----------
@@ -274,8 +418,12 @@ def main() -> int:
     else:
         print(f"{qr} 不存在（没有实例在等扫码）")
 
-    # ---------- 5. 数据库 ----------
-    section("⑤ 数据库：最后一条消息是什么时候")
+    # ---------- 5. 上游 QQ：它自己到底收到消息了没有 ----------
+    section("⑤ 上游：桌面 QQ 客户端自己收到消息了吗（第 4 种形态）")
+    print(qq_db_report(verdicts))
+
+    # ---------- 6. 数据库 ----------
+    section("⑥ 数据库：最后一条消息是什么时候")
     db = ROOT / "data" / "msgx.db"
     if db.exists():
         try:
