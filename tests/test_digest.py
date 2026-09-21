@@ -1,6 +1,6 @@
 """纪要长度硬约束的单元测试。
 
-背景：用户要的是「会议纪要式」摘要 —— 一段连贯的话，有明确字数上限。
+背景：纪要按主题分段，每段独立成文，并遵守明确的总字数上限。
 但**模型不遵守字数**：提示词里写明「不超过 N 字」，实测仍会写到 350~700 字。
 因此长度不能靠提示词保证，必须由 _fit_length 做确定性收敛。
 
@@ -145,12 +145,12 @@ big = S.chars_for_hours(24 * 30)
 out = run(sm._fit_length("甲" * (big * 3), big))
 check("长度不超过 1500", len(out) <= big, f"{len(out)} 字")
 
-print("\n=== 分层合并：多段 → 单段，收口层才写字数约束 ===")
+print("\n=== 分层合并：多份 → 一份，收口层才写字数约束 ===")
 llm = FakeLLM(["一" * 300, "二" * 300, "终" * 700])
 sm = make_summarizer(llm)
 parts = [f"第{i}段内容" * 20 for i in range(1, 6)]      # 5 段 → 4+1 → 收口
 out = run(sm._merge_all(parts, LIMIT))
-check("返回单段", isinstance(out, str) and out.strip() != "")
+check("返回合并正文", isinstance(out, str) and out.strip() != "")
 check("产生了合并调用", len(llm.calls) >= 1, f"{len(llm.calls)} 次")
 first_sys = llm.calls[0][0]
 mid_used = S.MERGE_MID_RULE.strip()[:20] in first_sys
@@ -165,6 +165,61 @@ sm = make_summarizer(llm)
 out = run(sm._merge_all(["唯一一段"], LIMIT))
 check("原样返回", out == "唯一一段")
 check("零调用", len(llm.calls) == 0)
+
+print("\n=== v0.5.8：主题段落贯穿生成、合并、压缩和展示 ===")
+for stage, prompt in (("生成", S.digest_system(LIMIT)), ("合并", S.MERGE_SYSTEM),
+                      ("压缩", S.compress_system(LIMIT))):
+    check(f"{stage}要求按主题分段", "每段" in prompt and "空行" in prompt)
+    check(f"{stage}不再要求写成一大段", "一段连贯" not in prompt and "禁止按话题分类" not in prompt)
+
+blocks = [f"{topic}。" + detail * 18 for topic, detail in (
+    ("模型更新", "测试需核对版本与对照条件。"),
+    ("工具使用", "部署前应确认依赖和入口。"),
+    ("研究进展", "结论需要通过可复现实验验证。"),
+)]
+structured = "\n\n".join(blocks)
+llm = FakeLLM([])
+sm = make_summarizer(llm)
+out = run(sm._fit_length(structured, 1500))
+check("已分段且未超限时不改写", out == structured and not llm.calls)
+
+llm = FakeLLM([structured])
+sm = make_summarizer(llm)
+out = run(sm._fit_length("".join(blocks), 1500))
+check("已有字数合格但挤成一段的正文会重新分段", len(out.split("\n\n")) >= 3)
+
+llm = FakeLLM(["压缩结果。" * 20])  # 模拟模型把多个主题压成一段
+sm = make_summarizer(llm)
+out = run(sm._fit_length(structured, 400))
+check("压缩结果不能把原有主题段合成一段", len(out.split("\n\n")) == 3)
+check("硬裁剪仍保留每段主题句并满足上限",
+      all(out.count(b.split("。")[0]) == 1 for b in blocks) and len(out) <= 400)
+
+llm = FakeLLM([RuntimeError("offline")])
+sm = make_summarizer(llm)
+out = run(sm._fit_length("".join(blocks), 800))
+check("分段改写失败时仍按句界分段且不超限", "\n\n" in out and len(out) <= 800)
+
+path = sm._write_report("主题纪要示例", structured, "测试群", 100, 200, 30)
+page = path.read_text(encoding="utf-8")
+check("HTML 只有一个总标题", page.count("<h1>") == 1)
+check("每个主题对应独立段落", page.count("<p>") == 3)
+check("正文保持转义，防止聊天内容作为 HTML 执行", "<script>" not in S.md_to_html("<script>alert(1)</script>"))
+
+print("\n=== 分块生成到最终纪要的完整链路 ===")
+from msgx.models import Msg
+import time
+
+llm = FakeLLM([*blocks, structured])
+sm = make_summarizer(llm)
+sm.scfg["chunk_char_budget"] = 1  # 每条记录单独生成一块，再走真正的合并步骤
+for i, block in enumerate(blocks):
+    sm.store.insert_message(Msg(msg_id=str(i), group_id="test", text=block, ts=int(time.time()) - 10 + i))
+result = run(sm.run_digest(full=True, target_chars=1500))
+page = Path(result["path"]).read_text(encoding="utf-8")
+check("分块与合并输出在最终 HTML 中保留独立内容段", page.count("<h1>") == 1 and page.count("<p>") == 3)
+check("保存的纪要正文同样保留段落", sm.store.recent_summaries(1)[0]["content"] == structured)
+check("链路只执行三次分块与一次合并，无多余模型调用", len(llm.calls) == 4)
 
 print()
 if fails:

@@ -38,12 +38,15 @@ def digest_system(limit: int) -> str:
     return f"""你在为一位科研 + 工程双线作战的用户写一份「群消息纪要」。
 他的唯一诉求：不遗漏业界动向。下面是一段时间的群聊记录（带群名、时间、发言人）。
 
-写成**一段连贯的纪要**，像会后心得，不是信息压缩，更不是话题罗列。
+写成按主题分段的纪要，像申论正文：每段都是相对独立的内容块。
+报告页面会提供唯一的总标题，你只输出正文，不重复写总标题。
 
 铁律：
 1. 总长不超过 {limit} 字。宁可写不足，也不要凑字数。
 2. 写「发生了什么、结论是什么」，不写「谁说了什么」。
-3. **禁止分条、禁止小标题、禁止按话题分类**——直接写成一段连贯的话。
+3. 按内容归并为若干主题段，通常 3~6 段；只有一个有效主题时允许一段，不凑段数。
+   每段只讲一个主题，以简短主题句开头，再交代事实、进展与结论；段间用空行分隔。
+   不把无关主题塞进同一段，不写碎片化清单，不另起段落小标题。
 4. 只留真正重要的：重要发布/更新、模型或工具行为变化、可复用的资源与结论。
    闲聊、寒暄、表情包、接龙、纯情绪、广告、账号交易一律不写。
    拿不准的内容标注（未证实）。
@@ -56,8 +59,9 @@ MERGE_SYSTEM = """把下面几段同一时间段的群聊纪要合并成一份�
 
 要求：
 1. 去掉重复，只保留最重要的信息。
-2. 输出风格与输入一致：**一段连贯的纪要，禁止分条、禁止小标题、禁止按话题分类**。
-3. 不写前缀与结尾评价，直接输出正文。
+2. 同一主题的信息合并，不同主题分段，每段是可独立阅读的内容块，以主题句开头。
+   通常保留 3~6 个内容段，段间用空行分隔；不按来源群机械分段，也不写碎片化清单。
+3. 报告页面提供唯一总标题，只输出正文，不另写总标题、小标题、前缀与结尾评价。
 """
 
 
@@ -74,13 +78,15 @@ def merge_final_rule(limit: int) -> str:
 
 
 def compress_system(limit: int) -> str:
-    return f"""把下面这段群消息纪要压缩成一段更精炼的纪要。
+    return f"""把下面的群消息纪要压缩为更精炼的多个主题段。
 
 规则：
 1. **只删不加**：只留最重要的事实与结论，删掉次要细节、举例、重复表述与铺垫。
 2. **把最重要的信息放在最前面**，越往后越次要。
 3. 总长控制在 {limit} 字以内（不到更好）。
-4. 仍然是一段连贯的话，禁止分条、禁止小标题、禁止前缀与结尾评价。
+4. 保留主题分段，每段只讲一项相对独立的内容，以简短主题句开头，段间用空行分隔。
+   优先精简每段细节，不得为了省字把不同主题合成一大段。
+   不写清单、小标题、前缀与结尾评价；报告页面提供唯一总标题。
 5. 直接输出压缩后的正文，不要说明你做了什么。
 """
 
@@ -195,6 +201,7 @@ PAGE = """<!DOCTYPE html>
  h2{{font-size:17px;font-weight:600;margin-top:30px;color:#2c2c2a}}
  h3{{font-size:15px;font-weight:600;margin-top:22px;color:#534ab7}}
  .meta{{color:#888780;font-size:13px;margin-bottom:26px}}
+ p{{margin:0 0 1.2em}}
  .ref{{color:#5f5e5a;font-size:13px;border-left:3px solid #b4b2a9;padding-left:10px;margin:6px 0}}
  a{{color:#185fa5}}
  ul{{margin:6px 0 6px 0;padding-left:22px}} li{{margin:3px 0}}
@@ -469,6 +476,31 @@ class Summarizer:
           2) 若仍超（或调用失败 / 反而更长），按句子边界硬截断。
         绝不放行超长原稿 —— 那等于这道工序不存在。
         """
+        # v0.5.8：字数合格不代表结构合格。先纠正长篇单段，再约束总长。
+        # 短讯或没有完整句子的片段不强行分段，避免为少量内容多调模型。
+        blocks = [p.strip() for p in content.splitlines() if p.strip()]
+        if len(blocks) == 1 and len(content) > 320 and len(re.findall(r"[。！？]", content)) >= 3:
+            try:
+                formatted = await self.llm.chat(
+                    digest_system(limit),
+                    "仅将以下已有纪要按主题整理成多个内容段，保留事实与未证实标注：\n\n" + content,
+                    max_tokens=limit * 2, temperature=0.1, think=False,
+                )
+                if len([p for p in (formatted or "").splitlines() if p.strip()]) > 1:
+                    content = formatted.strip()
+            except Exception as e:  # noqa: BLE001
+                log.warning("纪要分段整理失败，保留原文并按句界分段: %s", e)
+            if len([p for p in content.splitlines() if p.strip()]) == 1:
+                # 模型不可用时只调整阅读间隔，不臆测主题、不增加事实。
+                paragraphs, current = [], ""
+                for sentence in re.split(r"(?<=[。！？])", content):
+                    current += sentence
+                    if len(current) >= 180:
+                        paragraphs.append(current)
+                        current = ""
+                if current:
+                    paragraphs.append(current)
+                content = "\n\n".join(paragraphs)
         if len(content) <= limit:
             return content
 
@@ -490,18 +522,29 @@ class Summarizer:
             # 只在「确实更短」时采纳：模型偶尔会把压缩写成扩写
             if not shorter or len(shorter) >= len(content):
                 break
+            if (len([p for p in content.splitlines() if p.strip()]) > 1
+                    and len([p for p in shorter.splitlines() if p.strip()]) < 2):
+                break  # v0.5.8：不接受靠抹掉主题分段达成的压缩，改走逐段裁剪
             content = shorter
             if len(content) <= limit:
                 return content
 
-        # 硬截断：优先在句末（。！？；）断开，避免把句子切成两半
-        cut = content[:limit]
-        m = re.search(r"[。！？；!?;][^。！？；!?;]*$", cut)
-        if m and m.start() >= int(limit * 0.6):
-            cut = cut[: m.start() + 1]
-        else:
-            # 要给省略号留一个字符位，否则 limit + "…" 会变成 limit+1 字
-            cut = content[: limit - 1].rstrip("，,、；;：: \n\t") + "…"
+        # v0.5.8：按段分配剩余预算，避免第一段过长时后续主题被整段截掉。
+        blocks = [p.strip() for p in content.splitlines() if p.strip()]
+        kept = []
+        remaining = limit - 2 * (len(blocks) - 1)  # 段间空行也计入总长
+        for i, block in enumerate(blocks):
+            budget = max(1, remaining // (len(blocks) - i))
+            part = block[:budget]
+            if len(block) > budget:
+                m = re.search(r"[。！？；!?;][^。！？；!?;]*$", part)
+                if m and m.start() >= int(budget * 0.6):
+                    part = part[:m.start() + 1]
+                else:
+                    part = block[:budget - 1].rstrip("，,、；;：: \n\t") + "…"
+            kept.append(part)
+            remaining -= len(part)
+        cut = "\n\n".join(kept)[:limit]
         log.warning(
             "纪要仍超 %d 字（压缩后 %d 字），已硬截断至 %d 字",
             limit, len(content), len(cut),

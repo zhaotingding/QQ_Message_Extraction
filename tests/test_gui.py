@@ -315,7 +315,7 @@ check("「失败」⇒ 红", App._log_tag("[界面] 启动协议端失败：xxx"
 check("「消息不再入库」⇒ 红（哪怕行里也有『入库』）",
       App._log_tag("10:49:31 WARNING msgx.pipeline 消息不再入库") == "warn")
 check("协议端已连入 ⇒ 绿", App._log_tag("10:48:35 INFO msgx.napcat 协议端已连入（账号 123）") == "good")
-check("普通 INFO ⇒ 白", App._log_tag("10:48:35 INFO msgx.media OCR 引擎就绪: rapidocr") == "")
+check("普通 INFO ⇒ 白", App._log_tag("10:48:35 INFO msgx.media 正在检查待处理图片") == "")
 check("界面提示提到「已连接」不染绿（那是提示，不是事件）",
       App._log_tag("[界面] 连上后「协议端(NapCat)」会自己变成「已连接」") == "")
 check("先判红再判绿：同一行两个词都出现时红压过绿",
@@ -324,6 +324,37 @@ app._log_ui("10:48:35 INFO msgx.napcat 协议端已连入（账号 123）\n")
 app._log_ui("10:49:31 WARNING msgx.pipeline 消息不再入库\n")
 tags = [t for t in app.log.tag_names()]
 check("Text 控件注册了 warn/good 两个 tag", {"warn", "good"} <= set(tags), str(tags))
+
+print("\n=== v0.5.8：成功事件统一标绿 ===")
+for line in (
+    "17:07:31 INFO msgx 消息萃取服务已启动",
+    "17:07:33 INFO msgx.pipeline 已从协议端拉取群列表：7 个群",
+    "17:09:56 INFO msgx.summarize 全量纪要 已生成（1632 条消息）",
+    "[界面] 按范围重做（近 1 天）已生成，详见 data/reports/",
+    "17:07:51 INFO msgx.pipeline 账单快照（balance_diff）：今日 0.1 CNY",
+    "17:07:31 INFO msgx.media OCR 引擎就绪: rapidocr",
+    "[界面] 请求成功：已保存设置",
+    "17:07:31 INFO msgx.llm 请求完成 HTTP 200",
+):
+    check("成功为绿：" + line, App._log_tag(line) == "good")
+for line in (
+    "[界面] 正在请求生成最新摘要…",
+    "[界面] 已请求启动 NapCat，请在登录成功后继续",
+    "17:07:31 INFO msgx 停止信号文件: D:/stop.signal",
+    "17:07:31 INFO msgx 等待接收消息，入库前按规则过滤",
+    "17:07:31 INFO msgx.pipeline 已把 11 张上次下载失败的图片重新排入处理队列",
+):
+    check("普通运行为白：" + line, App._log_tag(line) == "")
+for line in (
+    "17:07:31 WARNING msgx 请求成功但内容校验失败",
+    "[界面] 请求未成功",
+    "[界面] 生成完成但文件写入失败",
+):
+    check("失败仍为红：" + line, App._log_tag(line) == "warn")
+_success_line = "[界面] 颜色验证：纪要已生成"
+app._log_ui(_success_line + "\n")
+_success_index = app.log.search(_success_line, "1.0", stopindex="end")
+check("实际日志控件为成功行应用绿色标签", "good" in app.log.tag_names(_success_index))
 
 print("\n=== 日志切换（v0.5.5：服务/协议端日志在主界面切，不再弹窗）===")
 check("有日志来源下拉", list(app.cb_log_src.cget("values")) == ["服务日志", "协议端日志"],

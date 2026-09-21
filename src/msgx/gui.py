@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import sqlite3
 import subprocess
 import sys
@@ -38,7 +39,7 @@ CREATE_NO_WINDOW = 0x08000000  # Windows: 子进程不弹控制台窗口
 # 日志框配色：沿用终端的深底浅字，长时间盯着不刺眼
 LOG_BG = "#1b1f27"
 LOG_FG = "#d6dbe5"
-# 行级颜色（v0.5.5）：暗底上要够亮才看得清。红 = 出问题，绿 = 在收消息/链路正常。
+# 行级颜色：暗底上要够亮才看得清。红 = 出问题，绿 = 操作成功，白 = 普通运行。
 LOG_RED = "#ff7b72"
 LOG_GREEN = "#7ee787"
 OK_COLOR = "#1a7f37"
@@ -301,7 +302,7 @@ class App:
             pady=8,
             relief="flat",
         )
-        # 行级颜色（v0.5.5）：白 = 平常，绿 = 在收消息/链路正常，红 = 出问题了。
+        # 行级颜色：白 = 普通运行，绿 = 操作成功，红 = 出问题了。
         w.tag_configure("warn", foreground=LOG_RED)
         w.tag_configure("good", foreground=LOG_GREEN)
         return w
@@ -309,22 +310,32 @@ class App:
     # ---- 日志行的颜色判定 ----
     # 用户的原话：「正常状态时白色，一旦进入连接状态收听消息就变成绿色，
     # 一旦出现问题就是红色」。规则必须**可解释**，所以是关键词而不是猜：
-    _RED_KEYS = ("WARNING", "ERROR", "CRITICAL", "失败", "异常", "错误", "不再入库", "无法")
-    _GREEN_SERVICE_KEYS = ("已连入", "已连接", "已恢复", "接收", "入库")
+    _RED_KEYS = ("WARNING", "ERROR", "CRITICAL", "失败", "异常", "错误", "不再入库", "无法", "未成功", "未能成功")
+    _GREEN_KEYS = ("成功", "已连入", "已连接", "已恢复", "已启动", "已生成", "已完成",
+                   "已刷新", "已保存", "已入库", "已接收", "已弹出", "清理完成", "引擎就绪",
+                   "已从协议端拉取群列表", "账单快照（", "多模态支持: True", "LLM 可用: True")
 
     @classmethod
     def _log_tag(cls, line: str) -> str:
         """返回 tag 名（'' = 默认白）。**先判红再判绿**：同一行可能两个词都出现
         （如「……消息不再入库」里也有「入库」），出了问题必须压过一切。"""
-        for k in cls._RED_KEYS:
-            if k in line:
-                return "warn"
-        # 绿色只给**服务日志**（带 HH:MM:SS 时间戳）里确实在干活的行；
-        # 界面自己的提示行不染绿 —— 提示里提到「已连接」三个字不该让它变绿。
-        if line[:8].count(":") == 2:
-            for k in cls._GREEN_SERVICE_KEYS:
-                if k in line:
-                    return "good"
+        # v0.5.8：成功事件也来自界面回调，不能再要求时间戳或只认「连接/入库」。
+        match = re.match(r"^\d{2}:\d{2}:\d{2}\s+(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+\S+\s+(.*)", line)
+        if match and match[1] in ("WARNING", "ERROR", "CRITICAL"):
+            return "warn"
+        body = match[2] if match else line.removeprefix("[界面]").strip()
+        # 这是历史失败任务重新排队的进度，既不是本次失败，也不等于处理成功。
+        if body.startswith("已把 ") and "重新排入处理队列" in body:
+            return ""
+        if any(k in body for k in cls._RED_KEYS):
+            return "warn"
+        if body.startswith(("正在", "等待", "请在", "请先", "请用", "请点", "请等待", "若", "如果",
+                            "连上后", "登录成功后", "已请求")):
+            return ""  # 操作说明、等待和已提交请求，不冒充执行成功
+        if any(k in body for k in cls._GREEN_KEYS):
+            return "good"
+        if re.search(r"\bHTTP(?:/\d(?:\.\d)?)?\s+2\d\d\b", body):
+            return "good"
         return ""
 
     def _switch_log_source(self) -> None:
