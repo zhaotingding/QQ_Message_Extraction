@@ -72,6 +72,8 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
     # 同时登记连接对象：退出时要靠它主动关闭，否则 runner.cleanup() 会
     # 一直等 WS 处理器返回（NapCat 不断线就永远不返回）。
     pipe.ws_conns.add(ws)
+    pipe.ws_online[ws] = None
+    pipe.ws_addresses[ws] = peer
     log.info("协议端已连接: %s", request.remote)
     pipe.on_peer_connected()
     accepted = 0
@@ -90,8 +92,18 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
                 if "echo" in event and "post_type" not in event:
                     pipe.resolve_action(event)
                     continue
-                if event.get("post_type") in ("meta_event", "notice", "request"):
+                if event.get("post_type") == "meta_event":
+                    status = event.get("status")
+                    if event.get("meta_event_type") == "heartbeat" and isinstance(status, dict):
+                        online = status.get("online")
+                        if isinstance(online, bool):
+                            pipe.ws_online[ws] = online
+                            pipe._protocol_checked = 0.0
                     continue
+                if event.get("post_type") in ("notice", "request"):
+                    continue
+                if event.get("post_type") == "message":
+                    pipe.ws_online[ws] = True
                 await pipe.submit(event)
                 accepted += 1
             elif raw.type == WSMsgType.ERROR:
@@ -99,9 +111,15 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
                 break
     finally:
         # 必须在 finally 里移除，否则断线后 /health 会一直显示「已连接」
-        pipe.ws_peers.discard(peer)
         pipe.ws_conns.discard(ws)
-        log.info("协议端断开（本次接收 %s 条事件）", accepted)
+        pipe.ws_online.pop(ws, None)
+        pipe.ws_addresses.pop(ws, None)
+        # 多条连接可能来自同一个 IP；其中一条断开不能抹掉仍在线的连接。
+        pipe.ws_peers.clear()
+        pipe.ws_peers.update(addr for conn, addr in pipe.ws_addresses.items() if not conn.closed)
+        reason = "服务主动停止" if pipe._closing_ws or pipe._stop.is_set() else "连接关闭"
+        pipe.ws_last_close = f"{reason}，关闭码 {ws.close_code}，错误 {ws.exception() or '无'}"
+        log.info("协议端断开（本次接收 %s 条事件；%s）", accepted, pipe.ws_last_close)
         pipe.on_peer_disconnected()
     return ws
 

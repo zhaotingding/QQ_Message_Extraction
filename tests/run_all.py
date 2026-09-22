@@ -27,6 +27,7 @@ SUITES = [
     ("群列表属主", "test_groups.py"),
     ("无额外推理与过滤链路", "test_pipeline.py"),
     ("服务生命周期", "test_service.py"),
+    ("断线原因与重连", "test_connection.py"),
     ("界面构建", "test_gui.py"),
 ]
 

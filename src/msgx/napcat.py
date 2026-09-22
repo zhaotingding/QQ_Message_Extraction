@@ -38,8 +38,10 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 
 from .config import ROOT
@@ -523,6 +525,38 @@ def restart(cfg: dict) -> dict:
 
 
 # ---------------------------------------------------------------- 上游健康
+
+def login_failure(cfg: dict, since: float = 0.0) -> dict:
+    """只读最新协议日志中的登录失效证据，不把群消息正文当成系统事件。"""
+    try:
+        path = napcat_own_log(resolve_dir(cfg))
+        if path is None:
+            return {}
+        modified = path.stat().st_mtime
+        with path.open("rb") as stream:
+            stream.seek(max(0, path.stat().st_size - 65536))
+            lines = stream.read(65536).decode("utf-8", errors="replace").splitlines()
+        for line in reversed(lines):
+            match = re.match(r"^(\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(?:error|warn|info)\] .*? \| (.*)$", line)
+            if not match:
+                continue
+            event = match[2]
+            if event.startswith("接收 <- "):
+                return {}  # 此后又收到消息，不能沿用旧登录失败。
+            if not event.startswith("[KickedOffLine] "):
+                continue
+            stamp = datetime.strptime(f"{datetime.fromtimestamp(modified).year}-{match[1]}", "%Y-%m-%d %H:%M:%S")
+            if stamp.timestamp() > modified + 86400:  # 跨年日志
+                stamp = stamp.replace(year=stamp.year - 1)
+            at = stamp.timestamp()
+            if at < since:
+                return {}
+            return {"state": "login_required", "since": at,
+                    "message": "QQ 登录已失效，需要重新扫码；重连本地接口无法恢复登录",
+                    "evidence": event[:400], "log_path": str(path)}
+    except (OSError, ValueError):
+        pass
+    return {}
 
 # QQ 数据目录的候选根。v0.5.4 的看门狗要用它判断「桌面 QQ 自己还在不在收消息」。
 QQ_DATA_ROOTS = (

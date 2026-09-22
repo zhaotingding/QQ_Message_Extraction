@@ -839,6 +839,27 @@ with patch.object(_mb, "showinfo") as _info, patch.object(_mb, "showerror") as _
     check("服务异常退出留在状态栏", "服务异常退出" in app.status.get())
     check("以上操作均不弹通知框", not _info.called and not _error.called)
 
+print("\n=== 0.6.2 登录失效与恢复入口 ===")
+app._apply_health({"ws_peers": ["127.0.0.1"], "protocol": {
+    "state": "login_required", "since": time.time() - 30,
+    "message": "QQ 登录已失效，需要重新扫码"}})
+check("登录失效不能因 WS 仍存在就显示在线", "登录失效" in app.v_peer.get())
+check("运行状态给出明确恢复入口", bool(app.btn_relogin.grid_info()) and "重新扫码" in app.v_protocol_detail.get())
+with patch.object(Path, "stat", return_value=type("Stat", (), {"st_mtime": time.time()})()), \
+        patch.object(app, "_start_qrcode_watch") as _watch, patch.object(app, "restart_napcat") as _restart:
+    app.relogin_napcat()
+    check("已有新码直接展示，不重启 QQ", _watch.called and not _restart.called)
+with patch.object(Path, "stat", return_value=type("Stat", (), {"st_mtime": time.time() - 3600})()), \
+        patch.object(app, "_start_qrcode_watch") as _watch, patch.object(app, "restart_napcat") as _restart:
+    app.relogin_napcat()
+    check("旧码走已有确认重置流程，不冒充有效二维码", not _watch.called and _restart.called)
+app._apply_health({"ws_peers": ["127.0.0.1"], "protocol": {"state": "offline", "message": "QQ 心跳报告离线"}})
+check("心跳离线不会显示健康", "QQ 已离线" in app.v_peer.get())
+app._apply_health({"protocol": {"state": "disconnected", "message": "等待 NapCat 自动重连"}})
+check("普通断线不诱导重复启动", "自动重连" in app.v_peer.get() and not app.btn_relogin.grid_info())
+app._apply_health({"ws_peers": ["127.0.0.1"], "protocol": {"state": "connected"}})
+check("重连后清除登录故障说明", "已连接" in app.v_peer.get() and not app.v_protocol_detail.get())
+
 root.update()
 root.destroy()
 

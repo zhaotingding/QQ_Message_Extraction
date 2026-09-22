@@ -84,6 +84,7 @@ class App:
         self._summary_path = ""
         self._usage_busy = False
         self._usage_items = {}
+        self._protocol_state = {}
         # 登录二维码弹窗。Tkinter 只能在主线程碰控件，所以监视线程只把路径
         # 丢进 events 队列，由 _drain 在主线程里弹窗。
         self.qr_win: tk.Toplevel | None = None
@@ -201,6 +202,14 @@ class App:
                 )
         card.columnconfigure(1, weight=1)
         card.columnconfigure(3, weight=1)
+
+        self.v_protocol_detail = tk.StringVar(value="")
+        ttk.Label(card, textvariable=self.v_protocol_detail, wraplength=900).grid(
+            row=len(rows), column=0, columnspan=4, sticky="w", pady=(6, 0)
+        )
+        self.btn_relogin = ttk.Button(card, text="重新扫码", command=self.relogin_napcat)
+        self.btn_relogin.grid(row=len(rows) + 1, column=0, sticky="w")
+        self.btn_relogin.grid_remove()
 
         # ---- 按钮区（两行，避免一行挤成一坨）----
         buttons = ttk.Frame(tab)
@@ -1421,6 +1430,22 @@ class App:
         if self.napcat_dir():
             self._start_qrcode_watch(since=qr_since)
 
+    def relogin_napcat(self) -> None:
+        """优先展示协议端自行生成的新码，避免为扫码再启动一份 QQ。"""
+        d = self.napcat_dir()
+        qr = d / "cache" / "qrcode.png" if d else None
+        try:
+            mtime = qr.stat().st_mtime if qr else 0.0
+        except OSError:
+            mtime = 0.0
+        since = float(self._protocol_state.get("since") or 0.0)
+        if mtime >= since and 0 <= time.time() - mtime < 120:
+            self._start_qrcode_watch(fresh_only=True, since=since)
+            self.status.set("正在显示新的登录二维码，请用手机 QQ 扫码")
+        else:
+            # 已过期的二维码不能冒充可用；沿用有明确确认的重置流程。
+            self.restart_napcat()
+
     def restart_napcat(self) -> None:
         """一键重置协议端：把所有注入器与 QQ.exe **全退掉**，再重新拉起。
 
@@ -1443,7 +1468,7 @@ class App:
             "  1. 强行结束**所有** NapCat 注入器和 QQ.exe（包括你自己的 QQ 窗口）\n"
             "  2. 再重新注入并拉起 QQ\n"
             "  3. **需要重新扫码登录**（二维码会自动弹出）\n\n"
-            "这是「消息冻结」唯一可靠的动作。要现在做吗？",
+            "请先确认无法使用当前二维码恢复登录。要现在重置吗？",
             parent=self.root,
         ):
             self.status.set("已取消重置协议端")
@@ -1737,9 +1762,21 @@ class App:
     def _apply_health(self, data: dict | None) -> None:
         if data is None:
             self.v_peer.set("未连接（服务响应超时）")
+            self.v_protocol_detail.set("服务未响应，暂时无法确认 QQ 登录状态")
+            self.btn_relogin.grid_remove()
             return
         peers = data.get("ws_peers") or []
-        if peers:
+        protocol = data.get("protocol") or {}
+        self._protocol_state = protocol
+        state = protocol.get("state")
+        self.v_protocol_detail.set(protocol.get("message", "") if state != "connected" else "")
+        self.btn_relogin.grid_remove()
+        if state == "login_required":
+            self.v_peer.set("QQ 登录失效 · 需要扫码")
+            self.btn_relogin.grid()
+        elif state == "offline":
+            self.v_peer.set("连接存在 · QQ 已离线")
+        elif peers:
             self.v_peer.set(f"已连接 · {', '.join(peers)}")
             # v0.5.7：保护的是重置前旧连接，扫码后的新连接不应再等待两分钟。
             # 由服务记录连接建立时间，即使断开/重连都发生在两次轮询之间也能识别。
@@ -1749,6 +1786,8 @@ class App:
                     self._trace_gui(f"协议端已连接，结束扫码监视 connected_at={connected_at}")
                 self.qr_watching = False  # 已连上，没必要再盯着二维码
                 self._close_qrcode()
+        elif state == "disconnected":
+            self.v_peer.set("连接中断 · 等待自动重连")
         elif self.napcat_script() or self.napcat_dir():
             self.v_peer.set("未连接 —— 请点「启动协议端(NapCat)」")
         else:

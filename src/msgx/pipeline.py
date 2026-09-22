@@ -45,6 +45,13 @@ class Pipeline:
         # 让界面能明确区分「服务在跑」和「NapCat 已连上」——这两件事经常被混淆。
         self.ws_peers: set[str] = set()
         self.ws_connected_at = 0.0  # v0.5.7：GUI 用新连接时间区分扫码成功与重置前旧连接
+        self.ws_disconnected_at = 0.0
+        self.ws_last_close = ""
+        self.ws_online: dict = {}
+        self.ws_addresses: dict = {}
+        self._closing_ws = False
+        self._protocol_checked = 0.0
+        self._protocol_failure: dict = {}
         # 活着的 WebSocket 连接对象。**退出时必须主动关掉它们**：
         # aiohttp 的 AppRunner.cleanup() 会等待所有活动连接处理完毕，而反向 WS 的
         # 处理器是 `async for raw in ws`，只要 NapCat 不断线就永远不返回。
@@ -184,6 +191,8 @@ class Pipeline:
 
     def on_peer_connected(self) -> None:
         self.ws_connected_at = time.time()
+        self._protocol_checked = 0.0
+        self._protocol_failure = {}
         t = self._peer_watch
         if t is not None and not t.done():
             t.cancel()
@@ -200,17 +209,44 @@ class Pipeline:
             log.debug("自动拉取群列表失败（不影响消息接收）: %s", e)
 
     def on_peer_disconnected(self) -> None:
-        """最后一条协议端连接断开超过 60 秒时，仅记录日志。"""
-        if self._stop.is_set() or self.ws_peers:
+        """最后一条连接断开后检查上游原因；不盲目重启 QQ 或创建重复实例。"""
+        if self._stop.is_set() or self._closing_ws or self.ws_conns:
             return
+        self.ws_disconnected_at = time.time()
+        self._protocol_checked = 0.0
+        if self._peer_watch is not None and not self._peer_watch.done():
+            self._peer_watch.cancel()
 
         async def _watch() -> None:
-            await asyncio.sleep(60)
-            if self._stop.is_set() or self.ws_peers:
+            await asyncio.sleep(1)
+            if self._stop.is_set() or self.ws_conns:
                 return
-            log.warning("协议端已断开超过 60s 且未重连 —— 消息不再入库")
+            status = self.protocol_status()
+            if status["state"] == "login_required":
+                log.warning("%s；协议日志：%s", status["message"], status["log_path"])
+                return
+            await asyncio.sleep(59)
+            if self._stop.is_set() or self.ws_conns:
+                return
+            log.warning("协议端已断开超过 60s 且未重连 —— 消息不再入库；%s", self.protocol_status()["message"])
 
         self._peer_watch = asyncio.create_task(_watch())
+
+    def protocol_status(self) -> dict:
+        live = [ws for ws in self.ws_conns if not ws.closed]
+        if live and any(self.ws_online.get(ws) is not False for ws in live):
+            return {"state": "connected", "message": "协议端已连接", "since": self.ws_connected_at}
+        now = time.monotonic()
+        if not self._protocol_checked or now - self._protocol_checked >= 5:
+            self._protocol_failure = napcat.login_failure(self.cfg, self.ws_connected_at)
+            self._protocol_checked = now
+        if self._protocol_failure:
+            return dict(self._protocol_failure)
+        if live:
+            return {"state": "offline", "message": "QQ 心跳报告离线，等待协议端恢复登录", "since": self.ws_connected_at}
+        return {"state": "disconnected", "since": self.ws_disconnected_at,
+                "message": "等待 NapCat 自动重连；若持续未恢复，请查看协议端日志",
+                "last_close": self.ws_last_close}
 
     async def close_ws_conns(self) -> int:
         """主动关闭所有反向 WS 连接，返回关闭条数。
@@ -218,6 +254,7 @@ class Pipeline:
         必须在 runner.cleanup() 之前调用，否则 cleanup 会一直等 WS 处理器返回。
         用 GOING_AWAY 告知对端是「服务要关了」，NapCat 收到后会自行重连。
         """
+        self._closing_ws = True
         conns = list(self.ws_conns)
         for ws in conns:
             with contextlib.suppress(Exception):
@@ -661,6 +698,7 @@ class Pipeline:
             "watch_groups": sorted(self.watch) or "全部",
             "ws_peers": sorted(self.ws_peers),
             "ws_connected_at": self.ws_connected_at,
+            "protocol": self.protocol_status(),
             "summary_progress": self.summarizer.progress,
             # ⚠️ ws_peers 是「对端 IP 的**集合**」：多份 NapCat 全从 127.0.0.1 连进来时
             # 会被去重成 1 个 —— 7 份实例看起来和 1 份完全一样，这正是 2026-09-21
