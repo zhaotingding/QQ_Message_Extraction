@@ -45,6 +45,8 @@ LOG_RED = "#ff7b72"
 LOG_GREEN = "#7ee787"
 OK_COLOR = "#1a7f37"
 MUTED = "#6b6b68"
+RETIRED_PURPOSES = {"消息评分", "纪要分块", "纪要总结", "摘要合并", "日报合并", "摘要成稿",
+                    "摘要压缩", "纪要压缩", "图片能力探测", "跨群热点", "群摘要分块"}
 
 
 def worker_python() -> str:
@@ -84,6 +86,9 @@ class App:
         self._summary_path = ""
         self._usage_busy = False
         self._usage_items = {}
+        self._usage_sort = {}
+        self._usage_numbers = {}
+        self._login_busy = False
         self._protocol_state = {}
         # 登录二维码弹窗。Tkinter 只能在主线程碰控件，所以监视线程只把路径
         # 丢进 events 队列，由 _drain 在主线程里弹窗。
@@ -219,15 +224,7 @@ class App:
         self.btn_stop = ttk.Button(buttons, text="停止服务", command=self.stop_service, state="disabled")
         self.btn_stop.pack(side="left", padx=8)
 
-        # 摘要只有两种生成方式：
-        #   ① 增量 —— 接着上次总结过的地方继续（日常就是这个）
-        #   ② 按范围 —— 明确「把最近 N 天的消息重做一份」
-        # 原来的「全量重做」没写清范围与字数，用户原话是「意义不明」。
-        self.btn_summary = ttk.Button(
-            buttons, text="生成最新摘要", command=lambda: self.summary_now("digest")
-        )
-        self.btn_summary.pack(side="left")
-        ttk.Label(buttons, text="按范围重做：").pack(side="left", padx=(16, 4))
+        ttk.Label(buttons, text="摘要范围：").pack(side="left", padx=(16, 4))
         self.v_range = tk.StringVar(value=DIGEST_RANGES[0][0])
         self.cb_range = ttk.Combobox(
             buttons,
@@ -240,25 +237,19 @@ class App:
         self.cb_range.pack(side="left")
         self.v_range_desc = tk.StringVar(value=self._range_desc(DIGEST_RANGES[0][0]))
         self.cb_range.bind("<<ComboboxSelected>>", lambda _e: self._on_range_change())
-        self.btn_summary_range = ttk.Button(buttons, text="生成", command=self.summary_by_range, width=6)
-        self.btn_summary_range.pack(side="left", padx=6)
+        self.btn_summary = ttk.Button(buttons, text="生成摘要", command=self.summary_by_range)
+        self.btn_summary.pack(side="left", padx=6)
         ttk.Button(buttons, text="打开数据目录", command=self.open_data_dir).pack(side="right")
 
         buttons2 = ttk.Frame(tab)
         buttons2.pack(fill="x")
         ttk.Label(buttons2, textvariable=self.v_range_desc, style="Hint.TLabel").pack(side="left")
-        # 协议端必须单独启动 —— 本服务只监听它连入。没配置就不显示这几个按钮。
-        # pack(side="right") 是「先 pack 的在最右」，所以下面的书写顺序 = 界面从右往左，
-        # 看的时候请从下往上读：刷新账单 | 启动协议端(NapCat) | 重启协议端。
-        # （「协议端日志」按钮已取消 —— 日志在下方直接切换，不再弹独立窗口。）
+        # 自动登录复用已有进程；强制重启保留为独立的手动恢复入口。
         if self.napcat_script() or self.napcat_dir():
-            # 「重启」紧挨着「启动」：两者只差一个「先清场」，而这正是排障时最容易搞错的一点。
-            # 「启动」只是再注入一份（会和卡住的那份并存）；「重启」才是先全退再重登。
             if napcat_mod.restart_script(self.cfg):
-                ttk.Button(buttons2, text="重启协议端", command=self.restart_napcat).pack(side="right")
-            ttk.Button(
-                buttons2, text="启动协议端(NapCat)", command=self.start_napcat
-            ).pack(side="right")
+                ttk.Button(buttons2, text="强制重启", command=self.restart_napcat).pack(side="right")
+            self.btn_login = ttk.Button(buttons2, text="自动登录", command=self.auto_login)
+            self.btn_login.pack(side="right")
         ttk.Button(buttons2, text="刷新账单", command=self.refresh_billing).pack(side="right", padx=8)
 
         progress = ttk.Frame(tab)
@@ -896,21 +887,26 @@ class App:
         ttk.Button(tab, text="刷新消费明细", command=self.refresh_usage).pack(anchor="w")
         self.v_usage = tk.StringVar(value="升级后开始逐次记录；Token 来自 API，金额按配置费率估算。")
         ttk.Label(tab, textvariable=self.v_usage, wraplength=880).pack(fill="x", pady=6)
-        self.usage_groups = ttk.Treeview(tab, columns=("purpose", "type", "calls", "input", "output", "cost"),
+        self.usage_groups = ttk.Treeview(tab, columns=("purpose", "type", "calls", "input", "output", "cost", "retired"),
                                         show="headings", height=6)
         for key, label, width in (("purpose", "用途", 150), ("type", "消息类型", 120), ("calls", "请求数", 70),
-                                  ("input", "输入 Token", 100), ("output", "输出 Token", 100), ("cost", "金额（元）", 110)):
+                                  ("input", "输入 Token", 100), ("output", "输出 Token", 100), ("cost", "金额（元）", 110),
+                                  ("retired", "用途状态", 70)):
             self.usage_groups.heading(key, text=label)
+            if key in ("calls", "input", "output", "cost"):
+                self.usage_groups.heading(key, command=lambda k=key: self._sort_usage(self.usage_groups, k))
             self.usage_groups.column(key, width=width, stretch=True)
         self.usage_groups.pack(fill="x", pady=(0, 10))
-        ttk.Label(tab, text="最近 500 次请求（上方分类汇总覆盖全部明细）；选中一行查看关联消息").pack(anchor="w")
+        ttk.Label(tab, text="点击请求数、Token 或金额表头排序；最近 500 次请求，选中一行查看关联消息（上方汇总覆盖全部明细）").pack(anchor="w")
         frame = ttk.Frame(tab)
         frame.pack(fill="both", expand=True)
-        columns = ("time", "purpose", "source", "input", "output", "cache", "cost", "state")
+        columns = ("time", "purpose", "source", "input", "output", "cache", "cost", "state", "retired")
         self.usage_table = ttk.Treeview(frame, columns=columns, show="headings", height=9)
-        for key, label, width in zip(columns, ("时间", "用途", "消息/任务", "输入", "输出", "缓存命中", "元（估算）", "结果"),
-                                   (125, 100, 115, 70, 70, 75, 95, 130)):
+        for key, label, width in zip(columns, ("时间", "用途", "消息/任务", "输入", "输出", "缓存命中", "元（估算）", "结果", "用途状态"),
+                                   (125, 100, 115, 70, 70, 75, 95, 130, 70)):
             self.usage_table.heading(key, text=label)
+            if key in ("input", "output", "cache", "cost"):
+                self.usage_table.heading(key, command=lambda k=key: self._sort_usage(self.usage_table, k))
             self.usage_table.column(key, width=width, stretch=True)
         scroll = ttk.Scrollbar(frame, command=self.usage_table.yview)
         self.usage_table.configure(yscrollcommand=scroll.set)
@@ -946,16 +942,39 @@ class App:
         self.v_usage.set(f"已归因 ¥{data.get('recorded_cost_cny', 0):.6f}；历史未归因 ¥{data.get('historical_unattributed_cny', 0):.6f}。"
                          "Token 为 API 返回值，金额按配置费率估算；无返回用量的失败显示未知。")
         self.usage_groups.delete(*self.usage_groups.get_children())
+        self._usage_numbers = {self.usage_groups: {}, self.usage_table: {}}
         for row in data.get("groups", []):
-            self.usage_groups.insert("", "end", values=(row["purpose"], row["source_type"], row["calls"],
+            iid = self.usage_groups.insert("", "end", values=(row["purpose"], row["source_type"], row["calls"],
                 row["in_tokens"] or 0, row["out_tokens"] or 0,
-                f"{row['cost_cny']:.6f}" + (f" + {row['unknown_calls']} 次未知" if row["unknown_calls"] else "")))
+                f"{row['cost_cny']:.6f}" + (f" + {row['unknown_calls']} 次未知" if row["unknown_calls"] else ""),
+                "已弃用" if row["purpose"] in RETIRED_PURPOSES else "使用中"))
+            self._usage_numbers[self.usage_groups][iid] = dict(calls=row["calls"], input=row["in_tokens"],
+                                                              output=row["out_tokens"], cost=row["cost_cny"])
         self.usage_table.delete(*self.usage_table.get_children())
         self._usage_items = {str(r["id"]): r for r in data.get("items", [])}
         for iid, row in self._usage_items.items():
             self.usage_table.insert("", "end", iid=iid, values=(time.strftime("%m-%d %H:%M:%S", time.localtime(row["ts"])),
                 row["purpose"], row["source_label"], *[row[k] if row[k] is not None else "未知" for k in ("in_tokens", "out_tokens", "cache_hit_tokens")],
-                f"{row['cost_cny']:.6f}" if row["cost_cny"] is not None else "未知", row["status"]))
+                f"{row['cost_cny']:.6f}" if row["cost_cny"] is not None else "未知", row["status"],
+                "已弃用" if row["purpose"] in RETIRED_PURPOSES else "使用中"))
+            self._usage_numbers[self.usage_table][iid] = dict(input=row["in_tokens"], output=row["out_tokens"],
+                                                             cache=row["cache_hit_tokens"], cost=row["cost_cny"])
+        for tree, (key, descending) in self._usage_sort.items():
+            self._sort_usage(tree, key, descending)
+
+    def _sort_usage(self, tree, key: str, descending: bool | None = None) -> None:
+        if descending is None:
+            previous = self._usage_sort.get(tree)
+            descending = not previous[1] if previous and previous[0] == key else True
+        self._usage_sort[tree] = (key, descending)
+        values = self._usage_numbers.get(tree, {})
+        known = [iid for iid in tree.get_children() if values[iid][key] is not None]
+        unknown = [iid for iid in tree.get_children() if values[iid][key] is None]
+        for index, iid in enumerate(sorted(known, key=lambda item: values[item][key], reverse=descending) + unknown):
+            tree.move(iid, "", index)
+        for column in tree["columns"]:
+            label = tree.heading(column, "text").removesuffix(" ▼").removesuffix(" ▲")
+            tree.heading(column, text=label + ((" ▼" if descending else " ▲") if column == key else ""))
 
     def _usage_selected(self, _event=None) -> None:
         selection = self.usage_table.selection()
@@ -997,7 +1016,6 @@ class App:
         self._summary_busy = False
         self.summary_bar.stop()
         self.btn_summary.configure(state="normal")
-        self.btn_summary_range.configure(state="normal")
         if data.get("error"):
             note = f"摘要生成失败：{data['error']}"
         elif not data.get("created"):
@@ -1102,7 +1120,6 @@ class App:
         self._summary_busy = True
         self._summary_started = time.time()
         self.btn_summary.configure(state="disabled")
-        self.btn_summary_range.configure(state="disabled")
         self.summary_bar.start(12)
         options = self._summary_options()
         target = f"最近 {hours // 24} 天" if kind == "range" and hours else "增量"
@@ -1363,72 +1380,39 @@ class App:
         p = Path(raw)
         return p if p.is_absolute() else ROOT / p
 
-    def start_napcat(self) -> None:
-        """拉起协议端（NapCat）。
-
-        默认走**隐藏模式**：不再往任务栏里塞一个永久挂着的 CMD 黑框。
-        那个黑框的成因是包装脚本末尾的 ``pause`` —— 真正的启动动作（向 QQ 注入
-        DLL）几秒就结束了，窗口却会一直留着。隐藏模式用 wscript 以窗口样式 0
-        拉起 launcher.bat：全程无窗口，失败会弹消息框，不会静默。
-
-        UAC 弹窗仍然会有：注入 DLL 必须是管理员，这是设计使然，不是缺陷。
-        想看完整输出就在设置页取消勾选「隐藏控制台窗口启动」。
-        """
+    def auto_login(self) -> None:
+        if self._login_busy:
+            return
+        self._login_busy = True
+        self.btn_login.configure(state="disabled")
+        note = "正在自动登录：复用已保存账号；协议端未运行时将请求启动（可能需要 UAC 授权）…"
+        self.status.set(note)
+        self._log_ui(f"[界面] {note}\n")
         visible = not bool(self.v_napcat_hidden.get())
 
-        # 启动前先问一句「是不是已经在跑了」。
-        # 点一次 = 注入一份 NapCat **并且再拉起一份 QQ**；用户看到「没反应」很容易反复点，
-        # 于是多份实例并存、各自往 cache/qrcode.png 写二维码互相覆盖 ——
-        # 扫哪一次都可能立刻被下一次覆盖掉，谁也登不上。表现恰好就是
-        # 「点了很多次，消息一直不来」。所以这里必须拦一下，而不是默默再注入一份。
-        try:
-            ri = napcat_mod.running_instances()
-        except Exception:  # noqa: BLE001  查不到就当没有，不要因此拦住正常启动
-            ri = {"injectors": 0, "qq": 0, "any": False}
-        if ri.get("injectors"):
-            n = int(ri["injectors"])
-            tail = (
-                "已经有 %d 个了，说明之前点过多次。\n"
-                "多份实例会互相覆盖二维码，导致扫码无效、消息一直不来。\n"
-                "建议：先把它们全部关掉，再启动一次、只扫一次码。" % n
-                if n >= 2
-                else "如果你只是想重新扫码，更好的做法是先关掉这一份，再启动。"
-            )
-            # QQ.exe 天然会有 3~4 个（1 个主进程 + 渲染/GPU 等辅助进程），单看这个数字
-            # 会让人以为「怎么这么多」，所以只在注入器数上做判断，并把后者写明。
-            if not messagebox.askyesno(
-                "协议端似乎已经在运行",
-                "检测到已有 %d 个 NapCat 注入器、%d 个 QQ.exe 进程"
-                "（QQ.exe 通常有 3~4 个辅助进程，属正常）。\n\n"
-                "再启动会再注入一份 NapCat，并再拉起一份 QQ。\n\n%s\n\n仍要再启动一个吗？"
-                % (n, int(ri.get("qq") or 0), tail),
-                parent=self.root,
-            ):
-                self._log_ui("[界面] 已取消启动（检测到已有 %d 个协议端实例）\n" % n)
-                self.status.set("已取消：协议端看起来已在运行，无需重复启动")
-                return
+        def work() -> None:
+            try:
+                if not napcat_mod.running_instances().get("injectors"):
+                    result = napcat_mod.launch(self.cfg, visible=visible)
+                    if not result.get("ok"):
+                        self.events.put(("login_done", {"ok": False, "note": result.get("error", "启动失败")}))
+                        return
+                self.events.put(("login_done", napcat_mod.quick_login(self.cfg)))
+            except Exception:
+                self.events.put(("login_done", {"ok": False, "note": "自动登录异常，请查看协议端日志"}))
 
-        self._log_ui(f"[界面] 正在启动协议端（{'可见' if visible else '隐藏'}模式）…\n")
-        self.status.set("已请求启动 NapCat —— 请在 UAC 窗口点「是」，再完成扫码登录")
-        qr_since = time.time()
-        try:
-            r = napcat_mod.launch(self.cfg, visible=visible)
-        except Exception as exc:  # noqa: BLE001
-            self._log_ui(f"[界面] 启动协议端异常：{exc}\n")
-            self.status.set(f"启动协议端失败：{exc}")
-            return
-        if not r.get("ok"):
-            self._log_ui(f"[界面] 启动协议端失败：{r.get('error')}\n")
-            self.status.set(f"启动协议端失败：{r.get('error') or '未知错误'}")
-            return
-        self._log_ui(f"[界面] {r.get('note') or ''}\n")
-        self._log_ui(f"[界面] 启动记录：{r.get('log')}（运行状态页下方「日志」可切换到「协议端日志」查看）\n")
-        self._log_ui(
-            "[界面] NapCat 要先注入 QQ 再登录，通常需要 10~30 秒。\n"
-            "[界面] 连上后上方「协议端(NapCat)」会自己变成「已连接」，无需重启服务。\n"
-        )
-        if self.napcat_dir():
-            self._start_qrcode_watch(since=qr_since)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _login_finished(self, result: dict) -> None:
+        self._login_busy = False
+        self.btn_login.configure(state="normal")
+        self.status.set(result["note"])
+        self._log_ui(f"[界面] {result['note']}\n")
+        if result.get("ok"):
+            self.qr_watching = False
+            self._close_qrcode()
+        elif result.get("scan"):
+            self._start_qrcode_watch(fresh_only=True, since=time.time() - 120)
 
     def relogin_napcat(self) -> None:
         """优先展示协议端自行生成的新码，避免为扫码再启动一份 QQ。"""
@@ -1447,35 +1431,26 @@ class App:
             self.restart_napcat()
 
     def restart_napcat(self) -> None:
-        """一键重置协议端：把所有注入器与 QQ.exe **全退掉**，再重新拉起。
-
-        和「启动协议端(NapCat)」的区别只在一件事上：**先清场**。
-        协议端卡住时（连着、能应答 API，却一条消息都不推），再点「启动」只会多注入
-        一份实例 —— 两份各自往 ``cache\\qrcode.png`` 写二维码互相覆盖，扫哪一次都可能
-        立刻失效，表现仍然是「消息一直不来」。所以卡住时该点的是这个按钮。
-
-        代价要说清楚：QQ 会被一起重启，**大概率需要重新扫码登录**。
-        这不是缺陷，是「重新登一次」这个动作本身的一部分。
-        """
+        """手动强制重启：保留全退再拉起的恢复方式，必须先确认影响范围。"""
         script = napcat_mod.restart_script(self.cfg)
         if script is None or not script.exists():
             self.status.set("无法重置：没有找到重置脚本，请检查 config.toml 的 [napcat] restart_script。")
             self._log_ui(f"[界面] {self.status.get()}\n")
             return
         if not messagebox.askyesno(
-            "重置协议端（全退 + 重登）",
+            "强制重启协议端（全退 + 重登）",
             "这一步会：\n"
             "  1. 强行结束**所有** NapCat 注入器和 QQ.exe（包括你自己的 QQ 窗口）\n"
             "  2. 再重新注入并拉起 QQ\n"
-            "  3. **需要重新扫码登录**（二维码会自动弹出）\n\n"
-            "请先确认无法使用当前二维码恢复登录。要现在重置吗？",
+            "  3. 已设置的账号将尝试自动登录；凭证失效时需要重新扫码\n\n"
+            "要现在强制重启吗？",
             parent=self.root,
         ):
             self.status.set("已取消重置协议端")
             return
 
         self._log_ui("[界面] 正在请求重置协议端（会弹一次 UAC，请点「是」）…\n")
-        self.status.set("已请求重置 —— 请在 UAC 窗口点「是」，然后扫码登录")
+        self.status.set("已请求强制重启 —— 请在 UAC 窗口点「是」，等待自动登录或扫码")
         # v0.5.7：在提权调用前记下起点，避免返回时新码已写好却被当成旧基线。
         qr_since = time.time()
         self._trace_gui("请求重置协议端")
@@ -1733,6 +1708,8 @@ class App:
             self._render_messages(value)
         elif kind == "summary_done":
             self._summary_finished(value)
+        elif kind == "login_done":
+            self._login_finished(value)
         elif kind == "usage":
             self._render_usage(value)
         elif kind == "usage_sources":
@@ -1772,7 +1749,7 @@ class App:
         self.v_protocol_detail.set(protocol.get("message", "") if state != "connected" else "")
         self.btn_relogin.grid_remove()
         if state == "login_required":
-            self.v_peer.set("QQ 登录失效 · 需要扫码")
+            self.v_peer.set("QQ 登录失效 · 等待自动登录或扫码")
             self.btn_relogin.grid()
         elif state == "offline":
             self.v_peer.set("连接存在 · QQ 已离线")
@@ -1789,7 +1766,7 @@ class App:
         elif state == "disconnected":
             self.v_peer.set("连接中断 · 等待自动重连")
         elif self.napcat_script() or self.napcat_dir():
-            self.v_peer.set("未连接 —— 请点「启动协议端(NapCat)」")
+            self.v_peer.set("协议端未连接 —— 请点「自动登录」")
         else:
             self.v_peer.set("未连接（NapCat 未启动）")
 

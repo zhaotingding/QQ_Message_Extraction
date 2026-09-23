@@ -80,16 +80,12 @@ check("滚动容器已设滚动区域", bool(canvases and canvases[0].cget("scro
 wheel_bound = [w for w in allw if w.bind("<MouseWheel>") and not isinstance(w, (tk.Text, tk.Listbox))]
 check("滚轮已绑到设置页控件上", len(wheel_bound) >= 5, f"{len(wheel_bound)} 个控件")
 buttons = [str(w.cget("text")) for w in allw if isinstance(w, ttk.Button)]
-check("有增量摘要按钮", any("最新摘要" in b for b in buttons), str(buttons))
+check("只有一个摘要按钮", buttons.count("生成摘要") == 1 and "生成最新摘要" not in buttons, str(buttons))
 # v0.5.0：原来的「全量重做」被换成「范围下拉 + 生成」——因为它没说清范围与字数，
 # 用户原话是「意义不明」。这里锁死「不再有那个按钮」+「必须有范围选择器」。
 check("不再有说不清范围的『全量重做』", not any("全量" in b for b in buttons), str(buttons))
-# v0.5.4：把 tools\重启协议端.bat 搬进界面，紧挨着「启动协议端」。
-# 两者的区别只在一件事上 —— **先清场**，而这正是排障时最容易搞错的一点：
-# 「启动」只是再注入一份（会和卡住的那份并存、二维码互相覆盖），
-# 「重启」才是先全退再重登。所以这个按钮必须在，且必须和「启动」挨着。
-check("有「重启协议端」按钮（全退 + 重登）",
-      any("重启协议端" in b for b in buttons), str(buttons))
+check("保留强制重启并替换原启动入口", "强制重启" in buttons and "自动登录" in buttons
+      and "启动协议端(NapCat)" not in buttons, str(buttons))
 # v0.5.4：群列表是历次登录的并集，换过账号就会混进别的账号的群，得有个清理入口。
 check("有「只保留当前账号的群」按钮",
       any("只保留当前账号" in b for b in buttons), str(buttons))
@@ -452,7 +448,6 @@ import subprocess as _sp  # noqa: E402
 
 _orig_sp_run = _sp.run
 _orig_running = N.running_instances
-_orig_launch = N.launch
 
 
 class _FakeProc:
@@ -501,54 +496,8 @@ check("dir 留空时仍给出可读说明且不下否定结论",
       ("未配置" in _txt3 or "logs" in _txt3) and "从未成功启动" not in _txt3, _txt3[-160:])
 N.running_instances = _orig_running  # type: ignore[assignment]
 
-print("\n=== 启动前拦截重复注入（v0.5.2）===")
-app.cfg["napcat"] = {"dir": "tests/nonexistent-napcat"}  # 不碰真实协议端的二维码
-_calls = {"n": 0}
-
-
-def _fake_launch(*a, **k):
-    _calls["n"] += 1
-    return {"ok": True, "note": "stub"}
-
-
-N.launch = _fake_launch  # type: ignore[assignment]
 import tkinter.messagebox as _mb  # noqa: E402
-
-_orig_ask = _mb.askyesno
-_asked = {"n": 0, "msg": ""}
-
-
-def _ask_no(*a, **k):
-    _asked["n"] += 1
-    # 记下弹窗正文：文案本身也是契约的一部分（见下面的检查）
-    parts = [str(x) for x in a] + [str(v) for v in k.values()]
-    _asked["msg"] = "\n".join(parts)
-    return False
-
-
-N.running_instances = lambda: {"injectors": 3, "qq": 12, "any": True}  # type: ignore[assignment]
-_mb.askyesno = _ask_no  # type: ignore[assignment]
-app.start_napcat()
-check("检测到已有实例时先问一句", _asked["n"] == 1, str(_asked["n"]))
-# 正常状态下 QQ.exe 就有 3~4 个（1 主进程 + 辅助进程），单看它会让人以为「怎么这么多」。
-# 判定只看注入器数，QQ.exe 的数量必须在文案里说明白，否则弹窗本身就成了新的误导源。
-check("弹窗说明了 QQ.exe 有辅助进程、数量多属正常",
-      "辅助进程" in _asked["msg"], _asked["msg"][:160])
-check("用户选「否」时不再注入一份", _calls["n"] == 0, str(_calls))
-check("取消时状态栏说清原因", "已在运行" in app.status.get() or "取消" in app.status.get(),
-      app.status.get())
-
-_mb.askyesno = lambda *a, **k: True  # type: ignore[assignment]
-app.start_napcat()
-check("用户确认「是」时照旧启动（不挡用户）", _calls["n"] == 1, str(_calls))
-
-N.running_instances = lambda: {"injectors": 0, "qq": 0, "any": False}  # type: ignore[assignment]
-app.start_napcat()
-check("没有实例时不打扰用户、直接启动", _calls["n"] == 2, str(_calls))
-
-_mb.askyesno = _orig_ask  # type: ignore[assignment]
-N.running_instances = _orig_running  # type: ignore[assignment]
-N.launch = _orig_launch  # type: ignore[assignment]
+app.cfg["napcat"] = {"dir": "tests/nonexistent-napcat"}  # 不碰真实协议端的二维码
 
 # ---------------------------------------------------------------------------
 # v0.5.6：「重启协议端后二维码从不弹出」的三处修复。
@@ -744,7 +693,7 @@ with patch("msgx.gui.threading.Thread") as _thread:
     app.summary_now("range", 72)
     app.summary_now("range", 72)
     check("点击立即标记忙碌并阻止重复请求", app._summary_busy and _thread.call_count == 1)
-    check("生成期间两个入口禁用", app.btn_summary.instate(["disabled"]) and app.btn_summary_range.instate(["disabled"]))
+    check("生成期间唯一入口禁用", app.btn_summary.instate(["disabled"]) and not hasattr(app, "btn_summary_range"))
     check("无需等 API 即可看到开始日志", "开始生成最近 3 天摘要" in app.log.get("1.0", "end"))
     check("日志采用已保存目标字数", "目标约 4200 字" in app.v_summary.get())
     with patch("msgx.gui.urllib.request.build_opener") as _opener:
@@ -760,7 +709,7 @@ with patch("msgx.gui.threading.Thread") as _thread:
     check("阶段进度和耗时可见", "第 2/6 块" in app.v_summary.get() and "秒" in app.v_summary.get())
     app._summary_finished({"error": "模型输出未完成"})
     check("失败恢复按钮并明确原因", not app._summary_busy and app.btn_summary.instate(["!disabled"])
-          and app.btn_summary_range.instate(["!disabled"]) and "输出未完成" in app.v_summary.get())
+          and "输出未完成" in app.v_summary.get())
     _full_text = "# 本期讨论总览\n\n**工具进展**\n\n" + "完整保留的内容。" * 400 + "\n\n**后续事项**\n\n全文最后一句。"
     _report_path = str((PROJ / "data" / "reports" / "gui-test-full.html").resolve())
     app._summary_finished({"created": [{"path": _report_path, "content": _full_text, "chars": len(_full_text)}]})
@@ -831,8 +780,11 @@ with patch.object(_mb, "showinfo") as _info, patch.object(_mb, "showerror") as _
     app.proc = _saved_proc
 
     with patch.object(N, "running_instances", return_value={"injectors": 0}), \
-            patch.object(N, "launch", return_value={"ok": False, "error": "测试协议端启动失败"}):
-        app.start_napcat()
+            patch.object(N, "launch", return_value={"ok": False, "error": "测试协议端启动失败"}), \
+            patch("msgx.gui.threading.Thread") as _thread, patch.object(app.events, "put") as _put:
+        app.auto_login()
+        _thread.call_args.kwargs["target"]()
+        app._dispatch_event(*_put.call_args.args[0])
     check("协议端失败留在状态栏和日志", "测试协议端启动失败" in app.status.get()
           and "测试协议端启动失败" in app.log.get("1.0", "end"))
     app._dispatch_event("exit", 1)
@@ -859,6 +811,57 @@ app._apply_health({"protocol": {"state": "disconnected", "message": "等待 NapC
 check("普通断线不诱导重复启动", "自动重连" in app.v_peer.get() and not app.btn_relogin.grid_info())
 app._apply_health({"ws_peers": ["127.0.0.1"], "protocol": {"state": "connected"}})
 check("重连后清除登录故障说明", "已连接" in app.v_peer.get() and not app.v_protocol_detail.get())
+
+print("\n=== 0.6.4 自动登录、合并入口与消费排序 ===")
+check("登录入口改为自动登录", app.btn_login.cget("text") == "自动登录")
+with patch.object(app, "summary_now") as _summary:
+    app.v_range.set("最近 3 天")
+    app.btn_summary.invoke()
+    check("唯一生成按钮按所选范围提交", _summary.call_args.args == ("range",) and _summary.call_args.kwargs == {"hours": 72})
+with patch("msgx.gui.threading.Thread") as _thread, patch.object(N, "running_instances", return_value={"injectors": 1}), \
+        patch.object(N, "launch") as _launch, patch.object(N, "quick_login", return_value={"ok": True, "note": "自动登录成功"}) as _quick:
+    app.auto_login()
+    app.auto_login()
+    check("自动登录防止重复点击且立即提示", _thread.call_count == 1 and app.btn_login.instate(["disabled"])
+          and "正在自动登录" in app.status.get())
+    _thread.call_args.kwargs["target"]()
+    check("已有实例只复用登录，不再启动第二份 QQ", _quick.call_count == 1 and not _launch.called)
+    app._login_finished({"ok": True, "note": "自动登录成功"})
+    check("登录完成恢复按钮", not app._login_busy and app.btn_login.instate(["!disabled"]))
+with patch("msgx.gui.threading.Thread") as _thread, patch.object(N, "running_instances", return_value={"injectors": 0}), \
+        patch.object(N, "launch", return_value={"ok": True}) as _launch, \
+        patch.object(N, "quick_login", return_value={"ok": False, "scan": True, "note": "请重新扫码"}) as _quick, \
+        patch.object(app, "_start_qrcode_watch") as _watch, patch.object(N, "restart") as _restart:
+    app.auto_login()
+    _thread.call_args.kwargs["target"]()
+    check("未启动时只启动一份后尝试凭证登录", _launch.call_count == 1 and _quick.call_count == 1)
+    app._login_finished({"ok": False, "scan": True, "note": "请重新扫码"})
+    check("凭证失败给扫码入口而非强制重启", _watch.called and not _restart.called)
+
+_usage_data = {"groups": [], "items": []}
+for _i, (_purpose, _cost, _tokens, _calls) in enumerate([
+        ("摘要总结", 2.0, 9, 12), ("消息评分", 10.0, 100, 2), ("纪要分块", 0.5, 11, 100)]):
+    _usage_data["groups"].append(dict(purpose=_purpose, source_type="文字", calls=_calls,
+        in_tokens=_tokens, out_tokens=_tokens * 2, cost_cny=_cost, unknown_calls=1))
+    _usage_data["items"].append(dict(id=_i, ts=time.time(), purpose=_purpose, source_type="文字", source_label="测试",
+        model="test", in_tokens=_tokens, out_tokens=_tokens * 2, cache_hit_tokens=0, cost_cny=_cost, status="完成"))
+_usage_data["items"].append(dict(_usage_data["items"][0], id=3, cost_cny=None, in_tokens=None))
+app._render_usage(_usage_data)
+check("现用摘要不被误标弃用，历史记录标注弃用", app.usage_table.set("0", "retired") == "使用中"
+      and app.usage_table.set("1", "retired") == "已弃用" and app.usage_table.set("2", "retired") == "已弃用")
+for _key, _expected in [("cost", ["消息评分", "摘要总结", "纪要分块"]),
+                         ("calls", ["纪要分块", "摘要总结", "消息评分"]),
+                         ("input", ["消息评分", "纪要分块", "摘要总结"]),
+                         ("output", ["消息评分", "纪要分块", "摘要总结"])]:
+    app._sort_usage(app.usage_groups, _key)
+    check(f"汇总 {_key} 按数值降序", [app.usage_groups.set(i, "purpose") for i in app.usage_groups.get_children()] == _expected)
+app._sort_usage(app.usage_table, "cost")
+check("明细金额数值降序且未知在末尾", app.usage_table.get_children() == ("1", "0", "2", "3"))
+app._sort_usage(app.usage_table, "cost")
+check("再次点击升序且未知仍在末尾", app.usage_table.get_children() == ("2", "0", "1", "3"))
+app._render_usage(_usage_data)
+check("刷新后保留排序方向", app.usage_table.get_children() == ("2", "0", "1", "3")
+      and app.usage_table.heading("cost", "text").endswith("▲"))
 
 root.update()
 root.destroy()

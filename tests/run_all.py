@@ -28,6 +28,7 @@ SUITES = [
     ("无额外推理与过滤链路", "test_pipeline.py"),
     ("服务生命周期", "test_service.py"),
     ("断线原因与重连", "test_connection.py"),
+    ("缓存凭证自动登录", "test_login.py"),
     ("界面构建", "test_gui.py"),
 ]
 

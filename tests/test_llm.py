@@ -300,6 +300,7 @@ async def image_without_probe():
         text, ok = await llm.describe_image(image, "提取图片", source_ids=[12])
         check("旧失败探测缓存不会阻止真实图片解析", ok and text == "图片中的运行日志")
         check("解析图片只有一次请求，没有前置测试图片", len(sent) == 1)
+        check("图片解析预留 2000 输出 Token", sent[0]["max_tokens"] == 2000)
         check("解析费用关联原消息", llm.store.details[0]["source_ids"] == [12])
         check("旧探测文件原样保留", old_cache.read_text("utf-8") == '{"vision": false}')
         llm.cfg["media"] = {"vision_enabled": False}

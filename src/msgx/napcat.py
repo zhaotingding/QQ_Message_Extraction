@@ -38,9 +38,13 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import re
 import subprocess
 import time
+import urllib.request
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 
@@ -244,6 +248,94 @@ def running_instances() -> dict:
     injectors = _tasklist_count("NapCatWinBootMain.exe")
     qq = _tasklist_count("QQ.exe")
     return {"injectors": injectors, "qq": qq, "any": injectors > 0}
+
+
+class _WebUI:
+    """只通过本机管理接口复用凭证；不读取或保存 QQ 密码。"""
+
+    def __init__(self, dir_: Path):
+        cfg = json.loads((dir_ / "config" / "webui.json").read_text(encoding="utf-8-sig"))
+        self.url = f"http://127.0.0.1:{int(cfg.get('port', 6099))}/api"
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.credential = ""
+        digest = hashlib.sha256((cfg["token"] + ".napcat").encode()).hexdigest()
+        data = self.call("/auth/login", {"hash": digest}) or {}
+        if data.get("require2FA") or not data.get("Credential"):
+            raise RuntimeError("NapCat 管理接口需要手动验证，请先在 WebUI 完成认证")
+        self.credential = data["Credential"]
+
+    def call(self, path: str, data: dict | None = None):
+        req = urllib.request.Request(self.url + path, data=json.dumps(data or {}).encode(),
+                                     headers={"Content-Type": "application/json",
+                                              "Authorization": f"Bearer {self.credential}"})
+        with self.opener.open(req, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        if result.get("code") != 0:
+            # 不把管理接口的原始响应写进日志，以免泄露令牌或登录验证信息。
+            raise RuntimeError(f"NapCat 接口 {path.rsplit('/', 1)[-1]} 未成功（code={result.get('code')}）")
+        return result.get("data")
+
+
+def quick_login(cfg: dict, wait_seconds: float = 60) -> dict:
+    """启用原生自动登录，并在离线时尝试一次；不重启、不循环提交凭证。"""
+    dir_ = resolve_dir(cfg)
+    if dir_ is None:
+        return {"ok": False, "note": "未找到 NapCat 安装目录"}
+    deadline = time.monotonic() + wait_seconds
+    client = None
+    submitted = False
+    account = ""
+    try:
+        while True:
+            try:
+                if client is None:
+                    client = _WebUI(dir_)
+                state = client.call("/QQLogin/CheckLoginStatus") or {}
+            except urllib.error.HTTPError:
+                return {"ok": False, "note": "NapCat 管理接口认证或请求失败，请查看协议端日志"}
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                # 启动或原生 Worker 重建期间仅等待接口，不启动第二份进程。
+                client = None
+                if time.monotonic() >= deadline:
+                    return {"ok": False, "note": "等待 NapCat 登录接口超时；请查看协议端日志，必要时强制重启"}
+                time.sleep(1)
+                continue
+            if state.get("isLogin") and state.get("coreReady"):
+                info = client.call("/QQLogin/GetQQLoginInfo") or {}
+                account = str(info.get("uin") or account)
+                if not account.isdigit():
+                    return {"ok": False, "note": "QQ 已在线，但未能读取账号，尚未启用自动登录"}
+                if str(client.call("/QQLogin/GetQuickLoginQQ") or "") != account:
+                    client.call("/QQLogin/SetQuickLoginQQ", {"uin": account})
+                return {"ok": True, "account": account,
+                        "note": f"QQ {account} 登录成功，已启用自动登录"}
+            phase = state.get("loginPhase")
+            if not submitted and phase == "waiting_qrcode":
+                account = str(client.call("/QQLogin/GetQuickLoginQQ") or "")
+                accounts = [str(item) for item in (client.call("/QQLogin/GetQuickLoginList") or [])]
+                if not account and len(accounts) == 1:
+                    account = accounts[0]
+                if not account:
+                    return {"ok": False, "scan": not accounts,
+                            "note": "未保存可快速登录的账号，请扫码登录后再点自动登录" if not accounts else
+                                    "存在多个已保存账号，请先在 NapCat WebUI 选择自动登录账号"}
+                if account not in accounts:
+                    return {"ok": False, "scan": True,
+                            "note": "指定账号已无可用快速登录凭证，请重新扫码后再点自动登录"}
+                client.call("/QQLogin/SetQuickLoginQQ", {"uin": account})
+                submitted = True
+                try:
+                    client.call("/QQLogin/SetQuickLogin", {"uin": account})
+                except RuntimeError:
+                    return {"ok": False, "scan": True,
+                            "note": "快速登录未成功，请重新扫码；本次不再重复尝试"}
+            if time.monotonic() >= deadline:
+                return {"ok": False, "scan": phase == "waiting_qrcode",
+                        "note": "等待 QQ 登录完成超时，请查看协议端日志；本次不再重复尝试"}
+            time.sleep(1)
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        return {"ok": False, "note": str(exc) if isinstance(exc, RuntimeError) else
+                "无法读取或使用 NapCat 本机登录配置，请查看协议端日志"}
 
 
 # ---------------------------------------------------------------- 日志
@@ -520,7 +612,7 @@ def restart(cfg: dict) -> dict:
         "ok": True,
         "dir": str(d),
         "log": str(lp),
-        "note": "已请求重置：点一次 UAC 的「是」即可，全程无黑框。二维码图片会在几秒到半分钟后自动弹出，直接扫它。",
+        "note": "已请求强制重启：点一次 UAC 的「是」即可。优先使用已设置账号自动登录；无法恢复时再扫码。",
     }
 
 
@@ -552,7 +644,7 @@ def login_failure(cfg: dict, since: float = 0.0) -> dict:
             if at < since:
                 return {}
             return {"state": "login_required", "since": at,
-                    "message": "QQ 登录已失效，需要重新扫码；重连本地接口无法恢复登录",
+                    "message": "QQ 登录已失效，等待协议端自动登录；凭证不可用时需要重新扫码",
                     "evidence": event[:400], "log_path": str(path)}
     except (OSError, ValueError):
         pass

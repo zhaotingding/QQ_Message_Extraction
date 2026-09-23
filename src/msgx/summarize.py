@@ -290,7 +290,7 @@ class Summarizer:
             if tokens <= input_limit:
                 self._progress("正在一次提交全部消息并等待完整摘要" if not checkpoint else "正在一次合并全部分块结果")
                 return await self._request(system, body, source_ids, output_tokens,
-                                           "摘要总结" if not checkpoint else "摘要合并", checkpoint)
+                                           "摘要总结" if not checkpoint else "超上下文合并", checkpoint)
             checkpoint = True
             part_header = "本次完整材料超过单次上下文。请归纳以下部分的重要主题，供随后合并：\n\n"
             available = input_limit - estimate_tokens(system) - estimate_tokens(part_header) - 128

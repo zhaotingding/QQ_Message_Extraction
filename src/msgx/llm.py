@@ -490,7 +490,7 @@ class LLM:
                     ],
                 }
             ],
-            "max_tokens": 400,
+            "max_tokens": 2000,
             "temperature": 0.2,
             "stream": False,
             "reasoning_effort": "none",

@@ -174,6 +174,7 @@ async def main():
             result = await sm.run_digest(full=True, target_chars=500)
         check("手动重试复用已完成分块", sum(c[1] == first_body for c in llm.calls) == 1)
         check("分批后最终合并关联全部消息", llm.calls[-1][2]["source_ids"] == ids and result["count"] == 12)
+        check("超上下文合并不复用已弃用用途名", llm.calls[-1][2]["purpose"] == "超上下文合并")
         check("分块和合并请求都留有上下文输出空间", all(
               S.estimate_tokens(c[0]) + S.estimate_tokens(c[1]) + 128 + c[2]["max_tokens"] + 2048 <= 12000
               for c in llm.calls))
