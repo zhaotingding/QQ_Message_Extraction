@@ -170,3 +170,22 @@ timeout_seconds  = 20
 [retention]
 keep_days_raw   = 90
 keep_days_media = 30
+
+
+# 0.7.0 默认 API；密钥只存 Windows 凭据管理器，不得写入此文件。
+[api]
+provider = "OpenAI 官方"
+base_url = "https://api.openai.com/v1"
+protocol = "responses"
+model = "gpt-6-luna"
+reasoning = "none"
+context_tokens = 1050000
+max_output_tokens = 128000
+input_price = 0.1
+cached_price = 0.01
+output_price = 0.5
+currency = "USD"
+usd_cny = 7.0
+long_context_threshold = 272000
+long_input_multiplier = 2.0
+long_output_multiplier = 1.5

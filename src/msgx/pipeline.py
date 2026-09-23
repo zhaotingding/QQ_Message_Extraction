@@ -98,7 +98,7 @@ class Pipeline:
     async def start(self) -> None:
         log.info("LLM 可用: %s | 预算上限 %.2f 元/日", self.llm.available, self.cfg["llm"]["max_daily_cost_cny"])
         if not self.llm.available:
-            log.warning("未检测到 DEEPSEEK_API_KEY，仅接收和存储消息，不调用模型")
+            log.warning("未配置当前 API 的密钥，仅接收和存储消息，不调用模型")
         self._tasks = [
             # ingest 必须在这里启动：_ws 回调只往 ingest_q 里塞事件，
             # 少了这个消费者，消息会全部堆在队列里（上限 5000）然后在进程退出时静默丢失，
@@ -530,6 +530,18 @@ class Pipeline:
             est_today = float(self.store.daily_cost_cny(date.today().isoformat()))
             est_total = float(est_total_row.get("cost_cny", 0.0))
 
+            if "api" in self.cfg:
+                # 新接入只统计本机请求用量，不把其他平台密钥发送到 DeepSeek 账单接口。
+                data = {"ts": int(now), "source": "estimate", "today_source": "estimate",
+                        "total_source": "estimate", "today_cny": est_today, "total_cny": est_total,
+                        "currency": "CNY", "days": 0,
+                        "platform_error": "按请求返回 Token 与配置费率估算；账户余额请查看官方平台",
+                        "estimate": {"today_cny": est_today, "total_cny": est_total,
+                                     "calls": int(est_total_row.get("calls", 0))},
+                        "balance": {"ok": False, "error": "未查询官方余额"}}
+                self._billing_ts, self._billing_data = now, data
+                return data
+
             # --- 真实余额（官方接口，用 API Key）---
             token_key = api_key(self.cfg)
             timeout = float(bc.get("timeout_seconds", 20) or 20)
@@ -712,11 +724,14 @@ class Pipeline:
     # ---------- introspection ----------
 
     def health(self) -> dict:
+        llm = self.llm.snapshot()
         return {
             "ok": True,
             "uptime_seconds": int(time.time() - self.started_at),
-            "llm_available": self.llm.available,
-            "vision_enabled": self.llm.vision_available,
+            "llm_available": llm.available,
+            "vision_enabled": llm.vision_available,
+            "api_provider": llm.cfg.get("api", {}).get("provider", "旧版 DeepSeek"),
+            "api_model": llm.llm["model"],
             "spent_today_cny": round(self.llm.spent_today_cny(), 4),
             "budget_cny": self.cfg["llm"]["max_daily_cost_cny"],
             # 真实账单快照（可能为空：启动后 20 秒内还没抓第一次）。只读缓存，不打网络。

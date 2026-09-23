@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from .config import abs_path
-from .llm import IncompleteResponse
+from .llm import IncompleteResponse, LLM
 
 log = logging.getLogger("msgx.summarize")
 
@@ -76,6 +76,8 @@ def output_token_budget(target_chars: int) -> int:
 
 
 def model_limits(cfg: dict) -> tuple[int, int]:
+    if "api" in cfg:
+        return cfg["api"]["context_tokens"], cfg["api"]["max_output_tokens"]
     # DeepSeek 官方规格，2026-09-21：
     # https://api-docs.deepseek.com/quick_start/pricing/
     model = cfg.get("llm", {}).get("model", "deepseek-flash")
@@ -182,7 +184,12 @@ class Summarizer:
             self.progress = {"state": "running", "message": "正在读取消息", "started_at": time.time()}
             log.info("开始生成摘要，目标约 %d 字", limit)
             try:
-                result = await self._run_digest(full, hours, limit, system)
+                worker = self
+                if isinstance(self.llm, LLM):
+                    llm = self.llm.snapshot()
+                    worker = Summarizer(llm.cfg, self.store, llm)
+                    worker.progress = self.progress
+                result = await worker._run_digest(full, hours, limit, system)
                 self.progress.update(state="done", message="摘要已生成" if result else "没有可总结的新消息")
                 return result
             except Exception as exc:

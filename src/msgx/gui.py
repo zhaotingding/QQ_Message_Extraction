@@ -24,12 +24,13 @@ import tkinter as tk
 import urllib.request
 import urllib.error
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from . import __version__
 from . import napcat as napcat_mod
 from . import prefs as prefs_mod
+from . import api_settings, credentials, security
 from .config import ROOT, abs_path, load
 from .summarize import DEFAULT_DIGEST_PROMPT, DIGEST_DEFAULT_CHARS, DIGEST_RANGES
 
@@ -465,6 +466,51 @@ class App:
         canvas.bind("<Configure>", _fit)
         self._scroll_canvas = canvas
 
+        api = ttk.LabelFrame(tab, text="API 配置（密钥独立加密保存）", padding=12)
+        api.pack(fill="x", pady=(0, 12))
+        selector = ttk.Frame(api)
+        selector.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(selector, text="使用配置：").pack(side="left")
+        self.api_selector = ttk.Combobox(selector, state="readonly", width=30)
+        self.api_selector.pack(side="left", padx=8)
+        self.api_selector.bind("<<ComboboxSelected>>", self._select_api_profile)
+        ttk.Button(selector, text="新增自定义配置", command=self.add_api_profile).pack(side="left")
+        self.v_api = {}
+        fields = [("provider", "服务平台"), ("base_url", "API 基础地址"), ("model", "模型（摘要及图片）"),
+                  ("protocol", "接口格式"), ("reasoning", "思考强度"),
+                  ("context_tokens", "上下文 Token 上限"), ("max_output_tokens", "输出 Token 上限"),
+                  ("currency", "费率币种"), ("input_price", "输入单价 / 百万 Token"),
+                  ("cached_price", "缓存输入单价 / 百万 Token"), ("output_price", "输出单价 / 百万 Token"),
+                  ("usd_cny", "美元折人民币（估算）"), ("long_context_threshold", "长输入加价阈值（0 关闭）"),
+                  ("long_input_multiplier", "长输入价格倍数"), ("long_output_multiplier", "长输出价格倍数"),
+                  ("peak_multiplier", "高峰价格倍数"), ("peak_windows_utc", "工作日高峰时段（UTC）")]
+        choices = {"protocol": ("responses", "chat_completions"), "currency": ("USD", "CNY"),
+                   "reasoning": ("none", "low", "medium", "high", "xhigh", "max")}
+        for row, (key, title) in enumerate(fields, 1):
+            ttk.Label(api, text=title).grid(row=row, column=0, sticky="w", pady=2)
+            var = self.v_api[key] = tk.StringVar()
+            widget = (ttk.Combobox(api, textvariable=var, values=choices[key], state="readonly")
+                      if key in choices else ttk.Entry(api, textvariable=var))
+            widget.grid(row=row, column=1, sticky="ew", padx=8, pady=2)
+            if key == "base_url":
+                widget.bind("<FocusOut>", lambda _e: self._api_key_status())
+        api.columnconfigure(1, weight=1)
+        row = len(fields) + 1
+        ttk.Label(api, text="新密钥（留空保留已有）").grid(row=row, column=0, sticky="w")
+        self.v_api_key = tk.StringVar()
+        ttk.Entry(api, textvariable=self.v_api_key, show="•").grid(row=row, column=1, sticky="ew", padx=8)
+        self.v_api_key_status = tk.StringVar(value="未配置")
+        ttk.Label(api, textvariable=self.v_api_key_status).grid(row=row+1, column=1, sticky="w", padx=8)
+        controls = ttk.Frame(api)
+        controls.grid(row=row+2, column=0, columnspan=2, sticky="w", pady=8)
+        ttk.Button(controls, text="保存配置 / 替换密钥", command=self.save_prefs).pack(side="left")
+        ttk.Button(controls, text="删除此地址的密钥", command=self.delete_api_key).pack(side="left", padx=4)
+        ttk.Button(controls, text="导入配置", command=self.import_api_config).pack(side="left")
+        ttk.Button(controls, text="导出配置", command=self.export_api_config).pack(side="left", padx=4)
+        ttk.Label(api, text="选择配置即保存切换；编辑参数后点击保存。新任务使用所选 API，在途摘要仍用原配置。\n"
+                  "配置导出不含密钥；不同配置或地址不复用密钥。更换模型请核对容量和费率，汇率为手动估值。",
+                  style="Hint.TLabel", wraplength=730).grid(row=row+3, column=0, columnspan=2, sticky="w")
+
         # --- 摘要 ---
         sm = ttk.LabelFrame(tab, text="手动摘要", padding=12)
         sm.pack(fill="x")
@@ -578,7 +624,7 @@ class App:
         ).pack(anchor="w", pady=(6, 0))
 
         # --- 账单 ---
-        bl = ttk.LabelFrame(tab, text="账单（真实数据）", padding=12)
+        bl = ttk.LabelFrame(tab, text="旧版 DeepSeek 账单（新 API 配置不使用）", padding=12)
         bl.pack(fill="x", pady=(12, 0))
         # 这段原来是「余额用 API Key；消费必须用平台 token；留空 = 只显示本地估算」，
         # 把两件事挤在一句里，读起来像「查账要两个钥匙」，而且「只能估算」说得太满
@@ -664,6 +710,8 @@ class App:
 
     def _load_into_widgets(self) -> None:
         p = self.prefs
+        self._api_profiles, active = api_settings.catalog(self.cfg, p)
+        self._show_api_profile(active)
         if "summary_target_chars" not in prefs_mod.load_raw(self.prefs_file):
             p["summary_target_chars"] = self.cfg.get("summary", {}).get("target_chars", DIGEST_DEFAULT_CHARS)
         options = self._summary_options()
@@ -728,8 +776,12 @@ class App:
             raise ValueError("最小长度必须是整数")
 
         groups = [self._group_ids[i] for i in self.lst_groups.curselection()]
+        profile = api_settings.validate({key: var.get() for key, var in self.v_api.items()})
         return {
             **self.prefs,
+            "api": profile,
+            "api_profiles": {**self._api_profiles, self._api_selected: profile},
+            "active_api_profile": self._api_selected,
             "summary_prompt": self.txt_summary_prompt.get("1.0", "end").strip(),
             "summary_target_chars": target_chars,
             "groups": groups,
@@ -754,22 +806,102 @@ class App:
                 self._log_ui(f"[界面] 设置有误：{exc}\n")
             return False
         try:
+            if self.v_api_key.get().strip():
+                credentials.save(data["api"]["base_url"], self.v_api_key.get(), profile_id=self._api_selected)
+                security.register(self.v_api_key.get().strip())
+                self.v_api_key.set("")
             prefs_mod.save(data, self.prefs_file)
-        except OSError as exc:
+        except (OSError, credentials.CredentialError) as exc:
             if not silent:
                 self.status.set(f"保存失败：{exc}")
                 self._log_ui(f"[界面] 保存失败：{exc}\n")
             return False
         self.prefs = data
+        self._api_profiles = data["api_profiles"]
+        self.api_selector.configure(values=[p["provider"] for p in self._api_profiles.values()])
+        self.api_selector.current(list(self._api_profiles).index(self._api_selected))
+        self._api_key_status()
         self.v_range_desc.set(self._range_desc(self.v_range.get()))
         if not self._summary_busy:
             self.v_summary.set(f"摘要待生成，目标约 {data['summary_target_chars']} 字")
         n_groups = len(data["groups"]) or "全部"
         self.status.set(
-            f"设置已保存 · 摘要约 {data['summary_target_chars']} 字，下一次生成生效 · 群 {n_groups}"
-            + ("（其他服务设置重启后生效）" if self.proc else "")
+            f"已保存 · 新任务使用 {data['api']['provider']} / {data['api']['model']} · 摘要约 {data['summary_target_chars']} 字 · 群 {n_groups}"
+            + ("（其他非 API 服务设置重启后生效）" if self.proc else "")
         )
         return True
+
+    def _show_api_profile(self, active: str) -> None:
+        self._api_selected = active
+        self.api_selector.configure(values=[p["provider"] for p in self._api_profiles.values()])
+        self.api_selector.current(list(self._api_profiles).index(active))
+        for key, var in self.v_api.items():
+            var.set(str(self._api_profiles[active][key]))
+        self.v_api_key.set("")
+        self._api_key_status()
+
+    def _select_api_profile(self, _event=None) -> None:
+        selected = list(self._api_profiles)[self.api_selector.current()]
+        previous = self._api_selected
+        if selected == previous:
+            return
+        if not self.save_prefs():
+            self.api_selector.current(list(self._api_profiles).index(previous))
+            return
+        self._show_api_profile(selected)
+        if not self.save_prefs():
+            self._show_api_profile(previous)
+
+    def add_api_profile(self) -> None:
+        if not self.save_prefs():
+            return
+        i = 1
+        while f"custom_{i}" in self._api_profiles:
+            i += 1
+        name = f"custom_{i}"
+        self._api_profiles[name] = {**api_settings.DEFAULTS, "provider": f"自定义 {i}"}
+        self._show_api_profile(name)
+        self.status.set("新配置待填写并保存；未保存前继续使用原配置。密钥需单独设置。")
+
+    def _api_key_status(self) -> None:
+        try:
+            present = bool(credentials.read(api_settings.endpoint(self.v_api["base_url"].get()), profile_id=self._api_selected))
+            self.v_api_key_status.set("已配置（Windows 凭据管理器）" if present else "此地址未配置密钥")
+        except (ValueError, credentials.CredentialError):
+            self.v_api_key_status.set("无法读取密钥或地址无效")
+
+    def delete_api_key(self) -> None:
+        try:
+            credentials.delete(api_settings.endpoint(self.v_api["base_url"].get()), profile_id=self._api_selected)
+            self.v_api_key.set("")
+            self._api_key_status()
+            self.status.set("此地址的密钥已删除；在途请求可能继续完成，后续请求不再使用该密钥")
+        except (ValueError, credentials.CredentialError) as exc:
+            self.status.set(str(exc))
+
+    def import_api_config(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("API 配置", "*.json")])
+        if not path:
+            return
+        try:
+            profile = api_settings.validate(json.loads(Path(path).read_text(encoding="utf-8")))
+            for key, var in self.v_api.items():
+                var.set(str(profile[key]))
+            self.v_api_key.set("")
+            self._api_key_status()
+            self.status.set("API 配置已载入，点击保存后生效；密钥需单独配置")
+        except (OSError, ValueError, TypeError):
+            self.status.set("导入失败：配置格式无效或含不允许的字段；请勿在配置文件中填写密钥")
+
+    def export_api_config(self) -> None:
+        try:
+            profile = api_settings.validate({key: var.get() for key, var in self.v_api.items()})
+            path = filedialog.asksaveasfilename(defaultextension=".json", initialfile="api-config.json")
+            if path:
+                Path(path).write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+                self.status.set("API 配置已导出，不含密钥")
+        except (OSError, ValueError):
+            self.status.set("导出失败：请检查配置或文件写入权限")
 
     def reload_prefs(self) -> None:
         self.prefs = prefs_mod.load(self.prefs_file)
@@ -889,11 +1021,11 @@ class App:
         ttk.Button(tab, text="刷新消费明细", command=self.refresh_usage).pack(anchor="w")
         self.v_usage = tk.StringVar(value="升级后开始逐次记录；Token 来自 API，金额按配置费率估算。")
         ttk.Label(tab, textvariable=self.v_usage, wraplength=880).pack(fill="x", pady=6)
-        self.usage_groups = ttk.Treeview(tab, columns=("purpose", "type", "calls", "input", "output", "cost", "today"),
+        self.usage_groups = ttk.Treeview(tab, columns=("purpose", "type", "calls", "input", "output", "cost", "today", "api"),
                                         show="headings", height=6)
         for key, label, width in (("purpose", "用途", 150), ("type", "消息类型", 120), ("calls", "请求数", 70),
                                   ("input", "输入 Token", 100), ("output", "输出 Token", 100), ("cost", "总金额（元）", 110),
-                                  ("today", "今日消费（元）", 110)):
+                                  ("today", "今日消费（元）", 110), ("api", "平台 / 模型", 190)):
             self.usage_groups.heading(key, text=label)
             if key in ("calls", "input", "output", "cost", "today"):
                 self.usage_groups.heading(key, command=lambda k=key: self._sort_usage(self.usage_groups, k))
@@ -902,10 +1034,10 @@ class App:
         ttk.Label(tab, text="点击请求数、Token 或金额表头排序；最近 500 次请求，选中一行查看关联消息（上方汇总覆盖全部明细）").pack(anchor="w")
         frame = ttk.Frame(tab)
         frame.pack(fill="both", expand=True)
-        columns = ("time", "purpose", "source", "input", "output", "cache", "cost", "state", "today")
+        columns = ("time", "purpose", "source", "input", "output", "cache", "cost", "state", "today", "api")
         self.usage_table = ttk.Treeview(frame, columns=columns, show="headings", height=9)
-        for key, label, width in zip(columns, ("时间", "用途", "消息/任务", "输入", "输出", "缓存命中", "总金额（元）", "结果", "今日消费（元）"),
-                                   (125, 100, 115, 70, 70, 75, 95, 130, 110)):
+        for key, label, width in zip(columns, ("时间", "用途", "消息/任务", "输入", "输出", "缓存命中", "总金额（元）", "结果", "今日消费（元）", "平台 / 模型"),
+                                   (125, 100, 115, 70, 70, 75, 95, 130, 110, 190)):
             self.usage_table.heading(key, text=label)
             if key in ("input", "output", "cache", "cost", "today"):
                 self.usage_table.heading(key, command=lambda k=key: self._sort_usage(self.usage_table, k))
@@ -951,7 +1083,8 @@ class App:
             iid = self.usage_groups.insert("", "end", values=(row["purpose"], row["source_type"], row["calls"],
                 row["in_tokens"] or 0, row["out_tokens"] or 0,
                 f"{row['cost_cny']:.6f}" + (f" + {row['unknown_calls']} 次未知" if row["unknown_calls"] else ""),
-                f"{row.get('today_cost_cny', 0):.6f}" + (f" + {row['today_unknown_calls']} 次未知" if row.get("today_unknown_calls") else "")))
+                f"{row.get('today_cost_cny', 0):.6f}" + (f" + {row['today_unknown_calls']} 次未知" if row.get("today_unknown_calls") else ""),
+                f"{row.get('provider') or '历史未记录'} / {row.get('model') or '未知'}"))
             self._usage_numbers[self.usage_groups][iid] = dict(calls=row["calls"], input=row["in_tokens"],
                                                               output=row["out_tokens"], cost=row["cost_cny"], today=row.get("today_cost_cny", 0))
         self.usage_table.delete(*self.usage_table.get_children())
@@ -960,7 +1093,8 @@ class App:
             self.usage_table.insert("", "end", iid=iid, values=(time.strftime("%m-%d %H:%M:%S", time.localtime(row["ts"])),
                 row["purpose"], row["source_label"], *[row[k] if row[k] is not None else "未知" for k in ("in_tokens", "out_tokens", "cache_hit_tokens")],
                 f"{row['cost_cny']:.6f}" if row["cost_cny"] is not None else "未知", row["status"],
-                f"{row.get('today_cost_cny', 0):.6f}" if row.get("today_cost_cny", 0) is not None else "未知"))
+                f"{row.get('today_cost_cny', 0):.6f}" if row.get("today_cost_cny", 0) is not None else "未知",
+                f"{row.get('provider') or '历史未记录'} / {row.get('model') or '未知'}"))
             self._usage_numbers[self.usage_table][iid] = dict(input=row["in_tokens"], output=row["out_tokens"],
                                                              cache=row["cache_hit_tokens"], cost=row["cost_cny"], today=row.get("today_cost_cny", 0))
         for tree, (key, descending) in self._usage_sort.items():
@@ -988,7 +1122,7 @@ class App:
         row = self._usage_items[iid]
         self.usage_detail.configure(state="normal")
         self.usage_detail.delete("1.0", "end")
-        self.usage_detail.insert("end", f"{row['purpose']} · {row['source_type']} · 模型 {row['model']}\n正在读取关联消息…")
+        self.usage_detail.insert("end", f"{row['purpose']} · {row['source_type']} · {row.get('provider') or '历史平台未记录'} · 模型 {row['model']}\n正在读取关联消息…")
         self.usage_detail.configure(state="disabled")
         port = int(self.cfg["onebot"]["http_port"])
         def work() -> None:
@@ -1127,7 +1261,7 @@ class App:
         self.summary_bar.start(12)
         options = self._summary_options()
         target = f"最近 {hours // 24} 天" if kind == "range" and hours else "增量"
-        note = f"开始生成{target}摘要，目标约 {options['target_chars']} 字；正在读取消息并调用 DeepSeek…"
+        note = f"开始生成{target}摘要，目标约 {options['target_chars']} 字；正在读取消息并调用已配置的模型…"
         self.v_summary.set(note)
         self.status.set(note)
         self._log_ui(f"[界面] {note}\n")
@@ -1265,12 +1399,12 @@ class App:
     # ---------------- 账单 ----------------
 
     def refresh_billing(self) -> None:
-        """让服务去 DeepSeek 抓一次真实账单（余额 + 逐日消费）。"""
+        """刷新当前服务的费用统计；新 API 只使用本机请求估算。"""
         if self.proc is None:
             self.status.set("请先启动服务，再刷新账单。")
             return
         port = int(self.cfg["onebot"]["http_port"])
-        self.status.set("正在向 DeepSeek 抓取真实账单…")
+        self.status.set("正在刷新消费统计…")
 
         def work() -> None:
             try:
@@ -1845,8 +1979,11 @@ class App:
             self.v_llm.set("已配置 · 带配文图片解析已开启")
         else:
             self.v_llm.set("已配置 · 图片解析 API 已关闭")
+        if data.get("api_provider"):
+            self.v_llm.set(f"{data['api_provider']} / {data.get('api_model', '')} · {self.v_llm.get()}")
 
     def _log_ui(self, text: str) -> None:
+        text = security.redact(text)
         # 按**行**插入才能按行上色（v0.5.5）。所有调用方传进来的都是完整行
         # （服务 stdout 按 readline、界面侧都带换行），所以这里不做跨块缓冲。
         self.log.configure(state="normal")

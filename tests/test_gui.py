@@ -27,6 +27,12 @@ except ImportError:
     raise SystemExit(1)
 
 from msgx.gui import App  # noqa: E402
+from unittest.mock import patch
+
+# 测试界面不得接触用户的真实凭据存储。
+patch("msgx.gui.credentials.read", return_value="").start()
+patch("msgx.gui.credentials.save").start()
+patch("msgx.gui.credentials.delete").start()
 
 fails: list[str] = []
 
@@ -893,6 +899,91 @@ check("再次点击升序且未知仍在末尾", app.usage_table.get_children() 
 app._render_usage(_usage_data)
 check("刷新后保留排序方向", app.usage_table.get_children() == ("2", "0", "1", "3")
       and app.usage_table.heading("cost", "text").endswith("▲"))
+
+print("\n=== 0.7.0 API 配置与密钥隔离 ===")
+from msgx import api_settings, credentials
+_fake_key = "sk-msgx-GUI-TEST-NOT-A-REAL-KEY"
+for _key, _value in api_settings.DEFAULTS.items():
+    app.v_api[_key].set(str(_value))
+app.v_summary_chars.set("3000")
+app.v_api["provider"].set("自定义服务")
+app.v_api["model"].set("future-model")
+app.v_api_key.set(_fake_key)
+with patch("msgx.gui.credentials.save") as _save_key, \
+        patch("msgx.gui.credentials.read", return_value=_fake_key), \
+        patch("msgx.gui.prefs_mod.save") as _save_prefs:
+    check("保存自定义 API 设置", app.save_prefs())
+    _saved = _save_prefs.call_args.args[0]
+    check("密钥仅交给系统凭据存储", _save_key.call_args.args == ("https://api.openai.com/v1", _fake_key)
+          and _fake_key not in json.dumps(_saved) and not app.v_api_key.get())
+    check("平台和模型可编辑且界面只显示配置状态", _saved["api"]["model"] == "future-model"
+          and _saved["api"]["provider"] == "自定义服务" and "已配置" in app.v_api_key_status.get()
+          and _fake_key not in app.v_api_key_status.get())
+app.v_api["base_url"].set("https://other.invalid/v1")
+with patch("msgx.gui.credentials.read", return_value="") as _read_key, \
+        patch("msgx.gui.credentials.save") as _save_key, patch("msgx.gui.prefs_mod.save"):
+    app._api_key_status()
+    check("切换地址不携带旧密钥", "未配置" in app.v_api_key_status.get() and app.save_prefs()
+          and not _save_key.called and _read_key.call_args.args == ("https://other.invalid/v1",))
+app.v_api_key.set(_fake_key)
+with patch("msgx.gui.filedialog.asksaveasfilename", return_value="fake-api.json"), \
+        patch("msgx.gui.Path.write_text") as _write:
+    app.export_api_config()
+    _export = json.loads(_write.call_args.args[0])
+    check("导出只含公开配置，不含未保存密钥", set(_export) == set(api_settings.DEFAULTS)
+          and _fake_key not in _write.call_args.args[0])
+with patch("msgx.gui.filedialog.askopenfilename", return_value="fake-api.json"), \
+        patch("msgx.gui.Path.read_text", return_value=json.dumps(api_settings.DEFAULTS)):
+    app.import_api_config()
+    check("导入默认配置并清空待保存密钥", app.v_api["model"].get() == "gpt-6-luna"
+          and app.v_api["base_url"].get() == "https://api.openai.com/v1" and not app.v_api_key.get())
+with patch("msgx.gui.filedialog.askopenfilename", return_value="fake-api.json"), \
+        patch("msgx.gui.Path.read_text", return_value=json.dumps({"api_key": _fake_key})):
+    app.import_api_config()
+    check("拒绝含密钥配置文件且错误不回显密钥", "导入失败" in app.status.get() and _fake_key not in app.status.get())
+with patch("msgx.gui.credentials.delete") as _delete:
+    app.delete_api_key()
+    check("删除仅作用于当前接口", _delete.call_args.args == ("https://api.openai.com/v1",))
+app.v_api["base_url"].set("http://other.invalid/v1")
+with patch("msgx.gui.credentials.save") as _save_key, patch("msgx.gui.prefs_mod.save") as _save_prefs:
+    check("无效地址禁止保存", not app.save_prefs() and not _save_key.called and not _save_prefs.called)
+
+print("\n=== 多 API 配置选择与独立保存 ===")
+app.v_api["base_url"].set("https://api.openai.com/v1")
+app.v_api["model"].set("my-openai-model")
+app.v_api_key.set(_fake_key)
+with patch("msgx.gui.prefs_mod.save") as _save_prefs, patch("msgx.gui.credentials.save") as _save_key:
+    app.api_selector.current(list(app._api_profiles).index("deepseek"))
+    app._select_api_profile()
+    check("下拉选择即切换并保存 DeepSeek", app._api_selected == "deepseek"
+          and _save_prefs.call_args.args[0]["active_api_profile"] == "deepseek"
+          and app.v_api["model"].get() == app._api_profiles["deepseek"]["model"])
+    check("切换前密钥保存到原配置且输入框清空", _save_key.call_args.kwargs == {"profile_id": "openai"}
+          and not app.v_api_key.get())
+    app.v_api["model"].set("my-deepseek-model")
+    app.api_selector.current(list(app._api_profiles).index("openai"))
+    app._select_api_profile()
+    check("切回 OpenAI 保留两套独立模型", app.v_api["model"].get() == "my-openai-model"
+          and app._api_profiles["deepseek"]["model"] == "my-deepseek-model")
+    _public = _save_prefs.call_args.args[0]
+    check("多配置保存不含密钥", _fake_key not in json.dumps(_public)
+          and {"openai", "deepseek"}.issubset(_public["api_profiles"]))
+    with patch("msgx.gui.prefs_mod.load", return_value=_public):
+        app.reload_prefs()
+        check("重新加载保留选择与配置", app._api_selected == "openai"
+              and app.v_api["model"].get() == "my-openai-model")
+    app.add_api_profile()
+    check("可新增自定义且不覆盖内置配置", app._api_selected == "custom_1"
+          and len(app._api_profiles) == 3 and not app.v_api_key.get())
+    app.v_api["provider"].set("自定义测试平台")
+    app.v_api_key.set(_fake_key)
+    app.save_prefs()
+    check("同地址的自定义配置密钥也独立", _save_key.call_args.kwargs == {"profile_id": "custom_1"})
+with patch("msgx.gui.credentials.delete") as _delete:
+    app.delete_api_key()
+    check("删除只作用于所选配置", _delete.call_args.kwargs == {"profile_id": "custom_1"})
+app._apply_health({"llm_available": True, "vision_enabled": True, "api_provider": "DeepSeek", "api_model": "test-model"})
+check("运行状态展示服务实际使用的平台模型", "DeepSeek / test-model" in app.v_llm.get())
 
 root.update()
 root.destroy()

@@ -10,6 +10,8 @@ from pathlib import Path
 
 import aiohttp
 
+from . import security
+
 log = logging.getLogger("msgx.llm")
 
 
@@ -59,17 +61,21 @@ class LLM:
         self.llm = cfg["llm"]
         self.key = ""
         self._session: aiohttp.ClientSession | None = None
+        self._session_owner: LLM | None = None
 
     # ---------- lifecycle ----------
 
     def configure(self, api_key: str) -> None:
         self.key = api_key or ""
+        security.register(self.key)
 
     @property
     def available(self) -> bool:
         return bool(self.llm.get("enabled") and self.key)
 
     async def session(self) -> aiohttp.ClientSession:
+        if self._session_owner is not None:
+            return await self._session_owner.session()
         if self._session is None or self._session.closed:
             # force_close=True：**每次都新建连接、绝不复用**。
             #
@@ -85,12 +91,32 @@ class LLM:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=float(self.llm.get("timeout_seconds", 90))),
                 connector=aiohttp.TCPConnector(force_close=True, limit=8),
+                read_bufsize=1024 * 1024,
             )
         return self._session
 
     async def close(self) -> None:
+        if self._session_owner is not None:
+            return
         if self._session and not self._session.closed:
             await self._session.close()
+
+    def snapshot(self) -> LLM:
+        """新任务读取已保存选择，在途任务保留自己的配置和费率。"""
+        from . import api_settings, prefs
+        from .config import api_key
+        saved = prefs.load_from_env() or {}
+        if "api" not in self.cfg and "api_profiles" not in saved:
+            return self
+        cfg = self.cfg
+        if "api_profiles" in saved or "api" in saved:
+            profiles, active = api_settings.catalog(cfg, saved)
+            cfg = api_settings.apply(cfg, profiles[active])
+            cfg.update(api_profiles=profiles, active_api_profile=active)
+        result = LLM(cfg, self.store)
+        result.configure(api_key(cfg))
+        result._session_owner = self._session_owner or self
+        return result
 
     # ---------- budget ----------
 
@@ -135,6 +161,16 @@ class LLM:
         ``peak`` 显式传值可覆盖时间判定 —— 给「只有日期、没有小时」的历史数据
         补算金额时用得到（那就只能按空闲价估，是个下限）。
         """
+        if "api" in self.cfg:
+            p = self.cfg["api"]
+            hit = max(0, min(int(cache_hit_tokens), int(in_tokens)))
+            long = p["long_context_threshold"] > 0 and in_tokens > p["long_context_threshold"]
+            input_mult = p["long_input_multiplier"] if long else 1
+            output_mult = p["long_output_multiplier"] if long else 1
+            fx = p["usd_cny"] if p["currency"] == "USD" else 1
+            peak_mult = p["peak_multiplier"] if (self.is_peak(ts) if peak is None else peak) else 1
+            return fx * peak_mult / 1_000_000 * ((hit * p["cached_price"] + (in_tokens - hit) * p["input_price"]) * input_mult
+                                      + out_tokens * p["output_price"] * output_mult)
         mult = float(self.llm.get("peak_multiplier", 2.0)) if (
             self.is_peak(ts) if peak is None else bool(peak)
         ) else 1.0
@@ -156,6 +192,8 @@ class LLM:
         只能按**空闲时段**估价：库里只存了日期、没有小时，无从判断峰谷。
         所以补出来的值是**下限**，真实只会更高；日志里会写明这一点。
         """
+        if "api" in self.cfg:
+            return 0  # 不能用新服务的费率回填旧服务历史账目。
         try:
             rows = [
                 r for r in self.store.usage_all()
@@ -188,13 +226,16 @@ class LLM:
     async def _accounted_post(self, payload: dict, purpose: str, source_ids: list[int] | None) -> dict:
         """v0.6.0：每个有返回的请求立即落账，后续重试失败也不会丢掉前次费用。"""
         started = time.time()
+        provider = self.cfg.get("api", {}).get("provider", "旧版 DeepSeek")
         try:
             data = await self._post(payload)
         except Exception:
             self.store.record_api_call(ts=started, purpose=purpose, source_ids=source_ids or [],
-                                       model=payload["model"], usage=None, cost_cny=None, status="请求失败，用量未知")
+                                       model=payload["model"], usage=None, cost_cny=None, status="请求失败，用量未知", provider=provider)
             raise
         usage = data.get("usage")
+        if usage and "prompt_cache_hit_tokens" not in usage:
+            usage["prompt_cache_hit_tokens"] = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
         if not usage or "prompt_tokens" not in usage or "completion_tokens" not in usage:
             usage = None
         cost = None
@@ -210,7 +251,7 @@ class LLM:
         if usage is None:
             status += "，用量未知"
         self.store.record_api_call(ts=started, purpose=purpose, source_ids=source_ids or [],
-                                   model=payload["model"], usage=usage, cost_cny=cost, status=status)
+                                   model=payload["model"], usage=usage, cost_cny=cost, status=status, provider=provider)
         if complete:
             log.info("API 请求成功 · %s · 输入 %s / 输出 %s Token", purpose,
                      (usage or {}).get("prompt_tokens", "未知"), (usage or {}).get("completion_tokens", "未知"))
@@ -309,7 +350,7 @@ class LLM:
             # 自相矛盾；而本项目所有调用方（打分取 JSON、摘要取正文）都只要剥净的文本。
             return (data["choices"][0]["message"]["content"] or "").strip()
         except (KeyError, IndexError):
-            log.warning("LLM 返回结构异常: %s", json.dumps(data)[:400])
+            log.warning("LLM 返回结构异常，未保存原始响应")
             return ""
 
     async def _post(self, payload: dict, retries: int | None = None) -> dict:
@@ -350,9 +391,21 @@ class LLM:
         raise RuntimeError(f"请求失败（已重试 {n} 次）: {last}")
 
     async def _post_once(self, payload: dict) -> dict:
+        if self.llm.get("credential_store"):
+            from .config import api_key
+            self.configure(api_key(self.cfg))
+            if not self.key:
+                raise RuntimeError("该 API 地址未配置安全密钥，或密钥已删除")
         s = await self.session()
         base = self.llm["base_url"].rstrip("/")
-        encoded = json.dumps(payload).encode("utf-8")
+        responses = self.llm.get("protocol") == "responses"
+        outgoing = self._responses_payload(payload) if responses else dict(payload)
+        if not responses and "api" in self.cfg:
+            effort = self.cfg["api"]["reasoning"]
+            outgoing["reasoning_effort"] = effort
+            if effort != "none":
+                outgoing.pop("temperature", None)
+        encoded = json.dumps(outgoing).encode("utf-8")
         paced = len(encoded) > 64 * 1024
         headers = {
             "Authorization": f"Bearer {self.key}",
@@ -379,33 +432,92 @@ class LLM:
             log.info("API 请求体已提交：%d 字节，耗时 %.2fs；等待响应", queued, time.monotonic() - started)
 
         try:
-            for url in (f"{base}/chat/completions", f"{base}/v1/chat/completions"):
+            urls = [f"{base}/responses"] if responses else [f"{base}/chat/completions"]
+            if not responses and not base.endswith("/v1"):
+                urls.append(f"{base}/v1/chat/completions")
+            for url in urls:
                 stage, queued, started = "连接或发送请求", 0, time.monotonic()
                 if paced:
                     log.info("API 开始上传：%.1f KiB，单次请求，每段 8 KiB", len(encoded) / 1024)
                 # 每次尝试都创建新的迭代器，404 路径回退和重试不能复用耗尽的正文。
-                async with s.post(url, headers=headers, data=upload() if paced else encoded) as r:
+                async with s.post(url, headers=headers, data=upload() if paced else encoded, allow_redirects=False) as r:
                     stage = "读取响应正文"
                     if paced:
                         log.info("API 响应头已收到：HTTP %d，耗时 %.2fs；正在接收结果", r.status, time.monotonic() - started)
-                    body = await r.text()
                     if r.status == 200:
+                        if responses:
+                            return await self._read_response(r)
+                        body = security.redact(await r.text())
                         try:
                             return json.loads(body)
                         except json.JSONDecodeError as e:
                             # 半截响应体：连接被掐断的另一种表现，同样值得重试
                             raise _Transient(f"响应不是完整 JSON: {e}") from e
-                    last = f"HTTP {r.status} @ {url}: {body[:300]}"
+                    last = f"HTTP {r.status}：API 请求未成功（原始响应已隐藏）"
                     if r.status in RETRY_STATUS:
                         raise _Transient(last)
                     if r.status != 404:
                         break
         except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as e:
             # 含 ServerDisconnectedError / ClientOSError(10053) / ClientConnectorError
-            raise _Transient(f"{type(e).__name__}: {e}（阶段：{stage}）") from e
+            if responses and stage == "读取响应正文":
+                raise RuntimeError("API 流式结果中断，用量未知；未自动重发") from None
+            raise _Transient(f"{type(e).__name__}（阶段：{stage}）") from None
         except asyncio.TimeoutError as e:
+            if responses and stage == "读取响应正文":
+                raise RuntimeError("API 流式结果超时，用量未知；未自动重发") from None
             raise _Transient(f"请求超时（阶段：{stage}）") from e
         raise RuntimeError(last or "请求失败")
+
+    def _responses_payload(self, payload: dict) -> dict:
+        inputs = []
+        for message in payload["messages"]:
+            content = message["content"]
+            if isinstance(content, list):
+                content = [({"type": "input_text", "text": item["text"]} if item["type"] == "text" else
+                            {"type": "input_image", "image_url": item["image_url"]["url"],
+                             "detail": item["image_url"].get("detail", "low")}) for item in content]
+            inputs.append({"role": message["role"], "content": content})
+        effort = self.cfg["api"]["reasoning"]
+        return {"model": payload["model"], "input": inputs, "max_output_tokens": payload["max_tokens"],
+                "reasoning": {"effort": effort}, "store": False, "stream": True}
+
+    async def _read_response(self, response) -> dict:
+        if "text/event-stream" not in response.headers.get("Content-Type", ""):
+            data = json.loads(security.redact(await response.text()))
+        else:
+            data = None
+            lines = []
+            # SSE 消息按空行分隔，支持多行 data；只在终态事件读取最终正文和用量。
+            async for raw in response.content:
+                line = raw.decode("utf-8").rstrip("\r\n")
+                if line.startswith("data:"):
+                    lines.append(line[5:].lstrip())
+                elif not line and lines:
+                    value = "\n".join(lines)
+                    lines = []
+                    if value == "[DONE]":
+                        continue
+                    event = json.loads(security.redact(value))
+                    if event.get("type") in ("response.completed", "response.incomplete", "response.failed"):
+                        data = event.get("response") or {}
+                        break
+                    if event.get("type") == "error":
+                        raise RuntimeError("API 流式响应报告失败，原始内容已隐藏")
+            if data is None:
+                # 服务端可能已经计费，不能把缺终态的流自动整单重发。
+                raise RuntimeError("API 响应中断，未收到完成事件；用量未知，未自动重发")
+        status = data.get("status")
+        text = "\n".join(part.get("text", "") for item in data.get("output", [])
+                         if item.get("type") == "message" for part in item.get("content", [])
+                         if part.get("type") == "output_text")
+        usage = data.get("usage")
+        normalized = None
+        if usage and "input_tokens" in usage and "output_tokens" in usage:
+            normalized = {"prompt_tokens": usage["input_tokens"], "completion_tokens": usage["output_tokens"],
+                          "prompt_cache_hit_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)}
+        return {"choices": [{"message": {"content": text},
+                             "finish_reason": "stop" if status == "completed" else "incomplete"}], "usage": normalized}
 
     # 这里原本有个 `_reset_session()`（close 掉共享 session 以「换掉半死的连接池」）。
     # v0.5.1 **已把它删掉**，不是重构、是修 bug：它会把并发的在途请求一起掐死

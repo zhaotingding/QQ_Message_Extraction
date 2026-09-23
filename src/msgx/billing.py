@@ -361,12 +361,12 @@ async def _get_json(url: str, headers: dict, timeout: float) -> dict:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=timeout)
         ) as s:
-            async with s.get(url, headers=headers) as r:
+            async with s.get(url, headers=headers, allow_redirects=False) as r:
                 body = await r.text()
                 if r.status in (401, 403):
                     raise PlatformAuthError(f"HTTP {r.status}")
                 if r.status != 200:
-                    raise RuntimeError(f"HTTP {r.status}: {body[:200]}")
+                    raise RuntimeError(f"HTTP {r.status}（原始响应已隐藏）")
                 return json.loads(body)
     except asyncio.TimeoutError as e:
         raise RuntimeError("请求超时") from e

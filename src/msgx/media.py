@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .llm import LLM
+
 import asyncio
 import hashlib
 import json
@@ -308,9 +310,10 @@ class MediaWorker:
         """
         if not _has_caption(row):
             return "", "skipped"
-        if not self.llm.vision_available:
+        llm = self.llm.snapshot() if isinstance(self.llm, LLM) else self.llm
+        if not llm.vision_available:
             return "", "skipped"
-        text, ok = await self.llm.describe_image(path, VISION_PROMPT, source_ids=[int(row["id"])],
+        text, ok = await llm.describe_image(path, VISION_PROMPT, source_ids=[int(row["id"])],
                                                  purpose="图片理解重试" if retry else "图片理解")
         return text, ("ok" if ok else "failed")
 
@@ -324,7 +327,8 @@ class MediaWorker:
 
         返回**这一次补出内容**的行 id，供后续摘要使用。
         """
-        if not self.llm.vision_available:
+        llm = self.llm.snapshot() if isinstance(self.llm, LLM) else self.llm
+        if not llm.vision_available:
             return []
         rows = self.store.failed_vision(limit)
         done: list[int] = []

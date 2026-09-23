@@ -17,6 +17,7 @@ PROJ = HERE.parent
 PY = PROJ / ".venv" / "Scripts" / "python.exe"
 
 SUITES = [
+    ("API 配置与密钥安全", "test_api_settings.py"),
     ("过滤规则", "test_filters.py"),
     ("计费口径", "test_cost.py"),
     ("逐请求消费明细", "test_usage.py"),

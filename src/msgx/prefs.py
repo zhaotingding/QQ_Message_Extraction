@@ -69,6 +69,13 @@ def save(prefs: dict, path: Path | str) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
+    if "api" in prefs:
+        from .api_settings import validate
+        prefs = {**prefs, "api": validate(prefs["api"])}
+    if "api_profiles" in prefs:
+        from .api_settings import catalog
+        profiles, active = catalog({}, prefs)
+        prefs = {**prefs, "api_profiles": profiles, "active_api_profile": active, "api": profiles[active]}
     payload = json.dumps(prefs, ensure_ascii=False, indent=2) + "\n"
     tmp.write_text(payload, encoding="utf-8", newline="\n")
     tmp.replace(p)
@@ -161,6 +168,14 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
     if token:
         out.setdefault("billing", {})["platform_token"] = token
 
+    if "api_profiles" in prefs:
+        from .api_settings import apply, catalog
+        profiles, active = catalog(cfg, prefs)
+        out = apply(out, profiles[active])
+        out.update(api_profiles=profiles, active_api_profile=active)
+    elif "api" in prefs:
+        from .api_settings import apply
+        out = apply(out, prefs["api"])
     return out
 
 

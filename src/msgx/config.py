@@ -133,6 +133,11 @@ def load(path: str | Path | None = None) -> dict:
         with open(cfg_path, "rb") as f:
             user = tomllib.load(f)
     cfg = _merge(DEFAULTS, user)
+    if "api" in user:
+        from .api_settings import apply, deepseek_profile
+        cfg["api_profiles"] = {"openai": user["api"], "deepseek": deepseek_profile(cfg["llm"])}
+        cfg["active_api_profile"] = "openai"
+        cfg = apply(cfg, user["api"])
 
     # 叠加界面偏好。只有 GUI 启动的子进程会设置 MSGX_PREFS 环境变量，
     # 直接跑命令行时不设，因此 CLI 行为完全不受影响。
@@ -147,6 +152,12 @@ def load(path: str | Path | None = None) -> dict:
 
 def api_key(cfg: dict) -> str:
     llm = cfg["llm"]
+    if llm.get("credential_store"):
+        from .credentials import CredentialError, read
+        try:
+            return read(llm["base_url"], profile_id=cfg.get("active_api_profile", ""))
+        except CredentialError:
+            return ""
     return os.environ.get(llm.get("api_key_env", "DEEPSEEK_API_KEY"), "") or llm.get("api_key", "")
 
 

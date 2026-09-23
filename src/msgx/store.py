@@ -159,6 +159,7 @@ class Store:
             ("usage", USAGE_MIGRATIONS),
             ("messages", MESSAGE_MIGRATIONS),
             ("groups", GROUP_MIGRATIONS),
+            ("api_calls", (("provider", "TEXT NOT NULL DEFAULT ''"),)),
         ):
             cols = {c[1] for c in self.conn.execute(f"PRAGMA table_info({table})")}
             for name, spec in migs:
@@ -524,7 +525,7 @@ class Store:
     # ---------- usage ----------
 
     def record_api_call(self, *, ts: float, purpose: str, source_ids: list[int], model: str,
-                        usage: dict | None, cost_cny: float | None, status: str) -> None:
+                        usage: dict | None, cost_cny: float | None, status: str, provider: str = "") -> None:
         ids = list(dict.fromkeys(source_ids))
         source_type = ("汇总报告" if purpose in ("日报合并", "摘要合并", "摘要成稿") else "系统检查") if not ids else "多条消息汇总"
         if len(ids) == 1:
@@ -535,9 +536,9 @@ class Store:
         outgoing = int(usage.get("completion_tokens", 0)) if usage is not None else None
         hit = int(usage.get("prompt_cache_hit_tokens", 0)) if usage is not None else None
         self.conn.execute(
-            "INSERT INTO api_calls(ts,purpose,source_ids,source_type,model,in_tokens,out_tokens,cache_hit_tokens,cost_cny,status)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (ts, purpose, json.dumps(ids), source_type, model, incoming, outgoing, hit, cost_cny, status),
+            "INSERT INTO api_calls(ts,purpose,source_ids,source_type,model,in_tokens,out_tokens,cache_hit_tokens,cost_cny,status,provider)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (ts, purpose, json.dumps(ids), source_type, model, incoming, outgoing, hit, cost_cny, status, provider),
         )
         if usage is not None:
             self.add_usage(time.strftime("%Y-%m-%d", time.localtime(ts)), incoming, outgoing,
@@ -561,11 +562,11 @@ class Store:
             item["source_count"] = len(ids)
             item["source_label"] = f"消息 #{ids[0]}" if len(ids) == 1 else f"{len(ids)} 条消息" if ids else item["source_type"]
         grouped = [dict(r) for r in self.conn.execute(
-            f"SELECT {purpose if active_only else 'purpose'} AS purpose,source_type,COUNT(*) AS calls,SUM(in_tokens) AS in_tokens,"
+            f"SELECT {purpose if active_only else 'purpose'} AS purpose,source_type,provider,model,COUNT(*) AS calls,SUM(in_tokens) AS in_tokens,"
             " SUM(out_tokens) AS out_tokens,COALESCE(SUM(cost_cny),0) AS cost_cny,"
             " COALESCE(SUM(CASE WHEN ts>=? AND ts<? THEN cost_cny END),0) AS today_cost_cny,"
             " SUM(CASE WHEN ts>=? AND ts<? AND cost_cny IS NULL THEN 1 ELSE 0 END) AS today_unknown_calls,"
-            f" SUM(cost_cny IS NULL) AS unknown_calls FROM api_calls {where} GROUP BY 1,2 ORDER BY cost_cny DESC",
+            f" SUM(cost_cny IS NULL) AS unknown_calls FROM api_calls {where} GROUP BY 1,2,3,4 ORDER BY cost_cny DESC",
             (start, end, start, end))]
         known = float(self.conn.execute("SELECT COALESCE(SUM(cost_cny),0) FROM api_calls").fetchone()[0])
         return {"items": items, "groups": grouped, "recorded_cost_cny": known,

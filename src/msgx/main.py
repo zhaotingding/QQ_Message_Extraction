@@ -23,6 +23,9 @@ def setup_logging(level: str) -> None:
         stream=sys.stdout,
     )
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    from .security import SecretFilter
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(SecretFilter())
 
 
 async def cmd_run(cfg: dict, stop_file: str | None = None) -> None:
@@ -66,7 +69,7 @@ async def cmd_run(cfg: dict, stop_file: str | None = None) -> None:
     log.info("  本地注入测试     : POST http://%s:%s/inject", host, http_port)
     log.info("  健康检查         : http://%s:%s/health", host, http_port)
     if not pipe.llm.available:
-        log.warning("  未设置 DEEPSEEK_API_KEY —— 当前仅接收和存储消息")
+        log.warning("  未配置当前 API 的密钥 —— 当前仅接收和存储消息")
     log.info("=" * 62)
 
     stop_evt = asyncio.Event()
