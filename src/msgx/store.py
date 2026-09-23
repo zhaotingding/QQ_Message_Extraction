@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -122,6 +123,7 @@ USAGE_MIGRATIONS = (
 # vision_tries 是**补跑次数**：没有它，一张永远读不出来的图会被每一轮补跑
 # 反复送去推理，安静地烧钱。到上限就停在 'failed'，不再重试。
 MESSAGE_MIGRATIONS = (
+    ("received_by", "TEXT NOT NULL DEFAULT ''"),
     ("vision_state", "TEXT DEFAULT ''"),
     ("vision_tries", "INTEGER DEFAULT 0"),
     ("at_all", "INTEGER DEFAULT 0"),  # v0.5.7：独立记录，不能依赖可能截断的 raw JSON
@@ -148,6 +150,11 @@ class Store:
         p.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(p), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        old = self.conn.execute("SELECT sql FROM sqlite_master WHERE name='messages'").fetchone()
+        if old and "UNIQUE(group_id, msg_id)" in old[0]:
+            backup = p.with_name(p.name + f".pre-account-{time.time_ns()}.bak")
+            with closing(sqlite3.connect(backup)) as dest:
+                self.conn.backup(dest)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         self._migrate()
@@ -166,6 +173,8 @@ class Store:
                 if name not in cols:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
 
+        self._migrate_accounts()
+
         # 老库里已经处理完的图没有 vision_state。按「有没有语义文本」回填一次，
         # 否则它们会被当成「未尝试」而被无意义地全量重跑。
         self.conn.execute(
@@ -179,6 +188,46 @@ class Store:
 
     def close(self) -> None:
         self.conn.close()
+
+    def _migrate_accounts(self) -> None:
+        """保留行 ID、解析结果和账本关联；未知历史账号不猜测。"""
+        sql = self.conn.execute("SELECT sql FROM sqlite_master WHERE name='messages'").fetchone()[0]
+        if "UNIQUE(group_id, msg_id)" in sql:
+            if not self.conn.in_transaction:
+                self.conn.execute("BEGIN IMMEDIATE")
+            with self.conn:
+                indexes = [r[0] for r in self.conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE tbl_name='messages' AND type='index' AND sql IS NOT NULL")]
+                seq = self.conn.execute("SELECT seq FROM sqlite_sequence WHERE name='messages'").fetchone()
+                self.conn.execute(sql.replace("messages", "messages_accounts", 1).replace(
+                    "UNIQUE(group_id, msg_id)", "UNIQUE(received_by, group_id, msg_id)"))
+                self.conn.execute("INSERT INTO messages_accounts SELECT * FROM messages")
+                self.conn.execute("DROP TABLE messages")
+                self.conn.execute("ALTER TABLE messages_accounts RENAME TO messages")
+                for statement in indexes:
+                    self.conn.execute(statement)
+                if seq:
+                    self.conn.execute("UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name='messages'", (seq[0],))
+                for row in self.conn.execute("SELECT id, raw FROM messages WHERE raw<>''").fetchall():
+                    try:
+                        account = str(json.loads(row["raw"]).get("self_id") or "")
+                    except (ValueError, AttributeError):
+                        continue
+                    if account.isascii() and account.isdigit() and account != "0":
+                        self.conn.execute("UPDATE messages SET received_by=? WHERE id=?", (account, row["id"]))
+        self.conn.execute("CREATE TABLE IF NOT EXISTS message_receipts ("
+                          "account TEXT NOT NULL, group_id TEXT NOT NULL, msg_id TEXT NOT NULL,"
+                          "message_row INTEGER NOT NULL, PRIMARY KEY(account, group_id, msg_id))")
+        self.conn.execute("INSERT OR IGNORE INTO message_receipts SELECT received_by,group_id,msg_id,id FROM messages")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_receipt_message ON message_receipts(message_row,account)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS group_accounts ("
+                          "group_id TEXT NOT NULL, account TEXT NOT NULL, PRIMARY KEY(group_id,account))")
+        self.conn.execute("INSERT OR IGNORE INTO group_accounts SELECT id,bot_uin FROM groups WHERE bot_uin<>''")
+        self.conn.execute("INSERT OR IGNORE INTO group_accounts SELECT group_id,received_by FROM messages WHERE received_by<>''")
+
+    def has_receipt(self, account: str, group_id: str, msg_id: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM message_receipts WHERE account=? AND group_id=? AND msg_id=?",
+                                 (account, group_id, msg_id)).fetchone() is not None
 
     # ---------- groups ----------
 
@@ -195,6 +244,8 @@ class Store:
             " bot_uin=CASE WHEN excluded.bot_uin<>'' THEN excluded.bot_uin ELSE groups.bot_uin END",
             (group_id, name, int(time.time()), bot_uin),
         )
+        if bot_uin:
+            self.conn.execute("INSERT OR IGNORE INTO group_accounts VALUES(?,?)", (group_id, bot_uin))
         self.conn.commit()
 
     def group_names(self) -> dict:
@@ -242,7 +293,7 @@ class Store:
         ).fetchone()
         return int(row[0] or 0)
 
-    def hour_baseline(self, hour: int, days: int = 7) -> int:
+    def hour_baseline(self, hour: int, days: int = 7, account: str = "") -> int:
         """最近若干天里，``hour`` 点这一小时每天消息条数的**中位数**。
 
         干什么用：区分「现在这个点本来就没人说话」与「消息冻结了」。
@@ -263,11 +314,14 @@ class Store:
             " FROM messages"
             " WHERE ts >= ? AND CAST(strftime('%H', ts,'unixepoch','localtime') AS INTEGER) = ?"
             "   AND COALESCE(text,'') NOT LIKE '【链路自检】%'"
+            " AND (?='' OR EXISTS (SELECT 1 FROM message_receipts r WHERE r.message_row=messages.id AND r.account=?))"
             " GROUP BY d",
-            (since, hour),
+            (since, hour, account, account),
         ).fetchall()
         first = self.conn.execute(
             "SELECT MIN(ts) FROM messages WHERE COALESCE(text,'') NOT LIKE '【链路自检】%'"
+            " AND (?='' OR EXISTS (SELECT 1 FROM message_receipts r WHERE r.message_row=messages.id AND r.account=?))",
+            (account, account),
         ).fetchone()[0]
         if first is None:
             return 0  # 一条真实消息都没有：没有基线可言
@@ -289,11 +343,29 @@ class Store:
 
     def insert_message(self, m: Msg, group_name: str = "", bot_uin: str = "", *, filtered: bool = False) -> int | None:
         """返回自增 id；重复消息返回 None。"""
+        if self.has_receipt(bot_uin, m.group_id, m.msg_id):
+            return None
+        # 同一群消息被不同账号接收时只保留一份正文，分别记录接收凭据。
+        # 不仅凭文本去重：必须消息 ID、时间、发送人、类型、内容均相同。
+        duplicate = self.conn.execute(
+            "SELECT id,raw FROM messages WHERE group_id=? AND msg_id=? AND ts=? AND sender_id=?"
+            " AND msg_type=? AND text=? AND received_by<>?",
+            (m.group_id, m.msg_id, m.ts, m.sender_id, m.msg_type, m.text, bot_uin)).fetchall()
+        for row in duplicate:
+            try:
+                same_media = bool(m.raw.get("message")) and json.loads(row["raw"]).get("message") == m.raw.get("message")
+            except (ValueError, AttributeError):
+                same_media = False
+            if (not m.image_urls and not m.file_names) or same_media:
+                self.conn.execute("INSERT INTO message_receipts VALUES(?,?,?,?)",
+                                  (bot_uin, m.group_id, m.msg_id, row["id"]))
+                self.upsert_group(m.group_id, group_name, bot_uin)
+                return None
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO messages"
             "(group_id, msg_id, sender_id, sender_name, ts, msg_type, text,"
-            " has_media, image_urls, media_state, at_me, at_all, reply_to, raw)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " has_media, image_urls, media_state, at_me, at_all, reply_to, raw, received_by)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 m.group_id,
                 m.msg_id,
@@ -309,11 +381,13 @@ class Store:
                 1 if m.at_all else 0,
                 m.reply_to,
                 "" if filtered else json.dumps(m.raw, ensure_ascii=False)[:20000],
+                bot_uin,
             ),
         )
-        self.conn.commit()
         if cur.rowcount == 0:
             return None
+        self.conn.execute("INSERT INTO message_receipts VALUES(?,?,?,?)",
+                          (bot_uin, m.group_id, m.msg_id, cur.lastrowid))
         # 无条件注册群：群名可能暂时为空（待配置补全），但群必须出现在 groups 表里，
         # 否则摘要调度遍历 group_names() 时看不到这个群。upsert_group 内部已保护空名不覆盖已有名字。
         #
@@ -414,6 +488,8 @@ class Store:
             self.conn.execute(
                 "SELECT m.id, m.group_id, m.sender_name, m.ts, m.text, m.msg_type,"
                 " m.media_state, m.vision_state, m.ocr_text, m.vision_text, m.at_me,"
+                " m.received_by, (SELECT GROUP_CONCAT(account) FROM message_receipts"
+                " WHERE message_row=m.id AND account<>'') AS receiver_accounts,"
                 " COALESCE(g.name, '') AS group_name"
                 " FROM messages m LEFT JOIN groups g ON g.id = m.group_id"
                 " ORDER BY m.ts DESC, m.id DESC LIMIT ?",

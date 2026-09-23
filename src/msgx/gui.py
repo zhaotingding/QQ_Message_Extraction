@@ -27,7 +27,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from . import __version__
+from . import __version__, DISPLAY_VERSION
 from . import napcat as napcat_mod
 from . import prefs as prefs_mod
 from . import api_settings, credentials, security
@@ -129,7 +129,7 @@ class App:
     # ---------------- 界面构建 ----------------
 
     def _build(self) -> None:
-        self.root.title(f"{APP_TITLE}  v{__version__}")
+        self.root.title(f"{APP_TITLE}  v{DISPLAY_VERSION}")
         # 默认尺寸按屏幕算：写死 800 高在 768p 屏上会顶出屏幕，
         # 设置页底部的「保存设置」直接被切掉（用户得手动拉窗口才能看到）。
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -415,7 +415,7 @@ class App:
 
         wrap = ttk.Frame(tab)
         wrap.pack(fill="both", expand=True)
-        cols = ("time", "group", "who", "text", "state")
+        cols = ("time", "group", "who", "text", "state", "account")
         self.rt = ttk.Treeview(wrap, columns=cols, show="headings", height=18)
         headings = {
             "time": ("时间", 78, "center"),
@@ -423,6 +423,7 @@ class App:
             "who": ("发言人", 110, "w"),
             "text": ("内容", 430, "w"),
             "state": ("图片", 70, "center"),
+            "account": ("接收账号", 125, "w"),
         }
         for key, (title, width, anchor) in headings.items():
             self.rt.heading(key, text=title)
@@ -567,8 +568,8 @@ class App:
         ).pack(side="left", padx=8)
         ttk.Label(
             gp,
-            text="群列表来自已入库的数据；换过登录账号就会混进别的账号的群，"
-                 "可用「只保留当前账号的群」清掉（有消息的群一律保留）。",
+            text="群列表保留各账号的历史数据；共同群记录多个接收账号。"
+                 "「只保留当前账号的群」仅清理空群，有消息的群一律保留。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(4, 0))
 
@@ -609,6 +610,13 @@ class App:
         # --- 协议端 ---
         nc = ttk.LabelFrame(tab, text="协议端（NapCat）", padding=12)
         nc.pack(fill="x", pady=(12, 0))
+        account_row = ttk.Frame(nc)
+        account_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(account_row, text="目标 QQ 号（本分支填写大号）").pack(side="left")
+        self.v_qq_account = tk.StringVar()
+        ttk.Entry(account_row, textvariable=self.v_qq_account, width=20).pack(side="left", padx=8)
+        ttk.Label(nc, text="保存后重启消息服务生效；历史数据保留。首次换号请在 NapCat 管理页切换并扫码。",
+                  style="Hint.TLabel").pack(anchor="w", pady=(0, 6))
         self.v_napcat_hidden = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             nc,
@@ -726,6 +734,7 @@ class App:
         for key, var in self.v_filters.items():
             var.set(bool(f.get(key, False)))
         self.v_minlen.set(str(int(f.get("min_text_length") or 0)))
+        self.v_qq_account.set(str(p.get("qq_account") or (self.cfg.get("napcat") or {}).get("account") or ""))
 
         self.v_napcat_hidden.set(
             bool(
@@ -776,6 +785,9 @@ class App:
             raise ValueError("最小长度必须是整数")
 
         groups = [self._group_ids[i] for i in self.lst_groups.curselection()]
+        account = self.v_qq_account.get().strip()
+        if account and (not account.isascii() or not account.isdigit() or account == "0"):
+            raise ValueError("目标 QQ 号必须为非零数字账号")
         profile = api_settings.validate({key: var.get() for key, var in self.v_api.items()})
         return {
             **self.prefs,
@@ -793,6 +805,7 @@ class App:
                 "min_text_length": minlen,
             },
             "napcat_hidden": bool(self.v_napcat_hidden.get()),
+            "qq_account": account,
             "platform_token": self.txt_platform_token.get("1.0", "end").strip(),
             "ui": self.prefs.get("ui", {}),
         }
@@ -945,9 +958,12 @@ class App:
             if db.exists():
                 conn = sqlite3.connect(str(db), timeout=3)
                 try:
+                    owners = "g.bot_uin"
+                    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='group_accounts'").fetchone():
+                        owners = "(SELECT GROUP_CONCAT(account) FROM group_accounts WHERE group_id=g.id)"
                     rows = list(
                         conn.execute(
-                            "SELECT g.id, g.name, g.bot_uin,"
+                            f"SELECT g.id, g.name, {owners},"
                             " (SELECT COUNT(*) FROM messages m WHERE m.group_id = g.id)"
                             " FROM groups g ORDER BY g.id"
                         )
@@ -960,8 +976,10 @@ class App:
                     label = f"{name}  ({gid})" if name else f"(未命名)  {gid}"
                     # 属主看板：只有在「知道当前账号」且「这个群记的是别的账号」时才标。
                     # 属主为空 = 未知（老数据），不当成「别人的群」——那会误标一大片。
-                    if uin and owner and owner != uin:
-                        label += "   ⚠ 非当前账号"
+                    if owner:
+                        label += f"   接收账号：{owner}"
+                    if uin and owner and uin not in owner.split(","):
+                        label += "   · 历史群"
                     elif n == 0:
                         label += "   · 0 条"
                     self.lst_groups.insert("end", label)
@@ -973,7 +991,7 @@ class App:
                 self.lst_groups.selection_set(i)
         parts = [f"群列表已刷新，共 {len(self._group_ids)} 个群"]
         if uin:
-            mine = sum(1 for _g, _n, o, _c in rows if o == uin) if rows else 0
+            mine = sum(1 for _g, _n, o, _c in rows if uin in str(o or "").split(",")) if rows else 0
             parts.append(f"当前协议端账号 {uin}（其中 {mine} 个已标注属主）")
         else:
             parts.append("未能连到协议端，群名来自本地库；启动服务与协议端后可拉到真实群名")
@@ -1187,6 +1205,8 @@ class App:
             return
         if not self.save_prefs(silent=False):
             return
+        if self._login_config() is None:
+            return
 
         self.stop_file.unlink(missing_ok=True)  # 清掉上次停止留下的信号，否则新进程会立刻退出
         env = os.environ.copy()
@@ -1389,6 +1409,7 @@ class App:
                     r.get("sender_name") or "",
                     body,
                     state,
+                    r.get("receiver_accounts") or r.get("received_by") or "历史未知",
                 ),
                 tags=tuple(tags),
             )
@@ -1518,13 +1539,23 @@ class App:
         p = Path(raw)
         return p if p.is_absolute() else ROOT / p
 
+    def _login_config(self) -> dict | None:
+        account = str(self.prefs.get("qq_account") or "").strip()
+        if not account.isascii() or not account.isdigit() or account == "0":
+            self.status.set("请先在设置中填写并保存目标 QQ 号，再操作协议端")
+            return None
+        return {**self.cfg, "napcat": {**self.cfg.get("napcat", {}), "account": account}}
+
     def auto_login(self) -> None:
         if self._login_busy:
+            return
+        cfg = self._login_config()
+        if cfg is None:
             return
         self._login_busy = True
         self._login_verify_since = time.time()
         self._login_pending = False
-        self._login_account = ""
+        self._login_account = cfg["napcat"]["account"]
         self._login_wait_noted = False
         self.btn_login.configure(state="disabled")
         note = "正在自动登录：复用已保存账号；协议端未运行时将请求启动（可能需要 UAC 授权）…"
@@ -1535,13 +1566,13 @@ class App:
         def work() -> None:
             try:
                 if not napcat_mod.running_instances().get("injectors"):
-                    result = napcat_mod.launch(self.cfg, visible=visible)
+                    result = napcat_mod.launch(cfg, visible=visible)
                     if not result.get("ok"):
                         self.events.put(("login_done", {"ok": False, "note": result.get("error", "启动失败")}))
                         return
-                result = napcat_mod.quick_login(self.cfg)
+                result = napcat_mod.quick_login(cfg)
                 if result.get("scan"):
-                    result = napcat_mod.refresh_login_qrcode(self.cfg)
+                    result = napcat_mod.refresh_login_qrcode(cfg)
                 self.events.put(("login_done", result))
             except Exception:
                 self.events.put(("login_done", {"ok": False, "note": "自动登录异常，请查看协议端日志"}))
@@ -1555,11 +1586,13 @@ class App:
         self._log_ui(f"[界面] {result['note']}\n")
         if result.get("ok"):
             self._login_pending = True
-            self._login_account = str(result.get("account") or "")
+            self._login_account = str(result.get("account") or self.prefs.get("qq_account") or "")
             self._login_verify_since = self._login_verify_since or time.time()
             self.status.set("已连接，等待新消息验证；收到新 QQ 群消息后才确认登录成功")
             self.qr_watching = False
             self._close_qrcode()
+            if result.get("restart_since"):
+                self._start_qrcode_watch(fresh_only=True, since=result["restart_since"])
         elif result.get("scan"):
             self._start_qrcode_watch(fresh_only=True, since=result.get("qr_since", time.time() - 120))
 
@@ -1585,64 +1618,46 @@ class App:
         """二维码过期只刷新登录码，不结束普通 QQ。"""
         if self._login_busy:
             return
+        cfg = self._login_config()
+        if cfg is None:
+            return
         self._login_busy = True
         self._login_verify_since = time.time()
         self._login_pending = False
-        self._login_account = ""
+        self._login_account = cfg["napcat"]["account"]
         self._login_wait_noted = False
         self.btn_login.configure(state="disabled")
         self.status.set("正在刷新 NapCat 登录二维码…")
 
         def work() -> None:
-            self.events.put(("login_done", napcat_mod.refresh_login_qrcode(self.cfg)))
+            self.events.put(("login_done", napcat_mod.refresh_login_qrcode(cfg)))
 
         threading.Thread(target=work, daemon=True).start()
 
     def restart_napcat(self) -> None:
-        """手动强制重启：保留全退再拉起的恢复方式，必须先确认影响范围。"""
-        script = napcat_mod.restart_script(self.cfg)
-        if script is None or not script.exists():
-            self.status.set("无法重置：没有找到重置脚本，请检查 config.toml 的 [napcat] restart_script。")
-            self._log_ui(f"[界面] {self.status.get()}\n")
+        """仅重启已绑定账号的 NapCat Worker，不结束普通 QQ。"""
+        cfg = self._login_config()
+        if cfg is None or self._login_busy:
             return
-        if not messagebox.askyesno(
-            "强制重启协议端（全退 + 重登）",
-            "这一步会：\n"
-            "  1. 强行结束**所有** NapCat 注入器和 QQ.exe（包括你自己的 QQ 窗口）\n"
-            "  2. 再重新注入并拉起 QQ\n"
-            "  3. 已设置的账号将尝试自动登录；凭证失效时需要重新扫码\n\n"
-            "要现在强制重启吗？",
-            parent=self.root,
-        ):
-            self.status.set("已取消重置协议端")
+        account = cfg["napcat"]["account"]
+        if not messagebox.askyesno("强制重启协议端", f"仅重启目标 QQ {account} 的 NapCat 登录进程。继续吗？", parent=self.root):
             return
-
-        self._log_ui("[界面] 正在请求重置协议端（会弹一次 UAC，请点「是」）…\n")
-        self.status.set("已请求强制重启 —— 请在 UAC 窗口点「是」，等待自动登录或扫码")
-        # v0.5.7：在提权调用前记下起点，避免返回时新码已写好却被当成旧基线。
-        qr_since = time.time()
-        self._trace_gui("请求重置协议端")
-        try:
-            r = napcat_mod.restart(self.cfg)
-        except Exception as exc:  # noqa: BLE001
-            self._log_ui(f"[界面] 重置协议端异常：{exc}\n")
-            self.status.set(f"重置协议端失败：{exc}")
-            return
-        if not r.get("ok"):
-            self._log_ui(f"[界面] 重置协议端失败：{r.get('error')}\n")
-            self.status.set(f"重置协议端失败：{r.get('error') or '未知错误'}")
-            return
-        self._login_verify_since = qr_since
-        self._login_pending = True
-        self._login_account = ""
+        self._login_busy = True
+        self._login_verify_since = time.time()
+        self._login_account = account
+        self._login_pending = False
         self._login_wait_noted = False
-        self._log_ui(f"[界面] {r.get('note') or ''}\n")
-        self._log_ui(f"[界面] 重置记录：{r.get('log')}（运行状态页下方「日志」可切换到「协议端日志」查看）\n")
-        # 重置过程中协议端会断、再连回来；把行/二维码监听起来，别让用户自己去找二维码。
-        # 重置过程中协议端会断、再连回来。二维码**必须**只认重置之后新写的码：
-        # cache 里那个旧码早失效了，弹出来用户一扫就是「怎么扫都登不上」。
-        if self.napcat_dir():
-            self._start_qrcode_watch(fresh_only=True, since=qr_since)
+        self.btn_login.configure(state="disabled")
+        self.status.set("正在请求重启目标账号的 NapCat…")
+        self._log_ui(f"[界面] 正在请求重启目标 QQ {account} 的 NapCat…\n")
+
+        def work() -> None:
+            result = napcat_mod.restart_target(cfg)
+            if result.get("ok"):
+                result["restart_since"] = self._login_verify_since
+            self.events.put(("login_done", result))
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ---------------- 登录二维码 ----------------
 
@@ -1933,6 +1948,7 @@ class App:
             received = data.get("last_protocol_message") or {}
             verified = (float(received.get("received_at") or 0) > max(float(data.get("ws_connected_at") or 0), self._login_verify_since)
                         and float(received.get("message_time") or 0) >= int(max(float(data.get("ws_connected_at") or 0), self._login_verify_since))
+                        and (not self.prefs.get("qq_account") or str(received.get("self_id")) == self.prefs["qq_account"])
                         and (not self._login_account or str(received.get("self_id")) == self._login_account))
             self.v_peer.set(f"已连接 · {'已验证消息接收' if verified else '等待新消息验证'} · {', '.join(peers)}")
             # v0.5.7：保护的是重置前旧连接，扫码后的新连接不应再等待两分钟。

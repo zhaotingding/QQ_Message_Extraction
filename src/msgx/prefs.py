@@ -36,6 +36,7 @@ DEFAULTS: dict = {
     # 协议端启动方式：true = 隐藏控制台窗口（默认，用户明确不要任务栏里堆黑框）。
     # 它是界面上的勾选框，所以必须走偏好；界面不改写 config.toml。
     "napcat_hidden": True,
+    "qq_account": "",
     # DeepSeek 平台登录态 token（查真实消费用）。**留空 = 沿用 config.toml**。
     # 说明：它是短期凭证，存在本地偏好文件里（.ui/ 不入版本库），不会进 Git。
     "platform_token": "",
@@ -162,6 +163,8 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
     # 协议端隐藏启动：勾选框是「明确表达」，所以 true/false 都写下去。
     if "napcat_hidden" in prefs:
         out.setdefault("napcat", {})["hidden"] = bool(prefs.get("napcat_hidden"))
+    if "qq_account" in prefs:
+        out.setdefault("napcat", {})["account"] = str(prefs.get("qq_account") or "").strip()
 
     # 平台 token：留空 = 沿用 config.toml。
     token = str(prefs.get("platform_token") or "").strip()

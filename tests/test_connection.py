@@ -20,6 +20,31 @@ from msgx.pipeline import Pipeline
 
 
 class ConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bound_account_blocks_wrong_ws_and_http(self):
+        self.cfg['napcat']['account'] = '222'
+        self.pipe.target_account = '222'
+        runner = web.AppRunner(build_app(self.cfg, self.pipe))
+        await runner.setup()
+        site = web.TCPSite(runner, '127.0.0.1', 0)
+        await site.start()
+        url = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
+        try:
+            async with aiohttp.ClientSession() as client:
+                for headers in ({}, {'X-Self-ID':'111'}):
+                    with self.assertRaises(aiohttp.WSServerHandshakeError) as error:
+                        await client.ws_connect(url+'/onebot/ws', headers=headers)
+                    self.assertEqual(error.exception.status, 403)
+                async with client.post(url+'/onebot', json={'self_id':111}) as response:
+                    self.assertEqual(response.status, 403)
+                ws = await client.ws_connect(url+'/onebot/ws', headers={'X-Self-ID':'222'})
+                await ws.send_json({'post_type':'meta_event','self_id':111})
+                await ws.receive(timeout=2)
+                self.assertEqual(ws.close_code, 1008)
+                self.assertEqual(self.pipe.last_protocol_message, {})
+                await ws.close()
+        finally:
+            await runner.cleanup()
+
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)

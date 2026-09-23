@@ -4,4 +4,5 @@
 发版时只需改这一处，再更新 CHANGELOG.md 并打对应标签。
 """
 
-__version__ = "0.7.0"
+__version__ = "0.7.1.post2"
+DISPLAY_VERSION = "0.7.1-2大号"

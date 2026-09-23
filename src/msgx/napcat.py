@@ -279,6 +279,9 @@ class _WebUI:
 def recover_worker(cfg: dict, account: str) -> dict:
     """仅恢复指定账号的原生 Worker；没有缓存凭证时不破坏现有会话。"""
     dir_ = resolve_dir(cfg)
+    target = str((cfg.get("napcat") or {}).get("account") or "")
+    if target and target != account:
+        return {"ok": False, "note": "恢复账号与目标 QQ 不一致，未自动重启"}
     if dir_ is None or not account.isascii() or not account.isdigit():
         return {"ok": False, "note": "无法确定待恢复的 QQ 账号或 NapCat 目录"}
     try:
@@ -296,6 +299,25 @@ def recover_worker(cfg: dict, account: str) -> dict:
         return {"ok": False, "note": "请求恢复 NapCat 未成功；本次不重复重启，请查看协议端日志"}
 
 
+def restart_target(cfg: dict) -> dict:
+    """手动重启只通过本机 NapCat 管理接口，不使用全退 QQ 的脚本。"""
+    target = str((cfg.get("napcat") or {}).get("account") or "").strip()
+    dir_ = resolve_dir(cfg)
+    if not target.isascii() or not target.isdigit() or target == "0" or dir_ is None:
+        return {"ok": False, "note": "请先在设置中填写目标 QQ 号和 NapCat 目录"}
+    try:
+        client = _WebUI(dir_)
+        info = client.call("/QQLogin/GetQQLoginInfo") or {}
+        saved = str(client.call("/QQLogin/GetQuickLoginQQ") or "")
+        current = str(info.get("uin") or "")
+        if current not in ("", "0", target) or saved != target:
+            return {"ok": False, "note": "NapCat 当前账号或自动登录账号与目标 QQ 不一致；请先在 NapCat 管理页切换，未重启"}
+        client.call("/QQLogin/RestartNapCat")
+        return {"ok": True, "account": target, "note": f"已请求重启目标 QQ {target} 的 NapCat；等待新消息验证"}
+    except (OSError, ValueError, KeyError, RuntimeError):
+        return {"ok": False, "note": "NapCat 管理接口无法重启；未执行全退 QQ，请手动检查 NapCat"}
+
+
 def refresh_login_qrcode(cfg: dict) -> dict:
     """只刷新现有 NapCat 的登录码；不启动或结束任何 QQ 进程。"""
     dir_ = resolve_dir(cfg)
@@ -306,6 +328,9 @@ def refresh_login_qrcode(cfg: dict) -> dict:
         state = client.call("/QQLogin/CheckLoginStatus") or {}
         if state.get("isLogin") and state.get("coreReady"):
             info = client.call("/QQLogin/GetQQLoginInfo") or {}
+            target = str((cfg.get("napcat") or {}).get("account") or "")
+            if target and str(info.get("uin") or "") != target:
+                return {"ok": False, "note": "NapCat 当前登录的不是目标 QQ，请先在 NapCat 管理页切换账号"}
             return {"ok": True, "account": str(info.get("uin") or ""),
                     "note": "QQ 已在线；等待新消息验证，无需刷新二维码"}
         if state.get("loginPhase") in ("reconnecting", "initializing"):
@@ -315,7 +340,8 @@ def refresh_login_qrcode(cfg: dict) -> dict:
         if result.get("restarting"):
             return {"ok": False, "note": "NapCat 正在恢复登录，请稍后再刷新二维码"}
         return {"ok": False, "scan": True, "qr_since": since,
-                "note": "已请求新二维码，请用目标小号扫码；未重启任何 QQ 客户端"}
+                "account": str((cfg.get("napcat") or {}).get("account") or ""),
+                "note": "已请求新二维码，请用设置中的目标 QQ 扫码；未重启任何 QQ 客户端"}
     except (OSError, ValueError, KeyError, RuntimeError):
         return {"ok": False, "note": "刷新二维码失败，请查看协议端日志；未执行强制重启"}
 
@@ -329,6 +355,7 @@ def quick_login(cfg: dict, wait_seconds: float = 60) -> dict:
     client = None
     submitted = False
     account = ""
+    target = str((cfg.get("napcat") or {}).get("account") or "").strip()
     try:
         while True:
             try:
@@ -347,6 +374,8 @@ def quick_login(cfg: dict, wait_seconds: float = 60) -> dict:
             if state.get("isLogin") and state.get("coreReady"):
                 info = client.call("/QQLogin/GetQQLoginInfo") or {}
                 account = str(info.get("uin") or account)
+                if target and account != target:
+                    return {"ok": False, "note": "NapCat 当前登录的不是目标 QQ；未修改自动登录账号，请先在 NapCat 管理页切换"}
                 if not account.isdigit():
                     return {"ok": False, "note": "QQ 已在线，但未能读取账号，尚未启用自动登录"}
                 if str(client.call("/QQLogin/GetQuickLoginQQ") or "") != account:
@@ -355,7 +384,7 @@ def quick_login(cfg: dict, wait_seconds: float = 60) -> dict:
                         "note": f"QQ {account} 已在线，自动登录已启用；等待新消息验证"}
             phase = state.get("loginPhase")
             if not submitted and phase == "waiting_qrcode":
-                account = str(client.call("/QQLogin/GetQuickLoginQQ") or "")
+                account = target or str(client.call("/QQLogin/GetQuickLoginQQ") or "")
                 accounts = [str(item) for item in (client.call("/QQLogin/GetQuickLoginList") or [])]
                 if not account and len(accounts) == 1:
                     account = accounts[0]

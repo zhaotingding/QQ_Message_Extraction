@@ -56,6 +56,9 @@ async def _http_report(request: web.Request) -> web.Response:
         return web.Response(status=400, text="bad json")
     if not isinstance(event, dict):
         return web.json_response({"error": "事件必须是对象"}, status=400)
+    target = str((request.app["cfg"].get("napcat") or {}).get("account") or "")
+    if target and str(event.get("self_id") or "") != target:
+        return web.json_response({"error": "非目标 QQ 账号"}, status=403)
     if await request.app["pipe"].submit(event):
         request.app["pipe"].note_protocol_message(event)
     return web.json_response({"status": "ok", "retcode": 0})
@@ -68,6 +71,10 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
         return web.Response(status=401, text="unauthorized")
 
     ws = web.WebSocketResponse(heartbeat=30, max_msg_size=MAX_WS_MSG)
+    target = str((request.app["cfg"].get("napcat") or {}).get("account") or "")
+    if target and request.headers.get("X-Self-ID") != target:
+        log.warning("拒绝非目标 QQ 的协议连接，请核对设置中的目标 QQ 号")
+        return web.Response(status=403, text="account mismatch")
     await ws.prepare(request)
     pipe = request.app["pipe"]
     peer = str(request.remote)
@@ -89,6 +96,9 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
                     continue
                 if not isinstance(event, dict):
                     continue
+                if target and "post_type" in event and str(event.get("self_id") or "") != target:
+                    await ws.close(code=1008, message=b"account mismatch")
+                    break
                 # OneBot API 响应（带 echo、无 post_type）不是事件：
                 # 它是对我们 call_action 的应答，必须先于事件处理拦截，否则
                 # 会被当成消息提交、然后被「非群消息」静默丢弃。

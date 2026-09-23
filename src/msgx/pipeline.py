@@ -68,6 +68,7 @@ class Pipeline:
         self._echo_seq = 0
         # 当前协议端登录的 QQ 号（群属主）。连上后查一次就缓存，见 login_uin()。
         self.bot_uin = ""
+        self.target_account = str((self.cfg.get("napcat") or {}).get("account") or "").strip()
         self._peer_watch: asyncio.Task | None = None
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
@@ -161,6 +162,8 @@ class Pipeline:
         删数据必须由用户显式点一下（界面的「只保留当前账号的群」）。
         """
         uin = await self.login_uin()
+        if self.target_account and uin != self.target_account:
+            raise RuntimeError("协议端登录账号与设置的目标 QQ 不一致，请核对账号")
         data = await self.call_action("get_group_list", {}, 8.0)
         keep: set[str] = set()
         for g in data or []:
@@ -289,15 +292,15 @@ class Pipeline:
         if event.get("post_type") != "message" or event.get("message_type") != "group":
             return
         self_id = str(event.get("self_id") or "")
+        if self.target_account and self_id != self.target_account:
+            return
         if not self_id.isdigit() or self_id == "0" or not event.get("message_id") or not event.get("time"):
             return
         try:
             msg = parse_onebot_event(event, self_id, {self_id})
         except (TypeError, ValueError, AttributeError):
             return
-        if msg is None or self.store.conn.execute(
-            "SELECT 1 FROM messages WHERE group_id=? AND msg_id=?", (msg.group_id, msg.msg_id)
-        ).fetchone():
+        if msg is None or self.store.has_receipt(self_id, msg.group_id, msg.msg_id):
             return
         self.last_protocol_message = {"received_at": time.time(), "message_time": msg.ts, "self_id": self_id}
         if (self._receive_warning and self_id == self._receive_warning.get("account")
@@ -331,6 +334,9 @@ class Pipeline:
     async def handle_event(self, event: dict) -> dict:
         self.counters["received"] += 1
         self_id = str(event.get("self_id", ""))
+        if self.target_account and self_id != self.target_account:
+            self.counters["skipped"] += 1
+            return {"ok": False, "reason": "非目标 QQ 账号，未入库"}
         # self_id 就是「收到这条消息的账号」，是群属主最直接的证据。
         # 但**不能无脑采信**：本项目的诊断探针（diagnose_freeze）走的就是这条路，
         # 它把 self_id 填成 0 —— 若不设防，探针会把群属主写成 "0"。
@@ -353,7 +359,7 @@ class Pipeline:
             # v0.5.7：图片/表情过滤后仍留一行状态，让实时页能说明为何没有识别结果。
             # 只存简要记录，既不进媒体队列，也不参与打分或摘要。
             if reason in ("纯表情", "纯图片"):
-                row_id = self.store.insert_message(msg, self.group_name(msg.group_id), self.bot_uin,
+                row_id = self.store.insert_message(msg, self.group_name(msg.group_id), self_id if self_id.isdigit() and self_id != "0" else "",
                                                    filtered=True)
                 if row_id is None:
                     self.counters["duplicate"] += 1
@@ -362,7 +368,7 @@ class Pipeline:
             return {"ok": False, "reason": f"已按过滤规则丢弃: {reason}"}
 
         name = self.group_name(msg.group_id)
-        row_id = self.store.insert_message(msg, name, self.bot_uin)
+        row_id = self.store.insert_message(msg, name, self_id if self_id.isdigit() and self_id != "0" else "")
         if row_id is None:
             self.counters["duplicate"] += 1
             return {"ok": True, "duplicate": True}
@@ -432,7 +438,7 @@ class Pipeline:
         age = napcat.qq_msg_db_age(self.bot_uin)
         if age is None or age < stale_s:
             return
-        base = self.store.hour_baseline(datetime.now().hour, int(wg.get("baseline_days", 7)))
+        base = self.store.hour_baseline(datetime.now().hour, int(wg.get("baseline_days", 7)), self.bot_uin)
         if base < int(wg.get("busy_min_messages", 5)):
             return
         self._receive_warning = {"state": "stalled", "since": now, "account": self.bot_uin,

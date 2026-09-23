@@ -46,6 +46,8 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 print("=== 构建界面 ===")
 root = tk.Tk()
 app = App(root)
+app.prefs["qq_account"] = "123"
+app.v_qq_account.set("123")
 root.update()  # 强制完成一次几何计算，布局错误会在这时抛出
 print("  界面构建完成，无异常")
 
@@ -112,7 +114,7 @@ nb = app.nb
 check("有实时消息标签页", any(str(nb.tab(i, "text")) == "实时消息" for i in range(nb.index("end"))),
       str([str(nb.tab(i, "text")) for i in range(nb.index("end"))]))
 check("实时消息表格列齐全",
-      list(app.rt["columns"]) == ["time", "group", "who", "text", "state"],
+      list(app.rt["columns"]) == ["time", "group", "who", "text", "state", "account"],
       str(list(app.rt["columns"])))
 app._render_messages(None)
 check("拉取失败时给出说明", "失败" in app.v_rt_status.get(), app.v_rt_status.get())
@@ -597,7 +599,7 @@ with _tf.TemporaryDirectory() as _tmp:
         return {"ok": True, "note": "测试重置", "log": "测试日志"}
 
     with patch.dict(os.environ, {"NAPCAT_HOME": str(_nc)}), \
-            patch.object(N, "restart", side_effect=_fake_restart) as _restart, \
+            patch.object(N, "restart_target", side_effect=_fake_restart) as _restart, \
             patch.object(_mb, "askyesno", return_value=True):
         check("未填目录时 GUI 与启动器定位同一目录", app.napcat_dir() == N.resolve_dir(app.cfg) == _nc)
         app.restart_napcat()
@@ -844,6 +846,7 @@ with patch("msgx.gui.threading.Thread") as _thread, patch.object(N, "running_ins
 with patch("msgx.gui.threading.Thread") as _thread, patch.object(N, "running_instances", return_value={"injectors": 0}), \
         patch.object(N, "launch", return_value={"ok": True}) as _launch, \
         patch.object(N, "quick_login", return_value={"ok": False, "scan": True, "note": "请重新扫码"}) as _quick, \
+        patch.object(N, "refresh_login_qrcode", return_value={"ok": False, "scan": True, "note": "模拟二维码"}), \
         patch.object(app, "_start_qrcode_watch") as _watch, patch.object(N, "restart") as _restart:
     app.auto_login()
     _thread.call_args.kwargs["target"]()
