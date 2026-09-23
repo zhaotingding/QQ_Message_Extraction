@@ -7,7 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
 from aiohttp import web
@@ -70,6 +70,60 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_logs_do_not_invent_cause(self):
         self.assertEqual(login_failure(self.cfg), {})
         self.assertEqual(self.pipe.protocol_status()["state"], "disconnected")
+
+    async def test_stalled_account_recovers_once_and_requires_fresh_message(self):
+        pipe = self.pipe
+        now = time.time()
+        pipe.bot_uin = "123"
+        pipe.started_at = pipe.ws_connected_at = now - 4000
+        pipe.ws_conns.add(Mock(closed=False))
+        pipe.last_protocol_message = {"self_id": "123", "received_at": now - 2000}
+        with patch("msgx.pipeline.napcat.qq_msg_db_age", return_value=2000) as age, \
+                patch.object(pipe.store, "hour_baseline", return_value=20), \
+                patch("msgx.pipeline.napcat.recover_worker", return_value={"ok": True, "note": "等待新消息"}) as recover:
+            await pipe._check_receive_health()
+            age.assert_called_once_with("123")
+            recover.assert_called_once_with(pipe.cfg, "123")
+            self.assertEqual(pipe.protocol_status()["state"], "recovering")
+            pipe._receive_warning["since"] -= 121
+            await pipe._check_receive_health()
+            self.assertEqual(pipe.protocol_status()["state"], "stalled")
+            event = {"post_type": "message", "message_type": "group", "self_id": 456,
+                     "group_id": 789, "user_id": 111, "message_id": 1, "time": int(now),
+                     "message": [{"type": "text", "data": {"text": "测试"}}]}
+            pipe.note_protocol_message(event)
+            self.assertTrue(pipe._receive_warning)  # 另一账号不能确认恢复
+            pipe.note_protocol_message(dict(event, self_id=123, time=int(now - 4000)))
+            self.assertTrue(pipe._receive_warning)  # 旧历史消息不能确认恢复
+            pipe.note_protocol_message(dict(event, self_id=123))
+            self.assertFalse(pipe._receive_warning)
+            self.assertEqual(pipe.protocol_status()["state"], "connected")
+            # 恢复后再次停收仍遵守一小时冷却，不反复重启。
+            pipe.last_protocol_message["received_at"] = now - 2000
+            await pipe._check_receive_health()
+            self.assertEqual(recover.call_count, 1)
+
+    async def test_no_recovery_without_account_evidence_stale_db_and_busy_baseline(self):
+        pipe = self.pipe
+        now = time.time()
+        pipe.bot_uin = "123"
+        pipe.started_at = pipe.ws_connected_at = now - 4000
+        pipe.ws_conns.add(Mock(closed=False))
+        with patch("msgx.pipeline.napcat.qq_msg_db_age", return_value=2000) as age, \
+                patch.object(pipe.store, "hour_baseline", return_value=20) as baseline, \
+                patch("msgx.pipeline.napcat.recover_worker") as recover:
+            await pipe._check_receive_health()  # 尚未验证过消息
+            pipe.last_protocol_message = {"self_id": "123", "received_at": now}
+            await pipe._check_receive_health()  # 活跃消息
+            pipe.last_protocol_message["received_at"] = now - 2000
+            for db_age in (None, 10):
+                age.return_value = db_age
+                await pipe._check_receive_health()
+            age.return_value = 2000
+            baseline.return_value = 0
+            await pipe._check_receive_health()  # 安静时段
+            recover.assert_not_called()
+            self.assertFalse(pipe._receive_warning)
 
     async def test_year_boundary(self):
         self.log.write_text("12-31 23:59:59 [error] bot | [KickedOffLine] [下线通知] 失效\n", encoding="utf-8")

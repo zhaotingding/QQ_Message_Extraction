@@ -1,8 +1,10 @@
 """自动登录回归：仅模拟本机管理接口，不操作 QQ 或调用模型。"""
 import hashlib
 import json
+import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -12,6 +14,63 @@ from msgx import napcat
 
 
 class LoginTests(unittest.TestCase):
+    def test_refresh_qr_does_not_restart_or_change_account(self):
+        for phase, online, refresh in (("waiting_qrcode", False, True),
+                                        ("ready", True, False), ("initializing", False, False)):
+            client = Mock()
+            client.call.side_effect = lambda path: {
+                "/QQLogin/CheckLoginStatus": {"isLogin": online, "coreReady": online, "loginPhase": phase},
+                "/QQLogin/GetQQLoginInfo": {"uin": "123"},
+                "/QQLogin/RefreshQRcode": {"qrcodeurl": "private-login-url"},
+            }[path]
+            with patch.object(napcat, "_WebUI", return_value=client), \
+                    patch.object(napcat, "restart") as restart, patch.object(napcat, "launch") as launch:
+                result = napcat.refresh_login_qrcode({"napcat": {"dir": "mock"}})
+            calls = [c.args[0] for c in client.call.call_args_list]
+            self.assertEqual("/QQLogin/RefreshQRcode" in calls, refresh)
+            self.assertEqual(bool(result.get("scan")), refresh)
+            self.assertNotIn("private-login-url", str(result))
+            self.assertFalse(any("/Set" in c or "Restart" in c for c in calls))
+            restart.assert_not_called()
+            launch.assert_not_called()
+
+    def test_recovery_never_restarts_or_logs_in_as_other_account(self):
+        for current, saved, cached, expected in (
+                ("123", "123", ["456"], False),
+                ("456", "123", ["123", "456"], False),
+                ("123", "456", ["123", "456"], False),
+                ("123", "123", ["123", "456"], True)):
+            with self.subTest(current=current, saved=saved, cached=cached):
+                client = Mock()
+                client.call.side_effect = lambda path: {
+                    "/QQLogin/GetQQLoginInfo": {"uin": current},
+                    "/QQLogin/GetQuickLoginQQ": saved,
+                    "/QQLogin/GetQuickLoginList": cached,
+                    "/QQLogin/RestartNapCat": None,
+                }[path]
+                with patch.object(napcat, "_WebUI", return_value=client), \
+                        patch.object(napcat, "restart") as force, patch.object(napcat, "launch") as launch:
+                    result = napcat.recover_worker({"napcat": {"dir": "mock"}}, "123")
+                self.assertEqual(result["ok"], expected)
+                calls = [c.args[0] for c in client.call.call_args_list]
+                self.assertEqual(calls.count("/QQLogin/RestartNapCat"), int(expected))
+                self.assertFalse(any("/Set" in c for c in calls))
+                force.assert_not_called()
+                launch.assert_not_called()
+
+    def test_active_other_account_cannot_mask_stale_target_database(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"QQ_DATA_ROOT": tmp}):
+            for account, age in (("123", 4000), ("456", 0)):
+                p = Path(tmp) / account / "nt_qq/nt_db/nt_msg.db-wal"
+                p.parent.mkdir(parents=True)
+                p.write_bytes(b"test")
+                stamp = time.time() - age
+                os.utime(p, (stamp, stamp))
+            self.assertLess(napcat.qq_msg_db_age(), 5)
+            self.assertGreater(napcat.qq_msg_db_age("123"), 3990)
+            self.assertIsNone(napcat.qq_msg_db_age("789"))
+            self.assertIsNone(napcat.qq_msg_db_age("../456"))
+
     def run_login(self, states, *, configured="123", accounts=None, fail=False, wait=10):
         client = Mock()
         status = iter(states)

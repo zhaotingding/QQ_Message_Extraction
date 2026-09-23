@@ -48,6 +48,8 @@ class Pipeline:
         self.ws_disconnected_at = 0.0
         self.ws_last_close = ""
         self.last_protocol_message: dict = {}
+        self._receive_warning: dict = {}
+        self._recovery_attempt_at = 0.0
         self.ws_online: dict = {}
         self.ws_addresses: dict = {}
         self._closing_ws = False
@@ -236,6 +238,8 @@ class Pipeline:
     def protocol_status(self) -> dict:
         live = [ws for ws in self.ws_conns if not ws.closed]
         if live and any(self.ws_online.get(ws) is not False for ws in live):
+            if self._receive_warning:
+                return dict(self._receive_warning)
             return {"state": "connected", "message": "协议端已连接", "since": self.ws_connected_at}
         now = time.monotonic()
         if not self._protocol_checked or now - self._protocol_checked >= 5:
@@ -296,6 +300,10 @@ class Pipeline:
         ).fetchone():
             return
         self.last_protocol_message = {"received_at": time.time(), "message_time": msg.ts, "self_id": self_id}
+        if (self._receive_warning and self_id == self._receive_warning.get("account")
+                and msg.ts >= int(max(self.ws_connected_at, self._receive_warning["since"]))):
+            self._receive_warning = {}
+            log.info("消息接收已恢复：已收到当前账号的新 QQ 群消息")
 
     async def submit(self, event: dict) -> bool:
         """非阻塞投递事件，由接入层调用。队列满时丢弃并计数，避免阻塞 WebSocket。"""
@@ -404,55 +412,55 @@ class Pipeline:
 
     # ---------- 看门狗 ----------
 
+    async def _check_receive_health(self) -> None:
+        """按当前账号检查停收；一次故障至多尝试恢复一次，真实新消息才解除。"""
+        now = time.time()
+        if self._receive_warning:
+            if (self._receive_warning["state"] == "recovering"
+                    and now - self._receive_warning["since"] >= 120):
+                self._receive_warning.update(state="stalled", message="自动恢复尚未收到新消息；已停止重复重启，请查看协议端登录状态")
+                log.warning(self._receive_warning["message"])
+            return
+        if not self.bot_uin or not any(not ws.closed for ws in self.ws_conns):
+            return
+        wg = self.cfg.get("watchdog") or {}
+        stale_s = max(300, int(wg.get("stale_minutes", 30)) * 60)
+        evidence = self.last_protocol_message
+        if (evidence.get("self_id") != self.bot_uin
+                or now - max(self.started_at, self.ws_connected_at, evidence.get("received_at", 0)) < stale_s):
+            return
+        age = napcat.qq_msg_db_age(self.bot_uin)
+        if age is None or age < stale_s:
+            return
+        base = self.store.hour_baseline(datetime.now().hour, int(wg.get("baseline_days", 7)))
+        if base < int(wg.get("busy_min_messages", 5)):
+            return
+        self._receive_warning = {"state": "stalled", "since": now, "account": self.bot_uin,
+                                 "message": "疑似停收：当前 QQ 账号和服务均长时间未收到消息"}
+        log.warning("疑似停收：QQ %s 消息库已 %.0f 分钟未写入，服务同期无新群消息（小时基线 %d 条）",
+                    self.bot_uin, age / 60, base)
+        if now - self._recovery_attempt_at < 3600:
+            self._receive_warning["message"] += "；一小时内已尝试恢复，不再自动重启"
+            return
+        self._recovery_attempt_at = now
+        self._receive_warning.update(state="recovering", message="正在尝试恢复消息接收；等待新消息验证")
+        log.warning("正在尝试恢复当前账号的 NapCat 登录进程；仅本次一次，不关闭普通 QQ")
+        result = await asyncio.to_thread(napcat.recover_worker, self.cfg, self.bot_uin)
+        # 请求期间若已有真实消息恢复，不能把状态覆盖回等待。
+        if self._receive_warning:
+            self._receive_warning.update(state="recovering" if result["ok"] else "stalled", message=result["note"])
+            log.warning(result["note"])
+
     async def _watchdog_loop(self) -> None:
-        """协议端「连着却不推消息」时记录警告（v0.5.4）。
-
-        要解决的问题：协议端可以**连着、能应答 API，却一条消息都不推**。
-        这种状态下 `/health` 一切正常，界面上「协议端已连接」是绿的，
-        唯一征兆是消息不再进来 —— 实测最长挂了 9 小时，全靠用户自己发现。
-
-        **判据必须同时满足四条，少一条都会误报**（这是本项目的血泪）：
-          ① 协议端连着 —— 断开有另一条专门的告警，这里不重复报；
-          ② 桌面 QQ 的消息库 `nt_msg.db-wal` 长时间没写入 —— 上游的直接证据；
-          ③ 本库同期也没有新消息 —— 排除「QQ 库在写、只是没写我们的群」；
-          ④ 这个小时按历史基线**本该是活跃的** —— 否则凌晨一点必然误报，
-             而深夜没人讲话是常态，不是故障。
-
-        只记录一次：警告后解除武装，等 ② 恢复（QQ 库重新开始写）才重新武装。
-        仅记录日志，不弹窗、不发声、不推送，也不自动重启。
-        """
+        """低频检查静默停收；不调用模型，不弹窗或发送通知。"""
         wg = self.cfg.get("watchdog") or {}
         if not wg.get("enabled", True):
             return
         every = max(30, int(wg.get("check_seconds", 300)))
-        stale_s = max(300, int(wg.get("stale_minutes", 30)) * 60)
-        busy_min = int(wg.get("busy_min_messages", 5))
-        days = int(wg.get("baseline_days", 7))
-        armed = True
         while not self._stop.is_set():
             try:
                 await asyncio.sleep(every)
-                age = napcat.qq_msg_db_age()
-                if age is None:
-                    continue  # 查不到 QQ 数据目录 —— 不据此下任何结论
-                if age < stale_s:
-                    armed = True  # 上游活着，重新武装
-                    continue
-                if not self.ws_peers:
-                    continue  # 协议端没连着：那是另一种告警，这里不抢
-                if self.store.messages_since(int(time.time()) - stale_s):
-                    continue  # 还在收消息，说明只是 QQ 库的 mtime 没动（别的号在写）
-                hour = datetime.now().hour
-                base = self.store.hour_baseline(hour, days)
-                if base < busy_min:
-                    log.debug("看门狗：%d 点历史基线仅 %d 条，判定『本来就没人说话』，不告警", hour, base)
-                    armed = True
-                    continue
-                if not armed:
-                    continue
-                armed = False
-                log.warning("看门狗：QQ 消息库已 %.0f 分钟无写入，本库同期也无新消息"
-                            "（%d 点历史基线 %d 条）—— 判定消息冻结", age / 60, hour, base)
+                await self._check_receive_health()
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001

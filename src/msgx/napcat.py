@@ -276,6 +276,50 @@ class _WebUI:
         return result.get("data")
 
 
+def recover_worker(cfg: dict, account: str) -> dict:
+    """仅恢复指定账号的原生 Worker；没有缓存凭证时不破坏现有会话。"""
+    dir_ = resolve_dir(cfg)
+    if dir_ is None or not account.isascii() or not account.isdigit():
+        return {"ok": False, "note": "无法确定待恢复的 QQ 账号或 NapCat 目录"}
+    try:
+        client = _WebUI(dir_)
+        info = client.call("/QQLogin/GetQQLoginInfo") or {}
+        saved = str(client.call("/QQLogin/GetQuickLoginQQ") or "")
+        accounts = [str(item) for item in (client.call("/QQLogin/GetQuickLoginList") or [])]
+        if str(info.get("uin") or "") != account or saved != account:
+            return {"ok": False, "note": "当前账号与自动登录账号不一致，未自动重启"}
+        if account not in accounts:
+            return {"ok": False, "note": "当前账号的快速登录凭证不可用，未自动重启；请手动重新扫码"}
+        client.call("/QQLogin/RestartNapCat")
+        return {"ok": True, "note": "已请求恢复 NapCat 登录进程；等待新消息验证"}
+    except (OSError, ValueError, KeyError, RuntimeError):
+        return {"ok": False, "note": "请求恢复 NapCat 未成功；本次不重复重启，请查看协议端日志"}
+
+
+def refresh_login_qrcode(cfg: dict) -> dict:
+    """只刷新现有 NapCat 的登录码；不启动或结束任何 QQ 进程。"""
+    dir_ = resolve_dir(cfg)
+    if dir_ is None:
+        return {"ok": False, "note": "未找到 NapCat 安装目录"}
+    try:
+        client = _WebUI(dir_)
+        state = client.call("/QQLogin/CheckLoginStatus") or {}
+        if state.get("isLogin") and state.get("coreReady"):
+            info = client.call("/QQLogin/GetQQLoginInfo") or {}
+            return {"ok": True, "account": str(info.get("uin") or ""),
+                    "note": "QQ 已在线；等待新消息验证，无需刷新二维码"}
+        if state.get("loginPhase") in ("reconnecting", "initializing"):
+            return {"ok": False, "note": "NapCat 正在恢复或完成登录，请稍后再刷新二维码"}
+        since = time.time()
+        result = client.call("/QQLogin/RefreshQRcode") or {}
+        if result.get("restarting"):
+            return {"ok": False, "note": "NapCat 正在恢复登录，请稍后再刷新二维码"}
+        return {"ok": False, "scan": True, "qr_since": since,
+                "note": "已请求新二维码，请用目标小号扫码；未重启任何 QQ 客户端"}
+    except (OSError, ValueError, KeyError, RuntimeError):
+        return {"ok": False, "note": "刷新二维码失败，请查看协议端日志；未执行强制重启"}
+
+
 def quick_login(cfg: dict, wait_seconds: float = 60) -> dict:
     """启用原生自动登录，并在离线时尝试一次；不重启、不循环提交凭证。"""
     dir_ = resolve_dir(cfg)
@@ -657,8 +701,8 @@ QQ_DATA_ROOTS = (
 )
 
 
-def qq_msg_db_age() -> float | None:
-    """桌面 QQ 的账号消息库「最后一次写入」距今多少秒；找不到返回 None。
+def qq_msg_db_age(account: str = "") -> float | None:
+    """指定账号消息库最后写入距今秒数；省略账号仅供兼容诊断，找不到返回 None。
 
     ``nt_msg.db-wal`` 的 mtime 就是「QQ 最后一次把消息写进本地库」的时刻。
     它是判断**第 4 种冻结形态**（QQ 客户端自己就没收到）的唯一外部证据 ——
@@ -677,11 +721,13 @@ def qq_msg_db_age() -> float | None:
     else:
         roots.extend(QQ_DATA_ROOTS)
     newest: float | None = None
+    if account and (not account.isascii() or not account.isdigit()):
+        return None
     for root in roots:
         try:
             if not root.is_dir():
                 continue
-            for w in root.glob("*/nt_qq/nt_db/nt_msg.db-wal"):
+            for w in root.glob(f"{account or '*'}/nt_qq/nt_db/nt_msg.db-wal"):
                 m = w.stat().st_mtime
                 if newest is None or m > newest:
                     newest = m

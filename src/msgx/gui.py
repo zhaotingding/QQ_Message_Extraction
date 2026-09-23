@@ -1405,7 +1405,10 @@ class App:
                     if not result.get("ok"):
                         self.events.put(("login_done", {"ok": False, "note": result.get("error", "启动失败")}))
                         return
-                self.events.put(("login_done", napcat_mod.quick_login(self.cfg)))
+                result = napcat_mod.quick_login(self.cfg)
+                if result.get("scan"):
+                    result = napcat_mod.refresh_login_qrcode(self.cfg)
+                self.events.put(("login_done", result))
             except Exception:
                 self.events.put(("login_done", {"ok": False, "note": "自动登录异常，请查看协议端日志"}))
 
@@ -1424,7 +1427,7 @@ class App:
             self.qr_watching = False
             self._close_qrcode()
         elif result.get("scan"):
-            self._start_qrcode_watch(fresh_only=True, since=time.time() - 120)
+            self._start_qrcode_watch(fresh_only=True, since=result.get("qr_since", time.time() - 120))
 
     def _verify_login_message(self, data: dict) -> None:
         if not self._login_pending:
@@ -1445,20 +1448,21 @@ class App:
             self._log_ui(f"[界面] {note}\n")
 
     def relogin_napcat(self) -> None:
-        """优先展示协议端自行生成的新码，避免为扫码再启动一份 QQ。"""
-        d = self.napcat_dir()
-        qr = d / "cache" / "qrcode.png" if d else None
-        try:
-            mtime = qr.stat().st_mtime if qr else 0.0
-        except OSError:
-            mtime = 0.0
-        since = float(self._protocol_state.get("since") or 0.0)
-        if mtime >= since and 0 <= time.time() - mtime < 120:
-            self._start_qrcode_watch(fresh_only=True, since=since)
-            self.status.set("正在显示新的登录二维码，请用手机 QQ 扫码")
-        else:
-            # 已过期的二维码不能冒充可用；沿用有明确确认的重置流程。
-            self.restart_napcat()
+        """二维码过期只刷新登录码，不结束普通 QQ。"""
+        if self._login_busy:
+            return
+        self._login_busy = True
+        self._login_verify_since = time.time()
+        self._login_pending = False
+        self._login_account = ""
+        self._login_wait_noted = False
+        self.btn_login.configure(state="disabled")
+        self.status.set("正在刷新 NapCat 登录二维码…")
+
+        def work() -> None:
+            self.events.put(("login_done", napcat_mod.refresh_login_qrcode(self.cfg)))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def restart_napcat(self) -> None:
         """手动强制重启：保留全退再拉起的恢复方式，必须先确认影响范围。"""
@@ -1614,6 +1618,7 @@ class App:
                 padx=20, pady=(16, 8)
             )
             ttk.Label(win, image=photo).pack(padx=20, pady=4)
+            ttk.Button(win, text="二维码过期？刷新二维码", command=self.relogin_napcat).pack(pady=6)
             ttk.Label(
                 win, text="登录成功后本窗口会自动关闭；也可以直接关掉它", style="Hint.TLabel"
             ).pack(pady=(6, 14))
@@ -1788,6 +1793,8 @@ class App:
             self.btn_relogin.grid()
         elif state == "offline":
             self.v_peer.set("连接存在 · QQ 已离线")
+        elif state in ("stalled", "recovering"):
+            self.v_peer.set("疑似停止接收消息" if state == "stalled" else "正在恢复 · 等待新消息验证")
         elif peers:
             received = data.get("last_protocol_message") or {}
             verified = (float(received.get("received_at") or 0) > max(float(data.get("ws_connected_at") or 0), self._login_verify_since)

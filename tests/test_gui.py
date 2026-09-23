@@ -797,16 +797,23 @@ app._apply_health({"ws_peers": ["127.0.0.1"], "protocol": {
     "message": "QQ 登录已失效，需要重新扫码"}})
 check("登录失效不能因 WS 仍存在就显示在线", "登录失效" in app.v_peer.get())
 check("运行状态给出明确恢复入口", bool(app.btn_relogin.grid_info()) and "重新扫码" in app.v_protocol_detail.get())
-with patch.object(Path, "stat", return_value=type("Stat", (), {"st_mtime": time.time()})()), \
+with patch.object(N, "refresh_login_qrcode", return_value={"ok": False, "scan": True,
+        "qr_since": time.time(), "note": "已刷新二维码"}) as _refresh, \
+        patch("msgx.gui.threading.Thread") as _thread, patch.object(app.events, "put") as _put, \
         patch.object(app, "_start_qrcode_watch") as _watch, patch.object(app, "restart_napcat") as _restart:
+    app._login_busy = False
     app.relogin_napcat()
-    check("已有新码直接展示，不重启 QQ", _watch.called and not _restart.called)
-with patch.object(Path, "stat", return_value=type("Stat", (), {"st_mtime": time.time() - 3600})()), \
-        patch.object(app, "_start_qrcode_watch") as _watch, patch.object(app, "restart_napcat") as _restart:
-    app.relogin_napcat()
-    check("旧码走已有确认重置流程，不冒充有效二维码", not _watch.called and _restart.called)
+    _thread.call_args.kwargs["target"]()
+    app._dispatch_event(*_put.call_args.args[0])
+    check("过期二维码只请求新码，不强制重启任何 QQ", _refresh.call_count == 1
+          and _watch.called and not _restart.called and not app._login_busy)
 app._apply_health({"ws_peers": ["127.0.0.1"], "protocol": {"state": "offline", "message": "QQ 心跳报告离线"}})
 check("心跳离线不会显示健康", "QQ 已离线" in app.v_peer.get())
+for _state, _label in (("stalled", "疑似停止接收"), ("recovering", "正在恢复")):
+    app._apply_health({"ws_peers": ["127.0.0.1"], "protocol": {
+        "state": _state, "message": "测试：当前账号长时间未收到消息"}})
+    check("静默停收和恢复等待不被 WS 存活覆盖", _label in app.v_peer.get()
+          and "长时间未收到" in app.v_protocol_detail.get())
 app._apply_health({"protocol": {"state": "disconnected", "message": "等待 NapCat 自动重连"}})
 check("普通断线不诱导重复启动", "自动重连" in app.v_peer.get() and not app.btn_relogin.grid_info())
 app._apply_health({"ws_peers": ["127.0.0.1"], "protocol": {"state": "connected"}})
