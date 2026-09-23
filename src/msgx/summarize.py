@@ -84,19 +84,14 @@ def model_limits(cfg: dict) -> tuple[int, int]:
     raise ValueError(f"尚未核实模型 {model} 的上下文与输出上限，不能安全计算摘要请求额度")
 
 
-def _rows_to_text_multi(rows: list, names: dict) -> str:
+def _rows_to_text_multi(rows: list) -> str:
     """只复用已入库的图片解析文字；此处不下载图片、不进行 OCR 或模型解析。"""
     lines = []
     for r in rows:
-        hhmm = time.strftime("%m-%d %H:%M", time.localtime(r["ts"]))
-        body = (r["text"] or "").strip()
-        if r["ocr_text"]:
-            body += "\n〔图中文字: " + r["ocr_text"] + "〕"
-        if r["vision_text"]:
-            body += "\n〔图片内容: " + r["vision_text"] + "〕"
-        gname = names.get(r["group_id"]) or r["group_id"]
-        lines.append(f"[{gname} · {hhmm}] {r['sender_name']}: {body}")
-    return "\n".join(lines)
+        body = re.sub(r"\[(?:图片|表情|表情包|语音|视频|合并转发)\]", "", r["text"] or "").strip()
+        picture = (r["vision_text"] or "").strip() or (r["ocr_text"] or "").strip()
+        lines.append("\n".join(part for part in (body, picture) if part))
+    return "\n\n".join(lines)
 
 
 def md_to_html(md: str) -> str:
@@ -213,14 +208,9 @@ class Summarizer:
             raise ValueError(f"目标字数对应的输出额度 {output_tokens} Token 超过模型上限 {max_output}，请降低目标字数")
         # 输入预估外再留 1% 上下文余量，并计入消息封装开销。
         input_limit = context_tokens - output_tokens - max(2048, math.ceil(context_tokens * 0.01))
-        header = (
-            f"统计范围：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start))}"
-            f" 至 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}；"
-            f"共 {len(rows)} 条消息。以下是聊天记录及已有图片解析：\n\n"
-        )
-        names = self.store.group_names()
-        blocks = [(_rows_to_text_multi([row], names), [int(row["id"])]) for row in rows]
-        input_tokens = estimate_tokens(system) + estimate_tokens(header + "\n".join(b[0] for b in blocks)) + 128
+        header = ""
+        blocks = [(_rows_to_text_multi([row]), [int(row["id"])]) for row in rows]
+        input_tokens = estimate_tokens(system) + estimate_tokens(header + "\n\n".join(b[0] for b in blocks)) + 128
         self._progress(
             f"已读取 {len(rows)} 条消息；预估输入 {input_tokens} Token；"
             f"目标 {limit} 字，含冗余的 max_tokens={output_tokens}；上下文 {context_tokens} Token"
@@ -261,7 +251,7 @@ class Summarizer:
         try:
             content = await self.llm.chat(
                 system, body, max_tokens=output_tokens, temperature=0.2, think=False,
-                purpose=purpose, source_ids=source_ids, require_complete=True,
+                purpose="摘要总结", source_ids=source_ids, require_complete=True,
             )
         except IncompleteResponse as exc:
             if exc.content:
@@ -284,7 +274,7 @@ class Summarizer:
         """只在预估上下文不足时拆分；按容量合并，成功中间结果可供手动重试复用。"""
         checkpoint = False
         while True:
-            body = header + "\n".join(text for text, _ids in blocks)
+            body = header + "\n\n".join(text for text, _ids in blocks)
             source_ids = list(dict.fromkeys(rid for _text, ids in blocks for rid in ids))
             tokens = estimate_tokens(system) + estimate_tokens(body) + 128
             if tokens <= input_limit:
@@ -315,7 +305,7 @@ class Summarizer:
                     pieces.append((text, ids))
             batches, batch, size = [], [], 0
             for piece in pieces:
-                cost = estimate_tokens(piece[0]) + 1
+                cost = estimate_tokens(piece[0]) + 2
                 if batch and size + cost > available:
                     batches.append(batch)
                     batch, size = [], 0
@@ -328,7 +318,7 @@ class Summarizer:
             for i, batch in enumerate(batches, 1):
                 self._progress(f"正在处理超出上下文的第 {i}/{len(batches)} 组；完成的组会保存在本地")
                 ids = list(dict.fromkeys(rid for _text, group in batch for rid in group))
-                part = await self._request(system, part_header + "\n".join(text for text, _ids in batch),
+                part = await self._request(system, part_header + "\n\n".join(text for text, _ids in batch),
                                            ids, output_tokens, "摘要分块", True)
                 next_blocks.append((part, ids))
             if sum(estimate_tokens(b[0]) for b in next_blocks) >= sum(estimate_tokens(b[0]) for b in blocks):

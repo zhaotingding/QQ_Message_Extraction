@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 from .models import Msg
@@ -465,7 +466,7 @@ class Store:
         """窗口内全部未过滤消息，按时间升序；默认不限制条数，避免摘要漏掉尾部。"""
         return list(
             self.conn.execute(
-                "SELECT * FROM messages WHERE ts>? AND ts<=? AND media_state<>'filtered' ORDER BY ts ASC LIMIT ?",
+                "SELECT * FROM messages WHERE ts>? AND ts<=? AND media_state<>'filtered' ORDER BY ts ASC,id ASC LIMIT ?",
                 (start, end, limit),
             )
         )
@@ -544,18 +545,32 @@ class Store:
         else:
             self.conn.commit()  # 无返回用量时保留未知值，不把失败伪装成免费
 
-    def api_usage_details(self, limit: int = 500) -> dict:
-        items = [dict(r) for r in self.conn.execute("SELECT * FROM api_calls ORDER BY id DESC LIMIT ?", (limit,))]
+    def api_usage_details(self, limit: int = 500, *, active_only: bool = False) -> dict:
+        today = date.today()
+        start = time.mktime(today.timetuple())
+        end = time.mktime((today + timedelta(days=1)).timetuple())
+        # 仅显示现用流程；旧账不删除、不改写。超上下文步骤仍归入摘要总结。
+        purpose = "CASE WHEN purpose IN ('摘要分块','超上下文合并') THEN '摘要总结' ELSE purpose END"
+        where = "WHERE purpose IN ('摘要总结','图片理解','摘要分块','超上下文合并')" if active_only else ""
+        items = [dict(r) for r in self.conn.execute(f"SELECT * FROM api_calls {where} ORDER BY id DESC LIMIT ?", (limit,))]
         for item in items:
+            if active_only and item["purpose"] in ("摘要分块", "超上下文合并"):
+                item["purpose"] = "摘要总结"
+            item["today_cost_cny"] = item["cost_cny"] if start <= item["ts"] < end else 0.0
             ids = json.loads(item["source_ids"])
             item["source_count"] = len(ids)
             item["source_label"] = f"消息 #{ids[0]}" if len(ids) == 1 else f"{len(ids)} 条消息" if ids else item["source_type"]
         grouped = [dict(r) for r in self.conn.execute(
-            "SELECT purpose,source_type,COUNT(*) AS calls,SUM(in_tokens) AS in_tokens,"
+            f"SELECT {purpose if active_only else 'purpose'} AS purpose,source_type,COUNT(*) AS calls,SUM(in_tokens) AS in_tokens,"
             " SUM(out_tokens) AS out_tokens,COALESCE(SUM(cost_cny),0) AS cost_cny,"
-            " SUM(cost_cny IS NULL) AS unknown_calls FROM api_calls GROUP BY purpose,source_type ORDER BY cost_cny DESC")]
-        known = sum(r["cost_cny"] for r in grouped)
+            " COALESCE(SUM(CASE WHEN ts>=? AND ts<? THEN cost_cny END),0) AS today_cost_cny,"
+            " SUM(CASE WHEN ts>=? AND ts<? AND cost_cny IS NULL THEN 1 ELSE 0 END) AS today_unknown_calls,"
+            f" SUM(cost_cny IS NULL) AS unknown_calls FROM api_calls {where} GROUP BY 1,2 ORDER BY cost_cny DESC",
+            (start, end, start, end))]
+        known = float(self.conn.execute("SELECT COALESCE(SUM(cost_cny),0) FROM api_calls").fetchone()[0])
         return {"items": items, "groups": grouped, "recorded_cost_cny": known,
+                "visible_cost_cny": sum(r["cost_cny"] for r in grouped),
+                "today_cost_cny": sum(r["today_cost_cny"] for r in grouped),
                 "historical_unattributed_cny": max(0.0, self.cost_totals()["cost_cny"] - known)}
 
     def api_call_sources(self, call_id: int) -> dict:

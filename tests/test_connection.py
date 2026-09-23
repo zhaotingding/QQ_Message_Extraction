@@ -122,6 +122,51 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
                 await self.pipe.close_ws_conns()
                 await runner.cleanup()
 
+    async def test_login_evidence_requires_new_protocol_group_message(self):
+        runner = web.AppRunner(build_app(self.cfg, self.pipe))
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        url = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+        event = {"post_type": "message", "message_type": "group", "self_id": 123,
+                 "group_id": 456, "user_id": 789, "message_id": 1, "time": int(time.time()),
+                 "message": [{"type": "text", "data": {"text": "注入消息不能证明QQ在线"}}]}
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(url + "/inject", json=event) as response:
+                    self.assertEqual(response.status, 200)
+                self.assertFalse(self.pipe.last_protocol_message)
+                ws = await session.ws_connect(url + "/onebot/ws")
+                for ignored in ({"post_type": "meta_event", "meta_event_type": "heartbeat", "status": {"online": True}},
+                                {"status": "ok", "echo": "old-query"}, event):
+                    await ws.send_json(ignored)
+                await asyncio.wait_for(self.pipe.ingest_q.get(), 1)
+                self.assertFalse(self.pipe.last_protocol_message)  # 注入后已入库的旧消息不能再次验证
+                self.pipe.cfg["filters"] = {"skip_image_only": True}
+                image = dict(event, message_id=2, message=[{"type": "image", "data": {"url": "https://example.invalid/p.png"}}])
+                await ws.send_json(image)
+                queued = await asyncio.wait_for(self.pipe.ingest_q.get(), 1)
+                self.assertTrue((await self.pipe.handle_event(queued))["filtered"])
+                evidence = self.pipe.health()["last_protocol_message"]
+                self.assertEqual(evidence["self_id"], "123")
+                self.assertEqual(evidence["message_time"], event["time"])
+                self.assertGreater(evidence["received_at"], self.pipe.ws_connected_at)
+                async with session.post(url + "/onebot", json=dict(event, message_id=3)) as response:
+                    self.assertEqual(response.status, 200)
+                self.assertGreater(self.pipe.last_protocol_message["received_at"], evidence["received_at"])
+                self.pipe.last_protocol_message = {}
+                for malformed in (dict(event, time="bad"), dict(event, sender="bad", message_id=4)):
+                    self.pipe.note_protocol_message(malformed)
+                self.assertFalse(self.pipe.last_protocol_message)
+                self.pipe.submit = AsyncMock(return_value=False)
+                async with session.post(url + "/onebot", json=dict(event, message_id=5)) as response:
+                    self.assertEqual(response.status, 200)
+                self.assertFalse(self.pipe.last_protocol_message)  # 队列拒收不能冒充恢复
+                await ws.close()
+            finally:
+                await self.pipe.close_ws_conns()
+                await runner.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

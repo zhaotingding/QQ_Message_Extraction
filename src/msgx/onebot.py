@@ -54,7 +54,10 @@ async def _http_report(request: web.Request) -> web.Response:
         event = await request.json()
     except json.JSONDecodeError:
         return web.Response(status=400, text="bad json")
-    await request.app["pipe"].submit(event)
+    if not isinstance(event, dict):
+        return web.json_response({"error": "事件必须是对象"}, status=400)
+    if await request.app["pipe"].submit(event):
+        request.app["pipe"].note_protocol_message(event)
     return web.json_response({"status": "ok", "retcode": 0})
 
 
@@ -104,7 +107,8 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
                     continue
                 if event.get("post_type") == "message":
                     pipe.ws_online[ws] = True
-                await pipe.submit(event)
+                if await pipe.submit(event):
+                    pipe.note_protocol_message(event)
                 accepted += 1
             elif raw.type == WSMsgType.ERROR:
                 log.warning("WS 错误: %s", ws.exception())
@@ -198,7 +202,7 @@ async def _billing(request: web.Request) -> web.Response:
 
 
 async def _usage_details(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, **request.app["pipe"].store.api_usage_details()})
+    return web.json_response({"ok": True, **request.app["pipe"].store.api_usage_details(active_only=True)})
 
 
 async def _usage_sources(request: web.Request) -> web.Response:

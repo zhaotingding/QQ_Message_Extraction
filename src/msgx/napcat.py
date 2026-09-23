@@ -308,7 +308,7 @@ def quick_login(cfg: dict, wait_seconds: float = 60) -> dict:
                 if str(client.call("/QQLogin/GetQuickLoginQQ") or "") != account:
                     client.call("/QQLogin/SetQuickLoginQQ", {"uin": account})
                 return {"ok": True, "account": account,
-                        "note": f"QQ {account} 登录成功，已启用自动登录"}
+                        "note": f"QQ {account} 已在线，自动登录已启用；等待新消息验证"}
             phase = state.get("loginPhase")
             if not submitted and phase == "waiting_qrcode":
                 account = str(client.call("/QQLogin/GetQuickLoginQQ") or "")

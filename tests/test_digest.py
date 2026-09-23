@@ -115,10 +115,25 @@ async def main():
         sm.store.conn.execute("UPDATE messages SET ocr_text=?,vision_text=? WHERE id=?", (ocr, vision, ids[0]))
         sm.store.conn.commit()
         result = await sm.run_digest(full=True, prompt="使用自定义格式")
-        check("同时发送全部已存OCR与图片解析，不截600/200字符",
-              ocr in llm.calls[0][1] and vision in llm.calls[0][1])
+        check("完整复用图片理解文字，不再同时发送OCR",
+              ocr not in llm.calls[0][1] and vision in llm.calls[0][1])
         check("图片复用不增加API调用，自定义格式也直接保存",
               len(llm.calls) == 1 and result["content"] == "用户自定义格式\n完整返回内容")
+        sm.store.conn.execute("UPDATE messages SET vision_text='' WHERE id=?", (ids[0],))
+        sm.store.conn.commit()
+        await sm.run_digest(full=True)
+        check("没有图片理解结果才使用已存OCR", ocr in llm.calls[-1][1])
+        sm.store.close()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        llm = FakeLLM([])
+        sm = make(llm, tmp)
+        now = int(time.time())
+        for i, (stamp, body) in enumerate([(now-2, "第二时刻甲[图片]"), (now-3, "第一时刻"), (now-2, "第二时刻乙")]):
+            sm.store.insert_message(Msg(msg_id=str(i), group_id="secret-group", sender_name="secret-sender", ts=stamp, text=body), "secret-name")
+        await sm.run_digest(full=True)
+        check("只发送正文，按消息时间及同秒入库编号排序", llm.calls[0][1] == "第一时刻\n\n第二时刻甲\n\n第二时刻乙")
+        check("不发送群名、发言人、时间或类型包装", not any(s in llm.calls[0][1] for s in ("secret-", "[图片]", time.strftime("%m-%d"))))
         sm.store.close()
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -174,7 +189,7 @@ async def main():
             result = await sm.run_digest(full=True, target_chars=500)
         check("手动重试复用已完成分块", sum(c[1] == first_body for c in llm.calls) == 1)
         check("分批后最终合并关联全部消息", llm.calls[-1][2]["source_ids"] == ids and result["count"] == 12)
-        check("超上下文合并不复用已弃用用途名", llm.calls[-1][2]["purpose"] == "超上下文合并")
+        check("超上下文所有请求统一归入摘要总结", all(c[2]["purpose"] == "摘要总结" for c in llm.calls))
         check("分块和合并请求都留有上下文输出空间", all(
               S.estimate_tokens(c[0]) + S.estimate_tokens(c[1]) + 128 + c[2]["max_tokens"] + 2048 <= 12000
               for c in llm.calls))

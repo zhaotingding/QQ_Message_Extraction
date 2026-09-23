@@ -725,8 +725,8 @@ with patch("msgx.gui.threading.Thread") as _thread:
                    "source_label": "消息 #11", "model": "test-model", "in_tokens": None, "out_tokens": None,
                    "cache_hit_tokens": None, "cost_cny": None, "status": "失败，用量未知"}]})
     check("未知费用不显示为零", app.usage_table.item("7", "values")[3:7] == ("未知", "未知", "未知", "未知"))
-    check("按用途和消息类型汇总且明确估算与历史费用", "纯图片" in app.usage_groups.item(app.usage_groups.get_children()[0], "values")
-          and "估算" in app.v_usage.get() and "0.250000" in app.v_usage.get())
+    check("按用途和消息类型汇总且明确估算与今日费用", "纯图片" in app.usage_groups.item(app.usage_groups.get_children()[0], "values")
+          and "估算" in app.v_usage.get() and "今日消费" in app.v_usage.get())
     app.usage_table.selection_set("7")
     app._usage_selected()
     app._dispatch_event("usage_sources", ("7", "消息原文已经读取"))
@@ -838,23 +838,47 @@ with patch("msgx.gui.threading.Thread") as _thread, patch.object(N, "running_ins
     app._login_finished({"ok": False, "scan": True, "note": "请重新扫码"})
     check("凭证失败给扫码入口而非强制重启", _watch.called and not _restart.called)
 
+print("\n=== 0.6.5 新消息验证 ===")
+app._login_verify_since = time.time() - 2
+app._login_finished({"ok": True, "account": "123", "note": "QQ 已在线，等待新消息验证"})
+check("QQ 在线不能直接宣告成功", app._login_pending and "等待新消息" in app.status.get())
+_health = {"protocol": {"state": "connected"}, "ws_peers": ["127.0.0.1"],
+           "ws_connected_at": app._login_verify_since - 1, "counters": {"received": 9999}}
+app._apply_health(_health)
+check("连接与接收总计都不能代替真实新消息证据", app._login_pending and "等待新消息" in app.v_peer.get())
+for _receipt, _stamp, _account in [(app._login_verify_since-1, time.time(), "123"),
+                                   (time.time(), app._login_verify_since-100, "123"),
+                                   (time.time(), time.time(), "456")]:
+    _health["last_protocol_message"] = dict(received_at=_receipt, message_time=_stamp, self_id=_account)
+    app._apply_health(_health)
+    check("旧接收、历史消息或其他账号不算此次登录成功", app._login_pending and "等待新消息" in app.v_peer.get())
+app._login_verify_since = time.time() - 65
+app._login_wait_noted = False
+app._apply_health({"protocol": {"state": "connected"}})
+check("超时只标记未验证，不谎报失败", app._login_pending and "尚未验证" in app.status.get() and "失败" not in app.status.get())
+_health["last_protocol_message"] = dict(received_at=time.time(), message_time=int(time.time()), self_id="123")
+app._apply_health(_health)
+check("真实新消息到达才成功", not app._login_pending and "登录成功" in app.status.get()
+      and "已验证消息接收" in app.v_peer.get())
+
 _usage_data = {"groups": [], "items": []}
 for _i, (_purpose, _cost, _tokens, _calls) in enumerate([
-        ("摘要总结", 2.0, 9, 12), ("消息评分", 10.0, 100, 2), ("纪要分块", 0.5, 11, 100)]):
+        ("摘要总结", 2.0, 9, 12), ("图片理解", 10.0, 100, 2), ("摘要总结", 0.5, 11, 100)]):
     _usage_data["groups"].append(dict(purpose=_purpose, source_type="文字", calls=_calls,
-        in_tokens=_tokens, out_tokens=_tokens * 2, cost_cny=_cost, unknown_calls=1))
+        in_tokens=_tokens, out_tokens=_tokens * 2, cost_cny=_cost, unknown_calls=1, today_cost_cny=_cost / 2))
     _usage_data["items"].append(dict(id=_i, ts=time.time(), purpose=_purpose, source_type="文字", source_label="测试",
-        model="test", in_tokens=_tokens, out_tokens=_tokens * 2, cache_hit_tokens=0, cost_cny=_cost, status="完成"))
-_usage_data["items"].append(dict(_usage_data["items"][0], id=3, cost_cny=None, in_tokens=None))
+        model="test", in_tokens=_tokens, out_tokens=_tokens * 2, cache_hit_tokens=0, cost_cny=_cost, status="完成", today_cost_cny=_cost / 2))
+_usage_data["items"].append(dict(_usage_data["items"][0], id=3, cost_cny=None, in_tokens=None, today_cost_cny=None))
+_usage_data["items"].append(dict(_usage_data["items"][0], id=4, purpose="消息评分"))
+_usage_data["groups"].append(dict(_usage_data["groups"][0], purpose="纪要分块"))
 app._render_usage(_usage_data)
-check("现用摘要不被误标弃用，历史记录标注弃用", app.usage_table.set("0", "retired") == "使用中"
-      and app.usage_table.set("1", "retired") == "已弃用" and app.usage_table.set("2", "retired") == "已弃用")
-for _key, _expected in [("cost", ["消息评分", "摘要总结", "纪要分块"]),
-                         ("calls", ["纪要分块", "摘要总结", "消息评分"]),
-                         ("input", ["消息评分", "纪要分块", "摘要总结"]),
-                         ("output", ["消息评分", "纪要分块", "摘要总结"])]:
+check("隐藏旧用途且今日消费替换用途状态", not app.usage_table.exists("4") and len(app.usage_groups.get_children()) == 3
+      and "retired" not in app.usage_table["columns"] and "今日消费" in app.usage_table.heading("today", "text")
+      and "总金额" in app.usage_groups.heading("cost", "text"))
+for _key, _expected in [("cost", [100, 9, 11]), ("calls", [11, 9, 100]),
+                         ("input", [100, 11, 9]), ("output", [100, 11, 9]), ("today", [100, 9, 11])]:
     app._sort_usage(app.usage_groups, _key)
-    check(f"汇总 {_key} 按数值降序", [app.usage_groups.set(i, "purpose") for i in app.usage_groups.get_children()] == _expected)
+    check(f"汇总 {_key} 按数值降序", [int(app.usage_groups.set(i, "input")) for i in app.usage_groups.get_children()] == _expected)
 app._sort_usage(app.usage_table, "cost")
 check("明细金额数值降序且未知在末尾", app.usage_table.get_children() == ("1", "0", "2", "3"))
 app._sort_usage(app.usage_table, "cost")

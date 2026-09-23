@@ -45,8 +45,6 @@ LOG_RED = "#ff7b72"
 LOG_GREEN = "#7ee787"
 OK_COLOR = "#1a7f37"
 MUTED = "#6b6b68"
-RETIRED_PURPOSES = {"消息评分", "纪要分块", "纪要总结", "摘要合并", "日报合并", "摘要成稿",
-                    "摘要压缩", "纪要压缩", "图片能力探测", "跨群热点", "群摘要分块"}
 
 
 def worker_python() -> str:
@@ -89,6 +87,10 @@ class App:
         self._usage_sort = {}
         self._usage_numbers = {}
         self._login_busy = False
+        self._login_verify_since = 0.0
+        self._login_pending = False
+        self._login_account = ""
+        self._login_wait_noted = False
         self._protocol_state = {}
         # 登录二维码弹窗。Tkinter 只能在主线程碰控件，所以监视线程只把路径
         # 丢进 events 队列，由 _drain 在主线程里弹窗。
@@ -887,25 +889,25 @@ class App:
         ttk.Button(tab, text="刷新消费明细", command=self.refresh_usage).pack(anchor="w")
         self.v_usage = tk.StringVar(value="升级后开始逐次记录；Token 来自 API，金额按配置费率估算。")
         ttk.Label(tab, textvariable=self.v_usage, wraplength=880).pack(fill="x", pady=6)
-        self.usage_groups = ttk.Treeview(tab, columns=("purpose", "type", "calls", "input", "output", "cost", "retired"),
+        self.usage_groups = ttk.Treeview(tab, columns=("purpose", "type", "calls", "input", "output", "cost", "today"),
                                         show="headings", height=6)
         for key, label, width in (("purpose", "用途", 150), ("type", "消息类型", 120), ("calls", "请求数", 70),
-                                  ("input", "输入 Token", 100), ("output", "输出 Token", 100), ("cost", "金额（元）", 110),
-                                  ("retired", "用途状态", 70)):
+                                  ("input", "输入 Token", 100), ("output", "输出 Token", 100), ("cost", "总金额（元）", 110),
+                                  ("today", "今日消费（元）", 110)):
             self.usage_groups.heading(key, text=label)
-            if key in ("calls", "input", "output", "cost"):
+            if key in ("calls", "input", "output", "cost", "today"):
                 self.usage_groups.heading(key, command=lambda k=key: self._sort_usage(self.usage_groups, k))
             self.usage_groups.column(key, width=width, stretch=True)
         self.usage_groups.pack(fill="x", pady=(0, 10))
         ttk.Label(tab, text="点击请求数、Token 或金额表头排序；最近 500 次请求，选中一行查看关联消息（上方汇总覆盖全部明细）").pack(anchor="w")
         frame = ttk.Frame(tab)
         frame.pack(fill="both", expand=True)
-        columns = ("time", "purpose", "source", "input", "output", "cache", "cost", "state", "retired")
+        columns = ("time", "purpose", "source", "input", "output", "cache", "cost", "state", "today")
         self.usage_table = ttk.Treeview(frame, columns=columns, show="headings", height=9)
-        for key, label, width in zip(columns, ("时间", "用途", "消息/任务", "输入", "输出", "缓存命中", "元（估算）", "结果", "用途状态"),
-                                   (125, 100, 115, 70, 70, 75, 95, 130, 70)):
+        for key, label, width in zip(columns, ("时间", "用途", "消息/任务", "输入", "输出", "缓存命中", "总金额（元）", "结果", "今日消费（元）"),
+                                   (125, 100, 115, 70, 70, 75, 95, 130, 110)):
             self.usage_table.heading(key, text=label)
-            if key in ("input", "output", "cache", "cost"):
+            if key in ("input", "output", "cache", "cost", "today"):
                 self.usage_table.heading(key, command=lambda k=key: self._sort_usage(self.usage_table, k))
             self.usage_table.column(key, width=width, stretch=True)
         scroll = ttk.Scrollbar(frame, command=self.usage_table.yview)
@@ -939,26 +941,28 @@ class App:
         if data.get("error"):
             self.v_usage.set(f"消费明细读取失败：{data['error']}")
             return
-        self.v_usage.set(f"已归因 ¥{data.get('recorded_cost_cny', 0):.6f}；历史未归因 ¥{data.get('historical_unattributed_cny', 0):.6f}。"
-                         "Token 为 API 返回值，金额按配置费率估算；无返回用量的失败显示未知。")
+        self.v_usage.set(f"当前用途总金额 ¥{data.get('visible_cost_cny', 0):.6f}；今日消费 ¥{data.get('today_cost_cny', 0):.6f}。"
+                         "仅显示摘要总结、图片理解；Token 为 API 返回值，金额为估算，未知费用另行标注。")
         self.usage_groups.delete(*self.usage_groups.get_children())
         self._usage_numbers = {self.usage_groups: {}, self.usage_table: {}}
         for row in data.get("groups", []):
+            if row["purpose"] not in ("摘要总结", "图片理解"):
+                continue
             iid = self.usage_groups.insert("", "end", values=(row["purpose"], row["source_type"], row["calls"],
                 row["in_tokens"] or 0, row["out_tokens"] or 0,
                 f"{row['cost_cny']:.6f}" + (f" + {row['unknown_calls']} 次未知" if row["unknown_calls"] else ""),
-                "已弃用" if row["purpose"] in RETIRED_PURPOSES else "使用中"))
+                f"{row.get('today_cost_cny', 0):.6f}" + (f" + {row['today_unknown_calls']} 次未知" if row.get("today_unknown_calls") else "")))
             self._usage_numbers[self.usage_groups][iid] = dict(calls=row["calls"], input=row["in_tokens"],
-                                                              output=row["out_tokens"], cost=row["cost_cny"])
+                                                              output=row["out_tokens"], cost=row["cost_cny"], today=row.get("today_cost_cny", 0))
         self.usage_table.delete(*self.usage_table.get_children())
-        self._usage_items = {str(r["id"]): r for r in data.get("items", [])}
+        self._usage_items = {str(r["id"]): r for r in data.get("items", []) if r["purpose"] in ("摘要总结", "图片理解")}
         for iid, row in self._usage_items.items():
             self.usage_table.insert("", "end", iid=iid, values=(time.strftime("%m-%d %H:%M:%S", time.localtime(row["ts"])),
                 row["purpose"], row["source_label"], *[row[k] if row[k] is not None else "未知" for k in ("in_tokens", "out_tokens", "cache_hit_tokens")],
                 f"{row['cost_cny']:.6f}" if row["cost_cny"] is not None else "未知", row["status"],
-                "已弃用" if row["purpose"] in RETIRED_PURPOSES else "使用中"))
+                f"{row.get('today_cost_cny', 0):.6f}" if row.get("today_cost_cny", 0) is not None else "未知"))
             self._usage_numbers[self.usage_table][iid] = dict(input=row["in_tokens"], output=row["out_tokens"],
-                                                             cache=row["cache_hit_tokens"], cost=row["cost_cny"])
+                                                             cache=row["cache_hit_tokens"], cost=row["cost_cny"], today=row.get("today_cost_cny", 0))
         for tree, (key, descending) in self._usage_sort.items():
             self._sort_usage(tree, key, descending)
 
@@ -1384,6 +1388,10 @@ class App:
         if self._login_busy:
             return
         self._login_busy = True
+        self._login_verify_since = time.time()
+        self._login_pending = False
+        self._login_account = ""
+        self._login_wait_noted = False
         self.btn_login.configure(state="disabled")
         note = "正在自动登录：复用已保存账号；协议端未运行时将请求启动（可能需要 UAC 授权）…"
         self.status.set(note)
@@ -1409,10 +1417,32 @@ class App:
         self.status.set(result["note"])
         self._log_ui(f"[界面] {result['note']}\n")
         if result.get("ok"):
+            self._login_pending = True
+            self._login_account = str(result.get("account") or "")
+            self._login_verify_since = self._login_verify_since or time.time()
+            self.status.set("已连接，等待新消息验证；收到新 QQ 群消息后才确认登录成功")
             self.qr_watching = False
             self._close_qrcode()
         elif result.get("scan"):
             self._start_qrcode_watch(fresh_only=True, since=time.time() - 120)
+
+    def _verify_login_message(self, data: dict) -> None:
+        if not self._login_pending:
+            return
+        message = data.get("last_protocol_message") or {}
+        if ((data.get("protocol") or {}).get("state") == "connected"
+                and float(message.get("received_at") or 0) > max(self._login_verify_since, float(data.get("ws_connected_at") or 0))
+                and float(message.get("message_time") or 0) >= int(max(self._login_verify_since, float(data.get("ws_connected_at") or 0)))
+                and (not self._login_account or str(message.get("self_id")) == self._login_account)):
+            self._login_pending = False
+            note = "登录成功，已收到新 QQ 群消息，消息接收已恢复"
+            self.status.set(note)
+            self._log_ui(f"[界面] {note}\n")
+        elif not self._login_wait_noted and time.time() - self._login_verify_since >= 60:
+            self._login_wait_noted = True
+            note = "尚未验证消息接收：暂未收到新 QQ 群消息；继续等待，不自动重启"
+            self.status.set(note)
+            self._log_ui(f"[界面] {note}\n")
 
     def relogin_napcat(self) -> None:
         """优先展示协议端自行生成的新码，避免为扫码再启动一份 QQ。"""
@@ -1464,6 +1494,10 @@ class App:
             self._log_ui(f"[界面] 重置协议端失败：{r.get('error')}\n")
             self.status.set(f"重置协议端失败：{r.get('error') or '未知错误'}")
             return
+        self._login_verify_since = qr_since
+        self._login_pending = True
+        self._login_account = ""
+        self._login_wait_noted = False
         self._log_ui(f"[界面] {r.get('note') or ''}\n")
         self._log_ui(f"[界面] 重置记录：{r.get('log')}（运行状态页下方「日志」可切换到「协议端日志」查看）\n")
         # 重置过程中协议端会断、再连回来；把行/二维码监听起来，别让用户自己去找二维码。
@@ -1737,6 +1771,7 @@ class App:
             self.status.set("服务已停止" if value == 0 else f"服务异常退出（{value}），请看日志")
 
     def _apply_health(self, data: dict | None) -> None:
+        self._verify_login_message(data or {})
         if data is None:
             self.v_peer.set("未连接（服务响应超时）")
             self.v_protocol_detail.set("服务未响应，暂时无法确认 QQ 登录状态")
@@ -1754,7 +1789,11 @@ class App:
         elif state == "offline":
             self.v_peer.set("连接存在 · QQ 已离线")
         elif peers:
-            self.v_peer.set(f"已连接 · {', '.join(peers)}")
+            received = data.get("last_protocol_message") or {}
+            verified = (float(received.get("received_at") or 0) > max(float(data.get("ws_connected_at") or 0), self._login_verify_since)
+                        and float(received.get("message_time") or 0) >= int(max(float(data.get("ws_connected_at") or 0), self._login_verify_since))
+                        and (not self._login_account or str(received.get("self_id")) == self._login_account))
+            self.v_peer.set(f"已连接 · {'已验证消息接收' if verified else '等待新消息验证'} · {', '.join(peers)}")
             # v0.5.7：保护的是重置前旧连接，扫码后的新连接不应再等待两分钟。
             # 由服务记录连接建立时间，即使断开/重连都发生在两次轮询之间也能识别。
             connected_at = float(data.get("ws_connected_at") or 0.0)

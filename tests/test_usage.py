@@ -82,6 +82,25 @@ async def main():
         store.close()
         reopened = Store(cfg["app"]["db_path"])
         check("重启后逐次费用记录仍保留", len(reopened.api_usage_details()["items"]) == 6)
+        from datetime import date, timedelta
+        midnight = time.mktime(date.today().timetuple())
+        tomorrow = time.mktime((date.today() + timedelta(days=1)).timetuple())
+        for ts, purpose, cost in [(midnight-1, "摘要总结", 10.0), (midnight, "摘要总结", 2.0),
+                                   (midnight+1, "图片理解", 0.5), (midnight+2, "摘要合并", 99.0),
+                                   (midnight+3, "超上下文合并", 1.0), (midnight+4, "摘要分块", 3.0),
+                                   (midnight+5, "图片理解", None), (tomorrow, "摘要总结", 20.0)]:
+            reopened.record_api_call(ts=ts, purpose=purpose, source_ids=[], model="test",
+                                      usage=response()["usage"] if cost is not None else None, cost_cny=cost, status="测试")
+        active = reopened.api_usage_details(active_only=True)
+        check("消费页仅显示两类现用用途", {r["purpose"] for r in active["groups"]} == {"摘要总结", "图片理解"}
+              and all(r["purpose"] in ("摘要总结", "图片理解") for r in active["items"]))
+        summary = next(r for r in active["groups"] if r["purpose"] == "摘要总结")
+        check("跨午夜统计今日消费，旧日及次日不混入", summary["today_cost_cny"] == 6 and summary["cost_cny"] == 36)
+        check("分页不改变今日及总金额", reopened.api_usage_details(1, active_only=True)["groups"] == active["groups"])
+        check("今日未知费用保留未知", sum(r["today_unknown_calls"] for r in active["groups"]) == 1
+              and any(r["today_cost_cny"] is None for r in active["items"]))
+        check("隐藏不删历史、不污染历史未归因金额", len(reopened.api_usage_details()["items"]) == 14
+              and abs(active["historical_unattributed_cny"] - .25) < 1e-8)
         reopened.close()
 
 asyncio.run(main())

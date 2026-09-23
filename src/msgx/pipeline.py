@@ -47,6 +47,7 @@ class Pipeline:
         self.ws_connected_at = 0.0  # v0.5.7：GUI 用新连接时间区分扫码成功与重置前旧连接
         self.ws_disconnected_at = 0.0
         self.ws_last_close = ""
+        self.last_protocol_message: dict = {}
         self.ws_online: dict = {}
         self.ws_addresses: dict = {}
         self._closing_ws = False
@@ -278,6 +279,23 @@ class Pipeline:
         self.store.close()
 
     # ---------- ingest ----------
+
+    def note_protocol_message(self, event: dict) -> None:
+        """仅由真实接入路径记录新群消息，过滤消息也可验证接收链路。"""
+        if event.get("post_type") != "message" or event.get("message_type") != "group":
+            return
+        self_id = str(event.get("self_id") or "")
+        if not self_id.isdigit() or self_id == "0" or not event.get("message_id") or not event.get("time"):
+            return
+        try:
+            msg = parse_onebot_event(event, self_id, {self_id})
+        except (TypeError, ValueError, AttributeError):
+            return
+        if msg is None or self.store.conn.execute(
+            "SELECT 1 FROM messages WHERE group_id=? AND msg_id=?", (msg.group_id, msg.msg_id)
+        ).fetchone():
+            return
+        self.last_protocol_message = {"received_at": time.time(), "message_time": msg.ts, "self_id": self_id}
 
     async def submit(self, event: dict) -> bool:
         """非阻塞投递事件，由接入层调用。队列满时丢弃并计数，避免阻塞 WebSocket。"""
@@ -698,6 +716,7 @@ class Pipeline:
             "watch_groups": sorted(self.watch) or "全部",
             "ws_peers": sorted(self.ws_peers),
             "ws_connected_at": self.ws_connected_at,
+            "last_protocol_message": dict(self.last_protocol_message),
             "protocol": self.protocol_status(),
             "summary_progress": self.summarizer.progress,
             # ⚠️ ws_peers 是「对端 IP 的**集合**」：多份 NapCat 全从 127.0.0.1 连进来时
