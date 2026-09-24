@@ -82,20 +82,22 @@ async def main() -> None:
                 check(f"过滤消息 {mid} 留有简要记录", result.get("filtered") is True and bool(result.get("row_id")))
             rows = [dict(r) for r in pipe.store.recent_messages() if r["media_state"] == "filtered"]
             check("表情、表情包和纯图片均标记已过滤", len(rows) == 3)
-            check("过滤消息不进入图片队列或调用模型", not pipe.store.pending_media() and pipe.llm._post.await_count == 0)
+            check("过滤图片进入本地 OCR 队列但不调用模型",
+                  len(pipe.store.pending_images()) == 2 and pipe.llm._post.await_count == 0)
             stored = pipe.store.conn.execute("SELECT * FROM messages WHERE media_state='filtered'").fetchall()
-            check("过滤记录不保留图片链接或原始载荷",
-                  len(stored) == 3 and all(json.loads(r["image_urls"]) == [] and not r["raw"] for r in stored))
+            check("过滤图片保留下载链接但不保存完整原始载荷",
+                  len(stored) == 3 and sum(bool(json.loads(r["image_urls"])) for r in stored) == 2
+                  and all(not r["raw"] for r in stored))
             end = int(time.time()) + 10
             check("按群摘要排除过滤记录", len(pipe.store.messages_between("200", 0, end)) == 6)
             check("跨群摘要排除过滤记录", len(pipe.store.messages_between_all(0, end)) == 6)
             again = await pipe.handle_event(event(12, [cases[2]]))
             check("重复的过滤消息不会新增一行", again.get("duplicate") is True and len(pipe.store.recent_messages()) == 9)
             await pipe.handle_event(event(20, [cases[2], {"type": "text", "data": {"text": "这是报错截图"}}]))
-            check("带文字的图片仍进入处理队列", len(pipe.store.pending_media()) == 1)
+            check("带文字的图片仍进入处理队列", len(pipe.store.pending_images()) == 3)
             cfg["filters"].update(skip_face_only=False, skip_image_only=False)
             await pipe.handle_event(event(21, [cases[2]]))
-            check("关闭入库过滤后保留纯图，仍由媒体层跳过解析", len(pipe.store.pending_media()) == 2)
+            check("关闭入库过滤后纯图也执行本地 OCR", len(pipe.store.pending_images()) == 4)
         finally:
             await pipe.stop()
 

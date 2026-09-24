@@ -80,6 +80,8 @@ class App:
         # 实时消息页：拉取是否在进行中（避免慢响应时叠请求）、上次用的条数
         self._rt_busy = False
         self._rt_limit = 80
+        self._rt_rows: dict[str, dict] = {}
+        self._rt_actions: set[str] = set()
         self._summary_busy = False
         self._summary_started = 0.0
         self._summary_path = ""
@@ -339,6 +341,8 @@ class App:
         if match and match[1] in ("WARNING", "ERROR", "CRITICAL"):
             return "warn"
         body = match[2] if match else line.removeprefix("[界面]").strip()
+        if body.startswith("API 内容摘要 ·"):
+            return "good"
         # 这是历史失败任务重新排队的进度，既不是本次失败，也不等于处理成功。
         if body.startswith("已把 ") and "重新排入处理队列" in body:
             return ""
@@ -415,33 +419,41 @@ class App:
 
         wrap = ttk.Frame(tab)
         wrap.pack(fill="both", expand=True)
-        cols = ("time", "group", "who", "text", "state", "account")
+        cols = ("time", "group", "who", "text", "state", "image", "ocr", "vision", "recognize", "include", "account")
         self.rt = ttk.Treeview(wrap, columns=cols, show="headings", height=18)
         headings = {
             "time": ("时间", 78, "center"),
             "group": ("群", 130, "w"),
             "who": ("发言人", 110, "w"),
-            "text": ("内容", 430, "w"),
+            "text": ("内容", 300, "w"),
             "state": ("图片", 70, "center"),
+            "image": ("原图链接", 80, "center"),
+            "ocr": ("OCR 文字", 180, "w"),
+            "vision": ("图片语义", 200, "w"),
+            "recognize": ("手动识别", 95, "center"),
+            "include": ("纳入摘要", 82, "center"),
             "account": ("接收账号", 125, "w"),
         }
         for key, (title, width, anchor) in headings.items():
             self.rt.heading(key, text=title)
             self.rt.column(key, width=width, anchor=anchor, stretch=(key == "text"))
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.rt.yview)
-        self.rt.configure(yscrollcommand=sb.set)
+        xsb = ttk.Scrollbar(tab, orient="horizontal", command=self.rt.xview)
+        self.rt.configure(yscrollcommand=sb.set, xscrollcommand=xsb.set)
         self.rt.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+        xsb.pack(fill="x")
+        self.rt.bind("<ButtonRelease-1>", self._on_rt_click)
+        self.rt.bind("<<TreeviewSelect>>", self._on_rt_select)
         # 交替行色便于阅读；被 @ 的消息按普通消息呈现。
         self.rt.tag_configure("odd", background="#f5f7fa")
         self.rt.tag_configure("failed", foreground="#a15c00")
 
-        ttk.Label(
-            tab,
-            text="显示最近入库的消息（新的在最上面）。图片仅在消息附带文字时解析；"
-                 "处理结果显示在「图片」列。",
-            style="Hint.TLabel",
-        ).pack(anchor="w", pady=(8, 0))
+        ttk.Label(tab, text="点击「打开」查看原图；点「□ 识别」才调用图片 API。"
+                         "「纳入摘要」只控制已识别语义是否参与摘要。", style="Hint.TLabel").pack(anchor="w", pady=(8, 0))
+        self.rt_detail = ScrolledText(tab, height=6, wrap="word", font=(FONT, 9))
+        self.rt_detail.pack(fill="x", pady=(5, 0))
+        self.rt_detail.configure(state="disabled")
 
     # ---- 标签页 3：设置 ----
 
@@ -578,8 +590,8 @@ class App:
         ft.pack(fill="x", pady=(12, 0))
         ttk.Label(
             ft,
-            text="过滤的图片/表情仅留简要记录，不下载、不识别、不进摘要；其他命中过滤的消息直接丢弃。\n"
-                 "图片只有在消息附带文字时才调用 API 解析，与图片内部是否有文字无关。",
+            text="过滤的图片/表情保留简要记录并做本地 OCR，默认不进摘要；其他命中过滤的消息直接丢弃。\n"
+                 "所有带链接的图片先做本地 OCR；只有在实时消息页手动勾选才调用图片 API。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(0, 6))
         self.v_filters = {
@@ -1330,8 +1342,10 @@ class App:
     def _media_label(row) -> str:
         m = str(row.get("media_state") or "")
         v = str(row.get("vision_state") or "")
+        if v == "download_failed":
+            return "下载失败"
         if m == "filtered":
-            return "已过滤"
+            return "已过滤" if row.get("media_path") else "OCR处理中" if row.get("has_media") else "已过滤"
         if m in ("", "none"):
             return "—"
         if m == "pending":
@@ -1384,14 +1398,31 @@ class App:
         sel = self.rt.selection()
         keep = str(sel[0]) if sel else ""
         self.rt.delete(*self.rt.get_children())
-        for i, r in enumerate(rows):
+        display_rows = []
+        for parent in rows:
+            images = parent.get("images") or []
+            if images:
+                for image in images:
+                    item = {**parent, **image, "id": f"{parent['id']}:{image['id']}",
+                            "image_id": image["id"], "has_media": 1,
+                            "media_state": "filtered" if parent.get("media_state") == "filtered"
+                            else image["media_state"]}
+                    display_rows.append(item)
+            else:
+                display_rows.append(parent)
+        self._rt_rows = {str(r.get("id")): r for r in display_rows}
+        for i, r in enumerate(display_rows):
             ts = int(r.get("ts") or 0)
             raw = r.get("text") or ""
             # 剥掉 [图片]/[表情] 这类占位符后如果没剩下东西，就把图片的语义/OCR
             # 内容顶上来 —— 纯图片消息的正文是占位符，真正有信息的是识别结果。
             body = prefs_mod.plain_text(raw)
-            if not body:
-                body = (r.get("vision_text") or r.get("ocr_text") or "").strip()
+            ocr = (r.get("ocr_text") or "").strip()
+            vision = (r.get("vision_text") or "").strip()
+            if r.get("media_state") == "filtered" and ocr:
+                body = "OCR:" + ocr
+            elif not body:
+                body = (vision or ocr).strip()
             if not body:
                 body = raw.strip() or "（无文本）"
             body = " ".join(body.split())[:300]
@@ -1411,13 +1442,75 @@ class App:
                     r.get("sender_name") or "",
                     body,
                     state,
+                    "打开" if r.get("media_path") else "—",
+                    " ".join(ocr.split())[:100] or "—",
+                    " ".join(vision.split())[:100] or "—",
+                    ("☑ 已识别" if vision else "□ 识别") if r.get("media_path") else "—",
+                    ("☑" if r.get("include_vision") else "□") if r.get("has_media") else "—",
                     r.get("receiver_accounts") or r.get("received_by") or "历史未知",
                 ),
                 tags=tuple(tags),
             )
         if keep and self.rt.exists(keep):
             self.rt.selection_set(keep)
-        self.v_rt_status.set(f"共 {len(rows)} 条 · 更新于 {time.strftime('%H:%M:%S')}")
+        self._on_rt_select()
+        self.v_rt_status.set(f"共 {len(display_rows)} 行 · 更新于 {time.strftime('%H:%M:%S')}")
+
+    def _on_rt_select(self, _event=None) -> None:
+        selection = self.rt.selection()
+        row = self._rt_rows.get(str(selection[0])) if selection else None
+        detail = (f"OCR:\n{row.get('ocr_text') or '（无文字）'}\n\n"
+                  f"图片语义：\n{row.get('vision_text') or '（尚未手动识别）'}") if row else ""
+        self.rt_detail.configure(state="normal")
+        self.rt_detail.delete("1.0", "end")
+        self.rt_detail.insert("end", detail)
+        self.rt_detail.configure(state="disabled")
+
+    def _on_rt_click(self, event) -> None:
+        row_id = self.rt.identify_row(event.y)
+        column = self.rt.identify_column(event.x)
+        row = self._rt_rows.get(row_id)
+        if not row:
+            return
+        if column == "#6" and row.get("media_path"):
+            path = Path(row["media_path"])
+            if path.is_file():
+                open_path(path)
+            else:
+                self.status.set("本地图片已不存在")
+        elif column == "#9" and row.get("image_id") and row.get("media_path") and not row.get("vision_text"):
+            self._start_rt_action(str(row["image_id"]), "vision", {})
+        elif column == "#10" and row.get("image_id"):
+            self._start_rt_action(str(row["image_id"]), "summary-include", {"include": not bool(row.get("include_vision"))})
+
+    def _start_rt_action(self, row_id: str, action: str, payload: dict) -> None:
+        key = f"{row_id}:{action}"
+        if key in self._rt_actions:
+            return
+        self._rt_actions.add(key)
+        self.status.set("正在提交图片识别…" if action == "vision" else "正在更新摘要选项…")
+
+        def work() -> None:
+            port = int(self.cfg["onebot"]["http_port"])
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/images/{row_id}/{action}",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            try:
+                op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with op.open(req, timeout=120) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                try:
+                    result = json.loads(exc.read().decode("utf-8"))
+                except (ValueError, UnicodeError):
+                    result = {"ok": False, "error": f"HTTP {exc.code}"}
+            except Exception as exc:  # noqa: BLE001
+                result = {"ok": False, "error": str(exc)}
+            self.events.put(("message_action", (key, action, result)))
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ---------------- 账单 ----------------
 
@@ -1896,6 +1989,15 @@ class App:
             self.status.set("账单已刷新")
         elif kind == "messages":
             self._render_messages(value)
+        elif kind == "message_action":
+            key, action, result = value
+            self._rt_actions.discard(key)
+            if result.get("ok"):
+                self.status.set("图片识别完成" if action == "vision" and result.get("state") == "ok"
+                                else "图片识别未完成" if action == "vision" else "摘要选项已更新")
+                self.refresh_messages()
+            else:
+                self.status.set(result.get("error") or "图片操作失败")
         elif kind == "summary_done":
             self._summary_finished(value)
         elif kind == "login_done":
@@ -1994,7 +2096,7 @@ class App:
         if not data.get("llm_available"):
             self.v_llm.set("未配置 API Key（不生成摘要或解析图片）")
         elif data.get("vision_enabled"):
-            self.v_llm.set("已配置 · 带配文图片解析已开启")
+            self.v_llm.set("已配置 · 手动图片解析已开启")
         else:
             self.v_llm.set("已配置 · 图片解析 API 已关闭")
         if data.get("api_provider"):

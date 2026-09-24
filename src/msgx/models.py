@@ -65,9 +65,10 @@ def _from_cq_string(s: str, at_ids: set) -> tuple[str, list, bool]:
         elif ctype == "face":
             out.append("[表情]")
         elif ctype == "mface":
-            # 表情包不采 URL：它几乎没有可 OCR 的文字，却和图片一样走
-            # 下载 + OCR + 多模态的完整流程 —— 量大、耗算力、还占额度。
-            # 处理方式与 video / record 一致，只留占位符。
+            url = cparams.get("url", "") or cparams.get("file", "")
+            if url:
+                images.append(url)
+            # 有链接的表情包同样做本地 OCR；图片语义只由用户手动发起。
             out.append("[表情包]")
         elif ctype == "reply":
             out.append("")
@@ -136,7 +137,10 @@ def parse_onebot_event(event: dict, self_id: str, at_ids: set | None = None) -> 
             elif stype == "face":
                 text_parts.append("[表情]")
             elif stype == "mface":
-                # 同上：表情包不采 URL，不下载、不 OCR、不送多模态。
+                url = data.get("url") or data.get("file") or ""
+                if url:
+                    images.append(str(url))
+                # 有链接时本地 OCR；不自动调用多模态模型。
                 text_parts.append("[表情包]")
             elif stype == "reply":
                 text_parts.append("")

@@ -284,6 +284,8 @@ class LLM:
         if complete:
             log.info("API 请求成功 · %s · 输入 %s / 输出 %s Token", purpose,
                      (usage or {}).get("prompt_tokens", "未知"), (usage or {}).get("completion_tokens", "未知"))
+            excerpt = " ".join(content.split())[:160]
+            log.info("API 内容摘要 · %s · %s", purpose, security.redact(excerpt))
         else:
             log.warning("API 输出未完成 · %s · finish_reason=%s · 输入 %s / 输出 %s Token · max_tokens=%s",
                         purpose, reason, (usage or {}).get("prompt_tokens", "未知"),

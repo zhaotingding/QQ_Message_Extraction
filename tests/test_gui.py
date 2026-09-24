@@ -114,7 +114,7 @@ nb = app.nb
 check("有实时消息标签页", any(str(nb.tab(i, "text")) == "实时消息" for i in range(nb.index("end"))),
       str([str(nb.tab(i, "text")) for i in range(nb.index("end"))]))
 check("实时消息表格列齐全",
-      list(app.rt["columns"]) == ["time", "group", "who", "text", "state", "account"],
+      list(app.rt["columns"]) == ["time", "group", "who", "text", "state", "image", "ocr", "vision", "recognize", "include", "account"],
       str(list(app.rt["columns"])))
 app._render_messages(None)
 check("拉取失败时给出说明", "失败" in app.v_rt_status.get(), app.v_rt_status.get())
@@ -123,7 +123,8 @@ app._render_messages([
      "text": "第二条", "media_state": "none", "vision_state": "", "at_me": 1},
     {"id": 1, "ts": 1699999900, "group_id": "g2", "group_name": "", "sender_name": "小红",
      "text": "[图片]", "media_state": "done", "vision_state": "failed", "at_me": 0,
-     "ocr_text": "报错截图", "vision_text": ""},
+     "ocr_text": "报错截图", "vision_text": "", "has_media": 1, "include_vision": 1,
+     "media_path": str(PROJ / "README.md"), "image_id": 1},
 ])
 rows = app.rt.get_children()
 check("消息渲染成行", len(rows) == 2, str(len(rows)))
@@ -132,6 +133,36 @@ check("按新的在前排序（列表顺序即服务返回顺序）", vals[0][3]
 check("空文本回落到 OCR 内容", vals[1][3] == "报错截图", str(vals[1]))
 check("被 @ 的行按普通消息呈现", "atme" not in app.rt.item(rows[0], "tags"), str(app.rt.item(rows[0], "tags")))
 check("语义失败的行有专属标记", "failed" in app.rt.item(rows[1], "tags"), str(app.rt.item(rows[1], "tags")))
+check("原图、OCR、语义、识别和纳入摘要分栏", vals[1][5] == "打开" and vals[1][6] == "报错截图"
+      and vals[1][7] == "—" and vals[1][8] == "□ 识别" and vals[1][9] == "☑", str(vals[1]))
+app.rt.selection_set("1")
+app._on_rt_select()
+check("选中行显示完整 OCR 与语义", "报错截图" in app.rt_detail.get("1.0", "end"))
+from types import SimpleNamespace  # noqa: E402
+event = SimpleNamespace(x=1, y=1)
+with patch.object(app.rt, "identify_row", return_value="1"), patch.object(app.rt, "identify_column", return_value="#6"), \
+        patch("msgx.gui.open_path") as opened:
+    app._on_rt_click(event)
+    check("点击图片链接打开当前行文件", opened.call_count == 1)
+with patch.object(app.rt, "identify_row", return_value="1"), patch.object(app.rt, "identify_column", return_value="#9"), \
+        patch.object(app, "_start_rt_action") as action:
+    app._on_rt_click(event)
+    check("点击识别勾选提交当前行", action.call_args.args == ("1", "vision", {}))
+with patch.object(app.rt, "identify_row", return_value="1"), patch.object(app.rt, "identify_column", return_value="#10"), \
+        patch.object(app, "_start_rt_action") as action:
+    app._on_rt_click(event)
+    check("纳入摘要单独切换", action.call_args.args == ("1", "summary-include", {"include": False}))
+app._render_messages([{"id": 3, "ts": 1700000000, "text": "[图片]", "media_state": "filtered",
+                       "ocr_text": "报错截图", "vision_text": "", "has_media": 1, "include_vision": 0,
+                       "media_path": str(PROJ / "README.md")}])
+check("过滤图片正文显示 OCR 前缀", app.rt.item("3", "values")[3] == "OCR:报错截图")
+app._render_messages([{"id": 4, "ts": 1700000000, "text": "两张图[图片][图片]", "media_state": "done",
+                       "images": [{"id": 41, "image_index": 0, "ocr_text": "第一张", "vision_text": "语义甲",
+                                   "media_path": str(PROJ / "README.md"), "include_vision": 1, "media_state": "done"},
+                                  {"id": 42, "image_index": 1, "ocr_text": "第二张", "vision_text": "语义乙",
+                                   "media_path": str(PROJ / "README.md"), "include_vision": 0, "media_state": "done"}]}])
+check("同条消息的两张图片独立展示", app.rt.exists("4:41") and app.rt.exists("4:42")
+      and app.rt.item("4:41", "values")[7] == "语义甲" and app.rt.item("4:42", "values")[7] == "语义乙")
 
 print("\n=== 图片状态标注 ===")
 labels = {
@@ -165,7 +196,7 @@ check("协议端显示已连接", "已连接" in app.v_peer.get(), app.v_peer.ge
 check("入库数显示", "33" in app.v_stored.get(), app.v_stored.get())
 check("过滤数显示", "2" in app.v_stored.get(), app.v_stored.get())
 check("花费显示（无账单快照时标明是估算）", "估算" in app.v_cost.get(), app.v_cost.get())
-check("模型状态仅说明已配置和解析已开启", app.v_llm.get() == "已配置 · 带配文图片解析已开启", app.v_llm.get())
+check("模型状态仅说明已配置和手动解析已开启", app.v_llm.get() == "已配置 · 手动图片解析已开启", app.v_llm.get())
 app._apply_health({"llm_available": True, "vision_enabled": False})
 check("图片解析关闭时状态准确", app.v_llm.get() == "已配置 · 图片解析 API 已关闭", app.v_llm.get())
 check("运行状态不再展示图片语义失败计数", not hasattr(app, "v_vision"))
@@ -326,6 +357,8 @@ check("「消息不再入库」⇒ 红（哪怕行里也有『入库』）",
       App._log_tag("10:49:31 WARNING msgx.pipeline 消息不再入库") == "warn")
 check("协议端已连入 ⇒ 绿", App._log_tag("10:48:35 INFO msgx.napcat 协议端已连入（账号 123）") == "good")
 check("普通 INFO ⇒ 白", App._log_tag("10:48:35 INFO msgx.media 正在检查待处理图片") == "")
+check("API 返回内容摘要为绿，即使识别文字含有错误字样",
+      App._log_tag("10:48:35 INFO msgx.llm API 内容摘要 · 图片理解 · 程序错误截图") == "good")
 check("界面提示提到「已连接」不染绿（那是提示，不是事件）",
       App._log_tag("[界面] 连上后「协议端(NapCat)」会自己变成「已连接」") == "")
 check("先判红再判绿：同一行两个词都出现时红压过绿",
@@ -758,7 +791,7 @@ app.v_summary_chars.set(_saved_chars)
 print("\n=== 状态和错误仅在界面内显示，不弹通知 ===")
 _labels = [str(w.cget("text")) for w in allw if isinstance(w, (ttk.Label, ttk.LabelFrame, ttk.Checkbutton))]
 check("删除热点关键词和摘要频率设置", "热点关注词" not in _labels and "摘要频率" not in _labels)
-check("图片规则明确按消息配文判断", any("消息附带文字时才调用 API" in value for value in _labels)
+check("图片规则明确本地 OCR 与手动 API 的边界", any("所有带链接的图片先做本地 OCR" in value for value in _labels)
       and "纯图片（消息未附带文字）" in _labels)
 with patch.object(_mb, "showinfo") as _info, patch.object(_mb, "showerror") as _error:
     app.summary_now()
@@ -953,6 +986,7 @@ with patch("msgx.gui.credentials.save") as _save_key, patch("msgx.gui.prefs_mod.
     check("无效地址禁止保存", not app.save_prefs() and not _save_key.called and not _save_prefs.called)
 
 print("\n=== 多 API 配置选择与独立保存 ===")
+app._show_api_profile("openai")
 app.v_api["base_url"].set("https://api.openai.com/v1")
 app.v_api["model"].set("my-openai-model")
 app.v_api_key.set(_fake_key)

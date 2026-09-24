@@ -221,8 +221,12 @@ for reason, content in [("length", "残缺正文"), ("length", ""),
 full_content = "# 总标题\n\n**独立主题**\n" + "完整内容，" * 4000
 sent, result, records, details = asyncio.run(complete_summary(ok_response(full_content)))
 check("完整长正文不截断、不额外改写", result == full_content and len(sent) == 1)
-check("完整响应才记录 API 成功", len(records) == 1 and records[0].levelno == logging.INFO
-      and "API 请求成功" in records[0].getMessage() and details[0]["status"] == "完成")
+check("完整响应才记录 API 成功及简短内容", len(records) == 2
+      and all(record.levelno == logging.INFO for record in records)
+      and "API 请求成功" in records[0].getMessage()
+      and "API 内容摘要" in records[1].getMessage()
+      and len(records[1].getMessage()) < 220 and full_content not in records[1].getMessage()
+      and details[0]["status"] == "完成")
 
 # ---------------------------------------------------------------- 连接层
 

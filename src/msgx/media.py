@@ -4,7 +4,6 @@ from .llm import APIRequestRejected, LLM
 
 import asyncio
 import hashlib
-import json
 import logging
 import time
 from pathlib import Path
@@ -12,8 +11,6 @@ from pathlib import Path
 import aiohttp
 
 from .config import abs_path
-from .models import CQ_RE
-from .prefs import plain_text
 
 log = logging.getLogger("msgx.media")
 
@@ -25,22 +22,6 @@ VISION_PROMPT = (
 )
 
 ERROR_HINTS = ("error", "exception", "traceback", "failed", "报错", "错误", "失败", "异常")
-
-
-def _has_caption(row) -> bool:
-    """只认可原消息的正文；协议占位符和 OCR 结果不算配文。"""
-    try:
-        event = json.loads(row["raw"] or "{}")
-    except (TypeError, json.JSONDecodeError):
-        event = {}
-    segments = event.get("message") if isinstance(event, dict) else None
-    if isinstance(segments, list):
-        return any(str((seg.get("data") or {}).get("text", "")).strip()
-                   for seg in segments if isinstance(seg, dict) and seg.get("type") == "text")
-    if isinstance(segments, str):
-        return bool(CQ_RE.sub("", segments).strip())
-    # 早期导入数据可能没有原事件，超长原事件也可能被截断。
-    return bool(plain_text(row["text"]))
 
 
 def _sniff_ext(data: bytes) -> str:
@@ -123,6 +104,7 @@ class MediaWorker:
         self._sem = asyncio.Semaphore(2)
         self._min_interval = 60.0 / max(1, int(self.mcfg.get("images_per_minute", 60)))
         self._last_start = 0.0
+        self._vision_running: set[int] = set()
 
     # ---------- infra ----------
 
@@ -224,7 +206,7 @@ class MediaWorker:
 
     async def process_pending(self, limit: int = 15) -> list[int]:
         """处理待办图片，返回已完成处理的 messages.id 列表。"""
-        rows = self.store.pending_media(limit)
+        rows = self.store.pending_images(limit)
         if not rows:
             return []
         done: list[int] = []
@@ -235,131 +217,70 @@ class MediaWorker:
                     await asyncio.sleep(gap)
                 self._last_start = time.monotonic()
                 try:
-                    await self._process_row(row)
-                    done.append(int(row["id"]))
+                    await self._process_image(row)
+                    done.append(int(row["message_row"]))
                 except Exception as e:  # noqa: BLE001
-                    log.warning("媒体处理失败 msg_id=%s: %s", row["msg_id"], e)
-                    self.store.set_media_result(row["id"], state="failed")
+                    log.warning("媒体处理失败 image_id=%s: %s", row["id"], e)
+                    self.store.set_image_result(row["id"], media_state="failed", vision_state="download_failed")
         return done
 
-    async def _process_row(self, row) -> None:
-        if not _has_caption(row):
-            self._skip_uncaptioned(row)
-            return
-
-        urls = json.loads(row["image_urls"] or "[]")
-        if not urls:
-            self.store.set_media_result(row["id"], state="none")
-            return
-
-        path = await self._download(str(urls[0]))
+    async def _process_image(self, row) -> None:
+        path = await self._download(row["image_url"])
         if path is None:
-            self.store.set_media_result(row["id"], state="failed")
+            self.store.set_image_result(row["id"], media_state="failed", vision_state="download_failed")
             return
 
         digest = hashlib.sha256(path.read_bytes()).hexdigest()[:32]
-        prev = self.store.find_by_hash(digest)
-        if prev is not None:
-            self.store.set_media_result(
-                row["id"],
-                ocr_text=prev["ocr_text"],
-                vision_text=prev["vision_text"],
-                media_path=str(path),
-                media_hash=digest,
-                state="done",
-                # 复用同图的历史结果时，语义状态也要跟着复用，否则会被当成
-                # 「还没试过」而重复调用模型。
-                vision_state=("ok" if (prev["vision_text"] or "").strip() else
-                              "rejected" if prev["vision_state"] == "rejected" else "failed"),
-            )
-            return
-
-        ocr_text = ""
-        if self.mcfg.get("ocr_enabled", True):
+        prev = self.store.find_image_by_hash(digest)
+        ocr_text = (prev["ocr_text"] or "") if prev is not None else ""
+        if not ocr_text and self.mcfg.get("ocr_enabled", True):
             ocr_text = await asyncio.to_thread(self._ocr_sync, path)
 
-        vision_text, vision_state = await self._run_vision(path, row)
-        if vision_state != "skipped":
-            # 第一次尝试也计数：否则「首跑失败」的行会白得一次额外重试机会，
-            # 而补跑计数只覆盖后续轮次，上限就不是真正的上限了。
-            self.store.bump_vision_tries(row["id"])
-
-        self.store.set_media_result(
+        self.store.set_image_result(
             row["id"],
             ocr_text=ocr_text,
-            vision_text=vision_text,
             media_path=str(path),
             media_hash=digest,
-            state="done",
-            vision_state=vision_state,
+            media_state="done",
+            vision_state="skipped",
         )
 
-    def _skip_uncaptioned(self, row) -> None:
-        """旧待办和失败记录也只按消息配文放行，保留已有识别结果。"""
-        self.store.set_media_result(
-            row["id"], ocr_text=row["ocr_text"] or "", vision_text=row["vision_text"] or "",
-            media_path=row["media_path"] or "", media_hash=row["media_hash"] or "",
-            state="done", vision_state="skipped",
-        )
-
-    async def _run_vision(self, path: Path, row, retry: bool = False) -> tuple[str, str]:
-        """跑图片语义，返回 ``(文本, 状态)``。状态见 store.MESSAGE_MIGRATIONS。
-
-        为什么要把「失败」单独记下来：失败不落状态的话，这张图以后永远不会
-        再被尝试（实测因此丢掉 62 张）。记成 'failed' 后由 `retry_vision()`
-        在后续轮次里补跑 —— 图片已在本地，补跑只是重发一次推理请求。
-        """
-        if not _has_caption(row):
-            return "", "skipped"
+    async def _run_vision(self, path: Path, row) -> tuple[str, str]:
+        """仅在用户手动选择时调用图片模型。"""
         llm = self.llm.snapshot() if isinstance(self.llm, LLM) else self.llm
         if not llm.vision_available:
-            return "", "skipped"
+            raise RuntimeError("当前 API 未配置图片解析能力或密钥")
         try:
-            text, ok = await llm.describe_image(path, VISION_PROMPT, source_ids=[int(row["id"])],
-                                             purpose="图片理解重试" if retry else "图片理解")
+            text, ok = await llm.describe_image(path, VISION_PROMPT, source_ids=[int(row["message_row"])],
+                                                purpose="图片理解")
         except APIRequestRejected:
             return "", "rejected"
         return text, ("ok" if ok else "failed")
 
-    async def retry_vision(self, limit: int = 8) -> list[int]:
-        """补跑之前语义失败的那些图（只重跑推理，不重新下载、不重跑 OCR）。
-
-        每轮只取少量，避免一次网络恢复后突然对模型发起几十个并发请求。
-        **每次尝试都计数**（store.bump_vision_tries）—— 没有这个上限，一张
-        永远读不出来的图会被每一轮补跑反复送去推理，安静地烧钱。次数用满后
-        它就停在 'failed'，不再进入 `failed_vision` 的结果集。
-
-        返回**这一次补出内容**的行 id，供后续摘要使用。
-        """
-        llm = self.llm.snapshot() if isinstance(self.llm, LLM) else self.llm
-        if not llm.vision_available:
-            return []
-        rows = self.store.failed_vision(limit)
-        done: list[int] = []
-        for row in rows:
-            if not _has_caption(row):
-                self._skip_uncaptioned(row)
-                continue
-            self.store.bump_vision_tries(row["id"])
-            path = Path(row["media_path"])
-            if not path.exists():
-                continue  # 文件被清理了，保持 failed 即可
+    async def manual_vision(self, row_id: int) -> dict:
+        """一次明确的用户操作对应至多一次模型请求；同一消息并发点击会合并。"""
+        row = self.store.get_image(row_id)
+        if row is None:
+            raise ValueError("这条消息没有可识别的图片")
+        if row_id in self._vision_running:
+            return {"state": "running", "text": ""}
+        if row["vision_state"] == "ok" and (row["vision_text"] or "").strip():
+            return {"state": "ok", "text": row["vision_text"], "cached": True}
+        path = Path(row["media_path"]) if row["media_path"] else None
+        if path is None or not path.is_file():
+            raise ValueError("图片尚未下载或本地文件已清理，无法手动识别")
+        self._vision_running.add(row_id)
+        try:
             async with self._sem:
-                text, state = await self._run_vision(path, row, retry=True)
-            self.store.set_media_result(
-                row["id"],
-                ocr_text=row["ocr_text"] or "",
+                text, state = await self._run_vision(path, row)
+            self.store.set_image_result(
+                row_id,
                 vision_text=text if state == "ok" else "",
-                media_path=row["media_path"],
-                media_hash=row["media_hash"] or "",
-                state="done",
                 vision_state=state,
             )
-            if state == "ok":
-                done.append(int(row["id"]))
-        if done:
-            log.info("补跑图片语义成功 %d 张（本轮取出 %d 张）", len(done), len(rows))
-        return done
+            return {"state": state, "text": text}
+        finally:
+            self._vision_running.discard(row_id)
 
     @staticmethod
     def looks_like_error(text: str) -> bool:

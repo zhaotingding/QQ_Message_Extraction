@@ -128,6 +128,50 @@ async def main():
     with tempfile.TemporaryDirectory() as tmp:
         llm = FakeLLM([])
         sm = make(llm, tmp)
+        row_id = insert(sm, 1, "图片讨论")[0]
+        sm.store.conn.execute("UPDATE messages SET has_media=1,ocr_text=?,vision_text=? WHERE id=?",
+                              ("本地OCR", "手动语义", row_id))
+        sm.store.conn.commit()
+        sm.store.set_vision_include(row_id, False)
+        await sm.run_digest(full=True)
+        check("取消纳入时 OCR 和语义均不发送",
+              "本地OCR" not in llm.calls[-1][1] and "手动语义" not in llm.calls[-1][1])
+        sm.store.set_vision_include(row_id, True)
+        await sm.run_digest(full=True)
+        check("重新纳入后发送语义", "手动语义" in llm.calls[-1][1])
+        sm.store.conn.execute("UPDATE messages SET media_state='filtered' WHERE id=?", (row_id,))
+        sm.store.conn.commit()
+        sm.store.set_vision_include(row_id, False)
+        check("过滤图片未勾选时不进入摘要", sm.store.messages_between_all(0, int(time.time())) == [])
+        sm.store.set_vision_include(row_id, True)
+        await sm.run_digest(full=True)
+        check("过滤图片勾选后仅把语义放进摘要", "手动语义" in llm.calls[-1][1]
+              and "本地OCR" not in llm.calls[-1][1])
+        sm.store.close()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        from msgx.models import Msg
+        llm = FakeLLM([])
+        sm = make(llm, tmp)
+        row_id = sm.store.insert_message(Msg(msg_id="two", group_id="g", ts=int(time.time()) - 1,
+                                             text="两张截图[图片][图片]", image_urls=["https://a.invalid/1", "https://a.invalid/2"]))
+        images = sm.store.conn.execute("SELECT id FROM message_images WHERE message_row=? ORDER BY image_index",
+                                       (row_id,)).fetchall()
+        sm.store.set_image_result(images[0]["id"], media_state="done", ocr_text="第一张OCR", vision_text="第一张语义")
+        sm.store.set_image_result(images[1]["id"], media_state="done", ocr_text="第二张OCR", vision_text="第二张语义")
+        sm.store.set_image_include(images[0]["id"], False)
+        await sm.run_digest(full=True)
+        check("多图消息按单张纳入语义和 OCR", "第一张语义" not in llm.calls[-1][1]
+              and "第一张OCR" not in llm.calls[-1][1] and "第二张语义" in llm.calls[-1][1])
+        sm.store.set_image_result(images[1]["id"], vision_text="", vision_state="skipped")
+        await sm.run_digest(full=True)
+        check("已勾选但未识别的第二张图仍送已有 OCR", "第一张OCR" not in llm.calls[-1][1]
+              and "第一张语义" not in llm.calls[-1][1] and "第二张OCR" in llm.calls[-1][1])
+        sm.store.close()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        llm = FakeLLM([])
+        sm = make(llm, tmp)
         now = int(time.time())
         for i, (stamp, body) in enumerate([(now-2, "第二时刻甲[图片]"), (now-3, "第一时刻"), (now-2, "第二时刻乙")]):
             sm.store.insert_message(Msg(msg_id=str(i), group_id="secret-group", sender_name="secret-sender", ts=stamp, text=body), "secret-name")

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 import json
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -114,29 +115,49 @@ asyncio.run(run_fetch_tests())
 print("\n=== requeue_failed_media ===")
 
 from msgx.store import Store  # noqa: E402
+from msgx.models import Msg  # noqa: E402
 
 tmp = tempfile.mkdtemp()
 st = Store(os.path.join(tmp, "t.db"))
-st.conn.execute(
-    "INSERT INTO messages(group_id, msg_id, ts, has_media, media_state)"
-    " VALUES('g1','m1',1,1,'failed')"
-)
-st.conn.commit()
+parent = st.insert_message(Msg(msg_id="m1", group_id="g1", ts=1,
+                               image_urls=["https://example.invalid/image"]))
+child_id = st.conn.execute("SELECT id FROM message_images WHERE message_row=?", (parent,)).fetchone()[0]
+st.set_image_result(child_id, media_state="failed")
 n = st.requeue_failed_media()
 row = st.conn.execute("SELECT media_state FROM messages WHERE msg_id='m1'").fetchone()
 check("failed 图片被重新入队", n == 1)
-check("状态恢复为 pending", row["media_state"] == "pending")
+check("父子状态恢复为 pending", row["media_state"] == "pending"
+      and st.get_image(child_id)["media_state"] == "pending")
 check("重复调用不产生副作用", st.requeue_failed_media() == 0)
 st.close()
 
-print("\n=== 仅消息带配文的图片允许解析 ===")
+print("\n=== 旧消息图片迁移 ===")
+with tempfile.TemporaryDirectory() as directory:
+    db = Path(directory) / "legacy.db"
+    store = Store(db)
+    parent = store.insert_message(Msg(msg_id="legacy", group_id="g", ts=100,
+                                      image_urls=["https://example.invalid/1", "https://example.invalid/2"]))
+    store.set_media_result(parent, ocr_text="旧 OCR", vision_text="旧语义", media_path="saved.png",
+                           state="done", vision_state="ok")
+    store.conn.execute("DELETE FROM message_images")
+    store.conn.commit()
+    store.close()
+    store = Store(db)
+    migrated = store.conn.execute("SELECT * FROM message_images WHERE message_row=? ORDER BY image_index",
+                                  (parent,)).fetchall()
+    check("旧版第一张结果保留、其余图片独立待 OCR", len(migrated) == 2
+          and migrated[0]["ocr_text"] == "旧 OCR" and migrated[0]["vision_text"] == "旧语义"
+          and migrated[0]["media_state"] == "done" and migrated[1]["media_state"] == "pending")
+    store.close()
+
+print("\n=== 图片先 OCR、手动模型识别 ===")
 
 from msgx.config import DEFAULTS  # noqa: E402
-from msgx.media import MediaWorker, _has_caption  # noqa: E402
-from msgx.models import Msg, parse_onebot_event  # noqa: E402
+from msgx.media import MediaWorker  # noqa: E402
+from msgx.models import parse_onebot_event  # noqa: E402
 import copy  # noqa: E402
 
-async def captioned_image_tests():
+async def manual_image_tests():
     with tempfile.TemporaryDirectory() as directory:
         cfg = copy.deepcopy(DEFAULTS)
         cfg["app"]["media_dir"] = str(Path(directory) / "media")
@@ -148,8 +169,12 @@ async def captioned_image_tests():
             vision_available = True
             def __init__(self):
                 self.calls = []
+                self.ready = asyncio.Event()
+                self.release = asyncio.Event()
             async def describe_image(self, path, prompt, **kwargs):
                 self.calls.append((path, prompt, kwargs))
+                self.ready.set()
+                await self.release.wait()
                 return "图片中展示了错误日志", True
 
         llm = FakeLLM()
@@ -159,96 +184,113 @@ async def captioned_image_tests():
             downloaded.append(url)
             return image
         worker._download = download
-        worker._ocr_sync = lambda path: ""
-
-        def insert(mid, text):
+        worker._ocr_sync = lambda path: "本地 OCR 文字"
+        def insert(mid, text, filtered=False):
             return store.insert_message(Msg(msg_id=mid, group_id="g", text=text,
-                                            image_urls=[image.as_uri()], msg_type="mixed"))
+                                            image_urls=[image.as_uri()], msg_type="mixed"), filtered=filtered)
+        def child(message_row):
+            return store.conn.execute("SELECT * FROM message_images WHERE message_row=?", (message_row,)).fetchone()
 
-        for index, text in enumerate(("[图片]", "[图片][表情][表情包]", "@全体成员[图片]",
-                                      "[图片][文件:资料.pdf][语音][视频][合并转发]", "  ",
-                                      "[图片][record][video][forward]")):
-            row_id = insert(f"bare-{index}", text)
-            await worker._process_row(store.get_message(row_id))
-            row = store.get_message(row_id)
-            check(f"无配文或仅占位符 {index + 1} 跳过且不耗重试次数",
-                  row["vision_state"] == "skipped" and row["vision_tries"] == 0)
-        check("无配文图片完全不下载、不调用 API", not downloaded and not llm.calls)
+        row_id = insert("filtered", "[图片]", filtered=True)
+        check("过滤图片也进入 OCR 队列", [r["message_row"] for r in store.pending_images()] == [row_id])
+        await worker.process_pending()
+        row = store.get_message(row_id)
+        check("过滤图片保留文件和 OCR、默认无模型调用",
+              row["media_state"] == "filtered" and row["media_path"] == str(image)
+              and row["ocr_text"] == "本地 OCR 文字" and row["vision_state"] == "skipped"
+              and not llm.calls and not store.pending_images())
 
-        event = {"post_type": "message", "message_type": "group", "message_id": "at-only",
-                 "group_id": "g", "message": [{"type": "at", "data": {"qq": "123"}},
-                                              {"type": "image", "data": {"url": image.as_uri()}}]}
-        at_only = store.insert_message(parse_onebot_event(event, "123"))
-        await worker._process_row(store.get_message(at_only))
-        check("只有点名和图片也不算配文", not downloaded and not llm.calls)
+        task = asyncio.create_task(worker.manual_vision(child(row_id)["id"]))
+        await llm.ready.wait()
+        concurrent = await worker.manual_vision(child(row_id)["id"])
+        llm.release.set()
+        result = await task
+        check("同图并发手动操作只提交一次模型请求", concurrent["state"] == "running"
+              and result["state"] == "ok" and len(llm.calls) == 1)
+        check("图片理解关联原消息", llm.calls[0][2] == {"source_ids": [row_id], "purpose": "图片理解"})
+        check("成功结果保留过滤状态与 OCR", store.get_message(row_id)["media_state"] == "filtered"
+              and store.get_message(row_id)["ocr_text"] == "本地 OCR 文字")
+        cached = await worker.manual_vision(child(row_id)["id"])
+        check("已识别图片再次点击不重复收费", cached.get("cached") and len(llm.calls) == 1)
 
-        for segment_type, marker in (("record", "[语音]"), ("video", "[视频]"),
-                                     ("forward", "[合并转发]"), ("json", "")):
-            cq_event = {"post_type": "message", "message_type": "group", "group_id": "g",
-                        "message_id": f"cq-{segment_type}",
-                        "message": f"[CQ:{segment_type},file=attachment][CQ:image,url={image.as_uri()}]"}
-            cq_msg = parse_onebot_event(cq_event, "123")
-            array_event = {**cq_event, "message": [{"type": segment_type, "data": {"file": "attachment"}},
-                                                    {"type": "image", "data": {"url": image.as_uri()}}]}
-            array_msg = parse_onebot_event(array_event, "123")
-            check(f"CQ {segment_type} 与数组格式占位符一致", cq_msg.text == array_msg.text == marker + "[图片]")
-            cq_id = store.insert_message(cq_msg)
-            await worker._process_row(store.get_message(cq_id))
-            check(f"图片与 {segment_type} 混合但无配文不会解析", not downloaded and not llm.calls)
-            # 复现旧版入库格式，包括未知 CQ 类型产生的英文占位符。
-            store.conn.execute("UPDATE messages SET text=?, media_path=?, vision_state='failed' WHERE id=?",
-                               (f"[{segment_type}][图片]", str(image), cq_id))
-            store.conn.commit()
-            recovered = await worker.retry_vision()
-            check(f"旧 {segment_type} 占位符不能通过重试绕过配文门槛",
-                  not recovered and not llm.calls and store.get_message(cq_id)["vision_state"] == "skipped")
+        duplicate = insert("duplicate", "另一条[图片]")
+        await worker.process_pending()
+        check("相同图片复用 OCR 但不自动复用语义", store.get_message(duplicate)["ocr_text"] == "本地 OCR 文字"
+              and not store.get_message(duplicate)["vision_text"] and len(llm.calls) == 1)
+        old = store.insert_message(Msg(msg_id="old", group_id="g", text="[图片]",
+                                       image_urls=[image.as_uri()]), filtered=True)
+        store.conn.execute("DELETE FROM message_images WHERE message_row=?", (old,))
+        store.conn.execute("UPDATE messages SET image_urls='[]',has_media=0 WHERE id=?", (old,))
+        store.conn.commit()
+        check("旧版未保存链接的过滤图片不冒充可恢复", old not in [r["message_row"] for r in store.pending_images()])
 
-        for message in (f"[ERROR][CQ:image,url={image.as_uri()}]",
-                        [{"type": "text", "data": {"text": "[ERROR]"}},
-                         {"type": "image", "data": {"url": image.as_uri()}}]):
-            error_event = {**event, "message_id": "error-caption", "message": message}
-            parsed = parse_onebot_event(error_event, "123")
-            check("正文里的 [ERROR] 是真实配文，不会被当协议占位符删除",
-                  _has_caption({"raw": json.dumps(parsed.raw), "text": parsed.text}))
-        check("旧 raw 截断时仍识别已知英文占位符",
-              not _has_caption({"raw": '{"message":', "text": "[record][video][forward][图片]"}))
+        multi = store.insert_message(Msg(msg_id="multi", group_id="g", text="两张图[图片][图片]",
+                                         image_urls=[image.as_uri(), image.as_uri()], msg_type="mixed"))
+        check("一条消息两张图分别建立可操作记录",
+              len(store.conn.execute("SELECT id FROM message_images WHERE message_row=?", (multi,)).fetchall()) == 2)
+        await worker.process_pending()
+        check("两张图分别保存 OCR 与路径且没有自动模型请求",
+              all(r["ocr_text"] == "本地 OCR 文字" and r["media_path"] == str(image)
+                  for r in store.conn.execute("SELECT * FROM message_images WHERE message_row=?", (multi,)))
+              and len(llm.calls) == 1)
 
-        captioned = insert("captioned", "部署时出现这个错误[图片]")
-        await worker._process_row(store.get_message(captioned))
-        check("真实配文图片无需能力探测且不依赖 OCR 检出文字", len(llm.calls) == 1
-              and store.get_message(captioned)["ocr_text"] == "")
-        check("图片请求关联原消息且不再解释表情包",
-              llm.calls[0][2] == {"source_ids": [captioned], "purpose": "图片理解"}
-              and "梗" not in llm.calls[0][1] and "情绪" not in llm.calls[0][1])
-        duplicate = insert("duplicate", "另一个群也遇到了[图片]")
-        await worker._process_row(store.get_message(duplicate))
-        check("配文同图复用已成功结果，不重复花费", len(llm.calls) == 1
-              and store.get_message(duplicate)["vision_state"] == "ok")
-        bare_duplicate = insert("bare-duplicate", "[图片]")
-        count = len(downloaded)
-        await worker._process_row(store.get_message(bare_duplicate))
-        check("无配文同图不能通过去重复用绕过门槛", len(downloaded) == count
-              and store.get_message(bare_duplicate)["vision_text"] == "")
+        from types import SimpleNamespace
+        from msgx.onebot import build_app
+        runner = web.AppRunner(build_app(cfg, SimpleNamespace(store=store, media=worker)))
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        children = store.conn.execute("SELECT id FROM message_images WHERE message_row=? ORDER BY image_index",
+                                      (multi,)).fetchall()
+        second = children[1]["id"]
+        try:
+            async with ClientSession() as session:
+                root = f"http://127.0.0.1:{port}"
+                async with session.post(f"{root}/images/{second}/vision", json={}) as response:
+                    result = await response.json()
+                check("本地接口只识别指定的第二张图", response.status == 200 and result["state"] == "ok"
+                      and len(llm.calls) == 2 and store.get_image(children[0]["id"])["vision_text"] == "")
+                async with session.post(f"{root}/images/{second}/summary-include", json={"include": False}) as response:
+                    result = await response.json()
+                check("接口可独立排除已识别语义", response.status == 200 and not result["include"]
+                      and not store.get_message(multi)["vision_text"] and store.get_image(second)["vision_text"])
+                async with session.post(f"{root}/images/{second}/summary-include", json={"include": True},
+                                        headers={"Origin": "https://example.invalid"}) as response:
+                    check("网页跨域请求不能修改摘要开关", response.status == 403
+                          and not store.get_image(second)["include_vision"])
+        finally:
+            await runner.cleanup()
 
-        old_bare = insert("old-bare", "[图片]")
-        store.set_media_result(old_bare, ocr_text="旧 OCR 内容", vision_text="旧结果", media_path=str(image),
-                               state="done", vision_state="failed")
-        recovered = await worker.retry_vision()
-        old_row = store.get_message(old_bare)
-        check("旧无配文失败队列不再烧 Token", not recovered and len(llm.calls) == 1
-              and old_row["vision_state"] == "skipped" and old_row["vision_tries"] == 0)
-        check("跳过旧记录时保留已有内容和路径", old_row["ocr_text"] == "旧 OCR 内容"
-              and old_row["vision_text"] == "旧结果" and old_row["media_path"] == str(image))
-        old_caption = insert("old-caption", "这些报错是什么[图片]")
-        store.set_media_result(old_caption, media_path=str(image), state="done", vision_state="failed")
-        recovered = await worker.retry_vision()
-        check("带配文的失败图片仍可在次数限制内补跑", recovered == [old_caption]
-              and store.get_message(old_caption)["vision_tries"] == 1 and len(llm.calls) == 2)
-        check("补跑费用仍关联原消息", llm.calls[-1][2] == {"source_ids": [old_caption], "purpose": "图片理解重试"})
+        event = {"post_type": "message", "message_type": "group", "message_id": "mface",
+                 "group_id": "g", "message": [{"type": "mface", "data": {"url": image.as_uri()}}]}
+        check("有链接的表情包也能本地 OCR", parse_onebot_event(event, "123").image_urls == [image.as_uri()])
         await worker.close()
         store.close()
 
-asyncio.run(captioned_image_tests())
+asyncio.run(manual_image_tests())
+
+print("\n=== 多图清理保留共享文件 ===")
+with tempfile.TemporaryDirectory() as directory:
+    store = Store(Path(directory) / "prune.db")
+    shared = Path(directory) / "shared.png"
+    shared.write_bytes(png())
+    now = int(time.time())
+    old_id = store.insert_message(Msg(msg_id="old", group_id="g", ts=now - 10 * 86400,
+                                      image_urls=["https://example.invalid/old"]))
+    new_id = store.insert_message(Msg(msg_id="new", group_id="g", ts=now - 86400,
+                                      image_urls=["https://example.invalid/new"]))
+    for parent in (old_id, new_id):
+        image_id = store.conn.execute("SELECT id FROM message_images WHERE message_row=?", (parent,)).fetchone()[0]
+        store.set_image_result(image_id, media_path=str(shared), media_state="done")
+    store.prune(7, 7)
+    check("删除旧消息时清理子图片但保留仍引用的文件", store.get_message(old_id) is None
+          and store.get_message(new_id) is not None and shared.exists()
+          and not store.conn.execute("SELECT 1 FROM message_images WHERE message_row=?", (old_id,)).fetchone())
+    store.prune(7, 0)
+    check("媒体保留期结束时清理子图片路径与文件", not shared.exists()
+          and not store.conn.execute("SELECT media_path FROM message_images WHERE message_row=?", (new_id,)).fetchone()[0])
+    store.close()
 
 print()
 if fails:

@@ -40,6 +40,22 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_msg_group_ts ON messages(group_id, ts);
 
+CREATE TABLE IF NOT EXISTS message_images (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_row INTEGER NOT NULL,
+  image_index INTEGER NOT NULL,
+  image_url TEXT NOT NULL DEFAULT '',
+  media_path TEXT NOT NULL DEFAULT '',
+  media_hash TEXT NOT NULL DEFAULT '',
+  ocr_text TEXT NOT NULL DEFAULT '',
+  vision_text TEXT NOT NULL DEFAULT '',
+  media_state TEXT NOT NULL DEFAULT 'pending',
+  vision_state TEXT NOT NULL DEFAULT 'skipped',
+  include_vision INTEGER NOT NULL DEFAULT 1,
+  UNIQUE(message_row, image_index)
+);
+CREATE INDEX IF NOT EXISTS idx_image_pending ON message_images(media_state, id);
+
 CREATE TABLE IF NOT EXISTS summaries (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   group_id      TEXT NOT NULL,
@@ -127,6 +143,7 @@ MESSAGE_MIGRATIONS = (
     ("received_by", "TEXT NOT NULL DEFAULT ''"),
     ("vision_state", "TEXT DEFAULT ''"),
     ("vision_tries", "INTEGER DEFAULT 0"),
+    ("include_vision", "INTEGER NOT NULL DEFAULT 1"),
     ("at_all", "INTEGER DEFAULT 0"),  # v0.5.7：独立记录，不能依赖可能截断的 raw JSON
 )
 
@@ -186,6 +203,27 @@ class Store:
             "UPDATE messages SET vision_state='failed'"
             " WHERE vision_state='' AND media_state='done' AND vision_text='' AND media_path<>''"
         )
+        for row in self.conn.execute("SELECT id,image_urls,media_path,media_hash,ocr_text,vision_text,"
+                                     "media_state,vision_state,include_vision FROM messages WHERE has_media=1"):
+            try:
+                urls = json.loads(row["image_urls"] or "[]")
+            except ValueError:
+                urls = []
+            if not urls and row["media_path"]:
+                urls = [""]
+            for index, url in enumerate(urls):
+                first = index == 0
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO message_images"
+                    "(message_row,image_index,image_url,media_path,media_hash,ocr_text,vision_text,"
+                    "media_state,vision_state,include_vision) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (row["id"], index, str(url), row["media_path"] if first else "",
+                     row["media_hash"] if first else "", row["ocr_text"] if first else "",
+                     row["vision_text"] if first else "",
+                     ("done" if row["media_path"] else "pending") if first else "pending",
+                     (row["vision_state"] or "skipped") if first else "skipped",
+                     row["include_vision"]),
+                )
 
     def close(self) -> None:
         self.conn.close()
@@ -349,7 +387,7 @@ class Store:
         # 同一群消息被不同账号接收时只保留一份正文，分别记录接收凭据。
         # 不仅凭文本去重：必须消息 ID、时间、发送人、类型、内容均相同。
         duplicate = self.conn.execute(
-            "SELECT id,raw FROM messages WHERE group_id=? AND msg_id=? AND ts=? AND sender_id=?"
+            "SELECT id,raw,image_urls FROM messages WHERE group_id=? AND msg_id=? AND ts=? AND sender_id=?"
             " AND msg_type=? AND text=? AND received_by<>?",
             (m.group_id, m.msg_id, m.ts, m.sender_id, m.msg_type, m.text, bot_uin)).fetchall()
         for row in duplicate:
@@ -357,7 +395,8 @@ class Store:
                 same_media = bool(m.raw.get("message")) and json.loads(row["raw"]).get("message") == m.raw.get("message")
             except (ValueError, AttributeError):
                 same_media = False
-            if (not m.image_urls and not m.file_names) or same_media:
+            same_filtered_image = filtered and bool(m.image_urls) and json.loads(row["image_urls"] or "[]") == m.image_urls
+            if (not m.image_urls and not m.file_names) or same_media or same_filtered_image:
                 self.conn.execute("INSERT INTO message_receipts VALUES(?,?,?,?)",
                                   (bot_uin, m.group_id, m.msg_id, row["id"]))
                 self.upsert_group(m.group_id, group_name, bot_uin)
@@ -375,8 +414,8 @@ class Store:
                 m.ts,
                 m.msg_type,
                 m.text,
-                1 if not filtered and (m.image_urls or m.file_names) else 0,
-                json.dumps([] if filtered else m.image_urls, ensure_ascii=False),
+                1 if m.image_urls or (not filtered and m.file_names) else 0,
+                json.dumps(m.image_urls, ensure_ascii=False),
                 "filtered" if filtered else "pending" if m.image_urls else "none",
                 1 if m.at_me else 0,
                 1 if m.at_all else 0,
@@ -389,6 +428,9 @@ class Store:
             return None
         self.conn.execute("INSERT INTO message_receipts VALUES(?,?,?,?)",
                           (bot_uin, m.group_id, m.msg_id, cur.lastrowid))
+        for index, url in enumerate(m.image_urls):
+            self.conn.execute("INSERT INTO message_images(message_row,image_index,image_url) VALUES(?,?,?)",
+                              (cur.lastrowid, index, str(url)))
         # 无条件注册群：群名可能暂时为空（待配置补全），但群必须出现在 groups 表里，
         # 否则摘要调度遍历 group_names() 时看不到这个群。upsert_group 内部已保护空名不覆盖已有名字。
         #
@@ -430,6 +472,68 @@ class Store:
     def get_message(self, row_id: int):
         return self.conn.execute("SELECT * FROM messages WHERE id=?", (row_id,)).fetchone()
 
+    def set_vision_include(self, row_id: int, include: bool) -> bool:
+        cur = self.conn.execute(
+            "UPDATE messages SET include_vision=? WHERE id=? AND has_media=1",
+            (int(include), row_id),
+        )
+        self.conn.commit()
+        return bool(cur.rowcount)
+
+    def get_image(self, image_id: int):
+        return self.conn.execute("SELECT * FROM message_images WHERE id=?", (image_id,)).fetchone()
+
+    def pending_images(self, limit: int = 200) -> list:
+        return list(self.conn.execute(
+            "SELECT * FROM message_images WHERE media_state='pending' AND image_url<>''"
+            " ORDER BY id LIMIT ?", (limit,),
+        ))
+
+    def find_image_by_hash(self, media_hash: str):
+        return self.conn.execute(
+            "SELECT ocr_text FROM message_images WHERE media_hash=? AND media_state='done'"
+            " AND ocr_text<>'' LIMIT 1", (media_hash,),
+        ).fetchone()
+
+    def set_image_result(self, image_id: int, *, ocr_text: str | None = None,
+                         vision_text: str | None = None, media_path: str | None = None,
+                         media_hash: str | None = None, media_state: str | None = None,
+                         vision_state: str | None = None) -> None:
+        fields = {"ocr_text": ocr_text, "vision_text": vision_text, "media_path": media_path,
+                  "media_hash": media_hash, "media_state": media_state, "vision_state": vision_state}
+        updates = {key: value for key, value in fields.items() if value is not None}
+        if not updates:
+            return
+        self.conn.execute("UPDATE message_images SET " + ",".join(f"{key}=?" for key in updates)
+                          + " WHERE id=?", (*updates.values(), image_id))
+        self._sync_image_message(self.get_image(image_id)["message_row"])
+
+    def set_image_include(self, image_id: int, include: bool) -> bool:
+        cur = self.conn.execute("UPDATE message_images SET include_vision=? WHERE id=?",
+                                (int(include), image_id))
+        if cur.rowcount:
+            self._sync_image_message(self.get_image(image_id)["message_row"])
+        return bool(cur.rowcount)
+
+    def _sync_image_message(self, message_row: int) -> None:
+        """父消息保留聚合字段，供现有摘要读取；逐张结果始终保存在子表。"""
+        images = list(self.conn.execute("SELECT * FROM message_images WHERE message_row=? ORDER BY image_index",
+                                        (message_row,)))
+        if not images:
+            return
+        ocr = "\n".join(r["ocr_text"] for r in images if r["include_vision"] and r["ocr_text"])
+        vision = "\n".join(r["vision_text"] for r in images if r["include_vision"] and r["vision_text"])
+        first = images[0]
+        current = self.conn.execute("SELECT media_state FROM messages WHERE id=?", (message_row,)).fetchone()
+        state = current["media_state"] if current and current["media_state"] == "filtered" else (
+            "pending" if any(r["media_state"] == "pending" for r in images) else
+            "failed" if any(r["media_state"] == "failed" for r in images) else "done"
+        )
+        self.conn.execute("UPDATE messages SET ocr_text=?,vision_text=?,media_path=?,media_hash=?,"
+                          "vision_state=?,media_state=? WHERE id=?",
+                          (ocr, vision, first["media_path"], first["media_hash"], first["vision_state"], state, message_row))
+        self.conn.commit()
+
     def find_by_hash(self, media_hash: str) -> sqlite3.Row | None:
         return self.conn.execute(
             "SELECT ocr_text, vision_text, media_path, vision_state FROM messages"
@@ -452,11 +556,16 @@ class Store:
         failed 的图片。服务启动时重置一次：URL 仍有效即被挽回；已过期会再次
         failed，但只在本策略下每次启动重试一次，不会死循环刷 URL。
         """
-        cur = self.conn.execute(
-            "UPDATE messages SET media_state='pending' WHERE media_state='failed' AND has_media=1"
+        children = self.conn.execute(
+            "UPDATE message_images SET media_state='pending' WHERE media_state='failed' AND image_url<>''"
+        )
+        self.conn.execute(
+            "UPDATE messages SET media_state='pending' WHERE media_state='failed'"
+            " AND EXISTS (SELECT 1 FROM message_images i WHERE i.message_row=messages.id"
+            " AND i.media_state='pending')"
         )
         self.conn.commit()
-        return cur.rowcount
+        return children.rowcount
 
     def failed_vision(self, limit: int = 200, max_tries: int = VISION_MAX_TRIES) -> list:
         """语义提取失败的图片（图片本身已落盘，只需重跑推理，不必重新下载）。
@@ -485,10 +594,11 @@ class Store:
 
     def recent_messages(self, limit: int = 60) -> list:
         """最近入库的消息（倒序）。带群名与图片处理状态，供界面直接展示。"""
-        return list(
+        rows = list(
             self.conn.execute(
                 "SELECT m.id, m.group_id, m.sender_name, m.ts, m.text, m.msg_type,"
-                " m.media_state, m.vision_state, m.ocr_text, m.vision_text, m.at_me,"
+                " m.media_state, m.vision_state, m.ocr_text, m.vision_text, m.media_path,"
+                " m.has_media, m.include_vision, m.at_me,"
                 " m.received_by, (SELECT GROUP_CONCAT(account) FROM message_receipts"
                 " WHERE message_row=m.id AND account<>'') AS receiver_accounts,"
                 " COALESCE(g.name, '') AS group_name"
@@ -497,12 +607,19 @@ class Store:
                 (limit,),
             )
         )
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["images"] = [dict(image) for image in self.conn.execute(
+                "SELECT * FROM message_images WHERE message_row=? ORDER BY image_index", (row["id"],))]
+            result.append(item)
+        return result
 
     def messages_between(self, group_id: str, start: int, end: int) -> list:
         return list(
             self.conn.execute(
                 "SELECT * FROM messages WHERE group_id=? AND ts>? AND ts<=?"
-                " AND media_state<>'filtered' ORDER BY ts ASC",
+                " AND (media_state<>'filtered' OR (include_vision=1 AND vision_text<>'')) ORDER BY ts ASC",
                 (group_id, start, end),
             )
         )
@@ -515,14 +632,16 @@ class Store:
 
     def first_ts(self, group_id: str) -> int:
         row = self.conn.execute(
-            "SELECT MIN(ts) AS t FROM messages WHERE group_id=? AND media_state<>'filtered'", (group_id,)
+            "SELECT MIN(ts) AS t FROM messages WHERE group_id=?"
+            " AND (media_state<>'filtered' OR (include_vision=1 AND vision_text<>''))", (group_id,)
         ).fetchone()
         return int(row["t"]) if row and row["t"] else 0
 
     # ---------- 跨群（热点统计用） ----------
 
     def first_ts_all(self) -> int:
-        row = self.conn.execute("SELECT MIN(ts) AS t FROM messages WHERE media_state<>'filtered'").fetchone()
+        row = self.conn.execute("SELECT MIN(ts) AS t FROM messages WHERE"
+                                " media_state<>'filtered' OR (include_vision=1 AND vision_text<>'')").fetchone()
         return int(row["t"]) if row and row["t"] else 0
 
     def window_end_by_kind(self, kind: str) -> int:
@@ -541,13 +660,35 @@ class Store:
         return self.window_end_by_kind("hotspot")
 
     def messages_between_all(self, start: int, end: int, limit: int = -1) -> list:
-        """窗口内全部未过滤消息，按时间升序；默认不限制条数，避免摘要漏掉尾部。"""
-        return list(
-            self.conn.execute(
-                "SELECT * FROM messages WHERE ts>? AND ts<=? AND media_state<>'filtered' ORDER BY ts ASC,id ASC LIMIT ?",
-                (start, end, limit),
-            )
+        """窗口内消息按时间升序；逐张图片选择已勾选的语义或 OCR。"""
+        rows = self.conn.execute(
+            "SELECT * FROM messages WHERE ts>? AND ts<=?"
+            " AND (media_state<>'filtered' OR (include_vision=1 AND vision_text<>''))"
+            " ORDER BY ts ASC,id ASC LIMIT ?", (start, end, limit),
         )
+        result = []
+        for row in rows:
+            item = dict(row)
+            if item["has_media"]:
+                images = list(self.conn.execute(
+                    "SELECT ocr_text,vision_text,include_vision FROM message_images"
+                    " WHERE message_row=? ORDER BY image_index", (item["id"],)))
+            else:
+                images = []
+            if images:
+                parts = []
+                for image in images:
+                    if item["include_vision"] and image["include_vision"]:
+                        part = image["vision_text"] or (image["ocr_text"] if item["media_state"] != "filtered" else "")
+                        if part:
+                            parts.append(part)
+                item["summary_picture"] = "\n".join(parts)
+            else:
+                item["summary_picture"] = ((item["vision_text"] or
+                                            (item["ocr_text"] if item["media_state"] != "filtered" else ""))
+                                           if item["include_vision"] else "")
+            result.append(item)
+        return result
 
     # ---------- summaries ----------
 
@@ -773,18 +914,25 @@ class Store:
     def prune(self, keep_days_raw: int, keep_days_media: int) -> dict:
         now = int(time.time())
         raw_cut = now - keep_days_raw * 86400
-        c1 = self.conn.execute("DELETE FROM messages WHERE ts < ? AND media_state<>'pending'", (raw_cut,))
         media_cut = now - keep_days_media * 86400
-        rows = list(
-            self.conn.execute(
-                "SELECT id, media_path FROM messages WHERE ts < ? AND media_path<>''", (media_cut,)
-            )
-        )
-        for r in rows:
-            Path(r["media_path"]).unlink(missing_ok=True)
-            self.conn.execute("UPDATE messages SET media_path='' WHERE id=?", (r["id"],))
+        paths = {r[0] for r in self.conn.execute(
+            "SELECT media_path FROM messages WHERE media_path<>'' AND ts<?", (max(raw_cut, media_cut),))}
+        paths.update(r[0] for r in self.conn.execute(
+            "SELECT i.media_path FROM message_images i JOIN messages m ON m.id=i.message_row"
+            " WHERE i.media_path<>'' AND m.ts<?", (max(raw_cut, media_cut),)))
+        c1 = self.conn.execute("DELETE FROM messages WHERE ts < ? AND media_state<>'pending'", (raw_cut,))
+        self.conn.execute("DELETE FROM message_images WHERE NOT EXISTS"
+                          " (SELECT 1 FROM messages WHERE messages.id=message_images.message_row)")
+        self.conn.execute("UPDATE messages SET media_path='' WHERE ts<?", (media_cut,))
+        self.conn.execute("UPDATE message_images SET media_path='' WHERE message_row IN"
+                          " (SELECT id FROM messages WHERE ts<?)", (media_cut,))
+        retained = {r[0] for r in self.conn.execute("SELECT media_path FROM messages WHERE media_path<>''")}
+        retained.update(r[0] for r in self.conn.execute(
+            "SELECT media_path FROM message_images WHERE media_path<>''"))
+        for path in paths - retained:
+            Path(path).unlink(missing_ok=True)
         self.conn.commit()
-        return {"messages_deleted": c1.rowcount, "media_files_deleted": len(rows)}
+        return {"messages_deleted": c1.rowcount, "media_files_deleted": len(paths - retained)}
 
     def stats(self) -> dict:
         q = lambda sql, *a: self.conn.execute(sql, a).fetchone()[0]  # noqa: E731

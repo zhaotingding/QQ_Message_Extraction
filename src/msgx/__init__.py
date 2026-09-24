@@ -4,5 +4,5 @@
 发版时只需改这一处，再更新 CHANGELOG.md 并打对应标签。
 """
 
-__version__ = "0.7.2"
-DISPLAY_VERSION = "0.7.2"
+__version__ = "0.7.3"
+DISPLAY_VERSION = "0.7.3"

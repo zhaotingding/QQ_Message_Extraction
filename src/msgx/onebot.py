@@ -201,6 +201,37 @@ async def _messages_recent(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "items": [dict(r) for r in rows]})
 
 
+def _local_edit_allowed(request: web.Request) -> bool:
+    return request.content_type == "application/json" and not request.headers.get("Origin")
+
+
+async def _message_vision(request: web.Request) -> web.Response:
+    if not _local_edit_allowed(request):
+        return web.json_response({"ok": False, "error": "仅接受本地程序的 JSON 请求"}, status=403)
+    try:
+        result = await request.app["pipe"].media.manual_vision(int(request.match_info["image_id"]))
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    except RuntimeError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=502)
+    return web.json_response({"ok": True, **result})
+
+
+async def _message_summary_include(request: web.Request) -> web.Response:
+    if not _local_edit_allowed(request):
+        return web.json_response({"ok": False, "error": "仅接受本地程序的 JSON 请求"}, status=403)
+    try:
+        include = (await request.json())["include"]
+    except (ValueError, KeyError, TypeError):
+        include = None
+    if not isinstance(include, bool):
+        return web.json_response({"ok": False, "error": "include 必须是布尔值"}, status=400)
+    changed = request.app["pipe"].store.set_image_include(int(request.match_info["image_id"]), include)
+    if not changed:
+        return web.json_response({"ok": False, "error": "找不到可设置的图片消息"}, status=404)
+    return web.json_response({"ok": True, "include": include})
+
+
 async def _billing(request: web.Request) -> web.Response:
     """真实账单：官方余额 + 平台逐日消费（有 token 时）。"""
     pipe = request.app["pipe"]
@@ -246,6 +277,8 @@ def build_app(cfg: dict, pipeline) -> web.Application:
     app.router.add_post("/inject", _inject)
     app.router.add_get("/alerts", _alerts)
     app.router.add_get("/messages/recent", _messages_recent)
+    app.router.add_post(r"/images/{image_id:\d+}/vision", _message_vision)
+    app.router.add_post(r"/images/{image_id:\d+}/summary-include", _message_summary_include)
     app.router.add_get("/billing", _billing)
     app.router.add_get("/usage/details", _usage_details)
     app.router.add_get(r"/usage/calls/{call_id:\d+}", _usage_sources)

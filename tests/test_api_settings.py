@@ -155,7 +155,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(KEY, str(raised.exception))
         self.assertNotIn("base64", str(raised.exception))
 
-    async def test_rejected_image_is_not_requeued_and_preserves_ocr(self):
+    async def test_rejected_manual_image_preserves_ocr_without_auto_retry(self):
         from PIL import Image
         from msgx.media import MediaWorker
         from msgx.models import Msg
@@ -166,38 +166,33 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         session = Mock()
         session.post.return_value = Response({"error": {"code": "unsupported_parameter", "param": "max_tokens"}}, 400)
         try:
-            for retry in (False, True):
-                row_id = self.store.insert_message(Msg(msg_id=str(retry), group_id="g", text="请看报错[图片]",
-                                                       image_urls=[image.as_uri()], msg_type="mixed"))
-                if retry:
-                    self.store.set_media_result(row_id, media_path=str(image), ocr_text="本地文字",
-                                                state="done", vision_state="failed")
-                with patch.object(self.llm, "snapshot", return_value=self.llm), \
-                        patch.object(self.llm, "session", AsyncMock(return_value=session)), \
-                        patch.object(worker, "_download", AsyncMock(return_value=image)), \
-                        patch.object(worker, "_ocr_sync", return_value="本地文字"):
-                    if retry:
-                        await worker.retry_vision()
-                    else:
-                        await worker._process_row(self.store.get_message(row_id))
-                    for _ in range(3):
-                        await worker.retry_vision()
-                row = self.store.get_message(row_id)
-                self.assertEqual(row["vision_state"], "rejected")
-                self.assertEqual(row["media_state"], "done")
-                self.assertEqual(row["ocr_text"], "本地文字")
-                self.assertEqual(row["vision_tries"], 1)
-            self.assertEqual(session.post.call_count, 2)
+            row_id = self.store.insert_message(Msg(msg_id="first", group_id="g", text="请看报错[图片]",
+                                                   image_urls=[image.as_uri()], msg_type="mixed"))
+            image_id = self.store.conn.execute("SELECT id FROM message_images WHERE message_row=?", (row_id,)).fetchone()[0]
+            with patch.object(self.llm, "snapshot", return_value=self.llm), \
+                    patch.object(self.llm, "session", AsyncMock(return_value=session)), \
+                    patch.object(worker, "_download", AsyncMock(return_value=image)), \
+                    patch.object(worker, "_ocr_sync", return_value="本地文字"):
+                await worker.process_pending()
+                self.assertEqual(session.post.call_count, 0)
+                result = await worker.manual_vision(image_id)
+                self.assertEqual(result["state"], "rejected")
+                await worker.process_pending()
+            row = self.store.get_message(row_id)
+            self.assertEqual(row["vision_state"], "rejected")
+            self.assertEqual(row["media_state"], "done")
+            self.assertEqual(row["ocr_text"], "本地文字")
+            self.assertEqual(self.store.get_image(image_id)["vision_state"], "rejected")
+            self.assertEqual(session.post.call_count, 1)
             self.assertEqual(self.store.failed_vision(), [])
             duplicate = self.store.insert_message(Msg(msg_id="duplicate", group_id="g", text="相同报错[图片]",
                                                       image_urls=[image.as_uri()], msg_type="mixed"))
             with patch.object(worker, "_download", AsyncMock(return_value=image)), \
-                    patch.object(self.llm, "snapshot", return_value=self.llm), \
-                    patch.object(self.llm, "session", AsyncMock(return_value=session)):
-                await worker._process_row(self.store.get_message(duplicate))
-                await worker.retry_vision()
-            self.assertEqual(self.store.get_message(duplicate)["vision_state"], "rejected")
-            self.assertEqual(session.post.call_count, 2)
+                    patch.object(worker, "_ocr_sync", return_value="本地文字"):
+                await worker.process_pending()
+            self.assertEqual(self.store.get_message(duplicate)["vision_state"], "skipped")
+            self.assertEqual(self.store.get_message(duplicate)["ocr_text"], "本地文字")
+            self.assertEqual(session.post.call_count, 1)
         finally:
             await worker.close()
 

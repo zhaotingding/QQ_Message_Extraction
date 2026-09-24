@@ -22,7 +22,7 @@ log = logging.getLogger("msgx.pipeline")
 
 
 class Pipeline:
-    """消息总线：接入 → 入库 → 带配文图片解析，摘要仅由用户手动生成。"""
+    """消息总线：接入 → 入库 → 本地 OCR；图片语义和摘要由用户手动发起。"""
 
     def __init__(self, cfg: dict | None = None):
         self.cfg = cfg or load()
@@ -115,15 +115,6 @@ class Pipeline:
         n = self.store.requeue_failed_media()
         if n:
             log.info("已把 %d 张上次下载失败的图片重新排入处理队列", n)
-        # v0.5.0 同类问题：图片语义提取曾把「失败」写成「完成」，导致 62 张图
-        # 永久不再重试。现在有独立的 vision_state 能区分了，那些老行会被
-        # `media.retry_vision()` 在空闲轮里自动捡回来（图片还在本地，只是重发一次推理）。
-        # 注意：不要在这里把 vision_state 清空 —— 清空后既不在 pending_media 里、
-        # 也不在 failed_vision 里，会变成谁也看不见的孤儿行。
-        n2 = self.store.stats().get("vision_retry", 0)
-        if n2:
-            log.info("有 %d 张图片的语义提取待补跑（失败过，但次数没用满）", n2)
-
     # ---------- OneBot API（反向 WS 通道） ----------
 
     def resolve_action(self, resp: dict) -> None:
@@ -351,13 +342,12 @@ class Pipeline:
             self.counters["skipped"] += 1
             return {"ok": False, "reason": f"群 {msg.group_id} 不在监听列表"}
 
-        # 界面配置的消息类型过滤。在处理前拦截，省下图片存储与模型成本。
+        # 过滤的图片仍下载并本地 OCR，供用户在实时页查看和手动选择语义解析。
         # 默认全部关闭，因此默认行为与不启用过滤时完全一致。
         reason = skip_reason(msg, self.cfg.get("filters") or {})
         if reason:
             self.counters["filtered"] += 1
-            # v0.5.7：图片/表情过滤后仍留一行状态，让实时页能说明为何没有识别结果。
-            # 只存简要记录，既不进媒体队列，也不参与打分或摘要。
+            # 过滤记录默认不进入摘要；保留可下载图片，OCR 不调用模型。
             if reason in ("纯表情", "纯图片"):
                 row_id = self.store.insert_message(msg, self.group_name(msg.group_id), self_id if self_id.isdigit() and self_id != "0" else "",
                                                    filtered=True)
@@ -376,7 +366,7 @@ class Pipeline:
         self.counters["stored"] += 1
 
         if msg.image_urls:
-            # 交给媒体循环处理；只有消息带配文时才允许解析图片。
+            # 媒体循环只下载并执行本地 OCR。
             return {"ok": True, "row_id": row_id, "queued_media": True}
 
         return {"ok": True, "row_id": row_id}
@@ -384,17 +374,12 @@ class Pipeline:
     # ---------- background loops ----------
 
     async def _media_loop(self) -> None:
-        """轮询图片队列；允许解析的失败图片按既有次数上限补跑。"""
-        idle_rounds = 0
+        """轮询图片下载与本地 OCR 队列。"""
         while not self._stop.is_set():
             try:
                 done = await self.media.process_pending(20)
                 if done:
-                    idle_rounds = 0
                     continue
-                idle_rounds += 1
-                if idle_rounds % 20 == 0:
-                    await self.media.retry_vision(4)
                 await asyncio.sleep(3)
             except asyncio.CancelledError:
                 raise
