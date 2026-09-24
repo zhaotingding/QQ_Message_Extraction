@@ -140,6 +140,8 @@ with tempfile.TemporaryDirectory() as directory:
     store.set_media_result(parent, ocr_text="旧 OCR", vision_text="旧语义", media_path="saved.png",
                            state="done", vision_state="ok")
     store.conn.execute("DELETE FROM message_images")
+    store.conn.execute("UPDATE messages SET include_vision=1 WHERE id=?", (parent,))
+    store.conn.execute("PRAGMA user_version=703")
     store.conn.commit()
     store.close()
     store = Store(db)
@@ -148,6 +150,13 @@ with tempfile.TemporaryDirectory() as directory:
     check("旧版第一张结果保留、其余图片独立待 OCR", len(migrated) == 2
           and migrated[0]["ocr_text"] == "旧 OCR" and migrated[0]["vision_text"] == "旧语义"
           and migrated[0]["media_state"] == "done" and migrated[1]["media_state"] == "pending")
+    check("升级时现有图片统一取消纳入、解析内容不删除", not store.get_message(parent)["include_vision"]
+          and all(not image["include_vision"] for image in migrated)
+          and store.get_message(parent)["vision_text"] == "旧语义")
+    store.set_image_include(migrated[0]["id"], True)
+    store.close()
+    store = Store(db)
+    check("迁移只执行一次，重新打开后保留手动勾选", store.get_image(migrated[0]["id"])["include_vision"] == 1)
     store.close()
 
 print("\n=== 图片先 OCR、手动模型识别 ===")
@@ -186,19 +195,27 @@ async def manual_image_tests():
         worker._download = download
         worker._ocr_sync = lambda path: "本地 OCR 文字"
         def insert(mid, text, filtered=False):
-            return store.insert_message(Msg(msg_id=mid, group_id="g", text=text,
+            return store.insert_message(Msg(msg_id=mid, group_id="g", text=text, ts=int(time.time()),
                                             image_urls=[image.as_uri()], msg_type="mixed"), filtered=filtered)
         def child(message_row):
             return store.conn.execute("SELECT * FROM message_images WHERE message_row=?", (message_row,)).fetchone()
 
         row_id = insert("filtered", "[图片]", filtered=True)
         check("过滤图片也进入 OCR 队列", [r["message_row"] for r in store.pending_images()] == [row_id])
+        check("新图片父子默认均不纳入摘要", not store.get_message(row_id)["include_vision"]
+              and not child(row_id)["include_vision"])
         await worker.process_pending()
         row = store.get_message(row_id)
         check("过滤图片保留文件和 OCR、默认无模型调用",
               row["media_state"] == "filtered" and row["media_path"] == str(image)
-              and row["ocr_text"] == "本地 OCR 文字" and row["vision_state"] == "skipped"
+              and child(row_id)["ocr_text"] == "本地 OCR 文字" and row["vision_state"] == "skipped"
               and not llm.calls and not store.pending_images())
+        store.set_image_include(child(row_id)["id"], True)
+        included = store.messages_between_all(0, int(time.time()) + 1)
+        check("过滤图片只勾选 OCR 就可进入摘要材料，不触发图片 API",
+              any(r["id"] == row_id and r["summary_picture"] == "本地 OCR 文字" for r in included)
+              and not llm.calls)
+        store.set_image_include(child(row_id)["id"], False)
 
         task = asyncio.create_task(worker.manual_vision(child(row_id)["id"]))
         await llm.ready.wait()
@@ -208,15 +225,16 @@ async def manual_image_tests():
         check("同图并发手动操作只提交一次模型请求", concurrent["state"] == "running"
               and result["state"] == "ok" and len(llm.calls) == 1)
         check("图片理解关联原消息", llm.calls[0][2] == {"source_ids": [row_id], "purpose": "图片理解"})
-        check("成功结果保留过滤状态与 OCR", store.get_message(row_id)["media_state"] == "filtered"
-              and store.get_message(row_id)["ocr_text"] == "本地 OCR 文字")
+        check("手动识别不自动纳入摘要，OCR 和语义仍可查看", store.get_message(row_id)["media_state"] == "filtered"
+              and child(row_id)["ocr_text"] == "本地 OCR 文字" and child(row_id)["vision_text"]
+              and not store.get_message(row_id)["include_vision"])
         cached = await worker.manual_vision(child(row_id)["id"])
         check("已识别图片再次点击不重复收费", cached.get("cached") and len(llm.calls) == 1)
 
         duplicate = insert("duplicate", "另一条[图片]")
         await worker.process_pending()
-        check("相同图片复用 OCR 但不自动复用语义", store.get_message(duplicate)["ocr_text"] == "本地 OCR 文字"
-              and not store.get_message(duplicate)["vision_text"] and len(llm.calls) == 1)
+        check("相同图片复用 OCR 但不自动复用语义", child(duplicate)["ocr_text"] == "本地 OCR 文字"
+              and not child(duplicate)["vision_text"] and len(llm.calls) == 1)
         old = store.insert_message(Msg(msg_id="old", group_id="g", text="[图片]",
                                        image_urls=[image.as_uri()]), filtered=True)
         store.conn.execute("DELETE FROM message_images WHERE message_row=?", (old,))
@@ -225,6 +243,7 @@ async def manual_image_tests():
         check("旧版未保存链接的过滤图片不冒充可恢复", old not in [r["message_row"] for r in store.pending_images()])
 
         multi = store.insert_message(Msg(msg_id="multi", group_id="g", text="两张图[图片][图片]",
+                                         ts=int(time.time()) + 1,
                                          image_urls=[image.as_uri(), image.as_uri()], msg_type="mixed"))
         check("一条消息两张图分别建立可操作记录",
               len(store.conn.execute("SELECT id FROM message_images WHERE message_row=?", (multi,)).fetchall()) == 2)
@@ -244,13 +263,24 @@ async def manual_image_tests():
         children = store.conn.execute("SELECT id FROM message_images WHERE message_row=? ORDER BY image_index",
                                       (multi,)).fetchall()
         second = children[1]["id"]
+        store.insert_message(Msg(msg_id="new-text", group_id="g", text="较新的文字消息",
+                                 ts=int(time.time()) + 2))
         try:
             async with ClientSession() as session:
                 root = f"http://127.0.0.1:{port}"
+                async with session.get(f"{root}/messages/recent?limit=2&images=1") as response:
+                    items = (await response.json())["items"]
+                check("仅看图片在服务端筛选后再取显示条数", response.status == 200
+                      and len(items) == 2 and all(item["images"] for item in items)
+                      and items[0]["id"] == multi)
                 async with session.post(f"{root}/images/{second}/vision", json={}) as response:
                     result = await response.json()
                 check("本地接口只识别指定的第二张图", response.status == 200 and result["state"] == "ok"
                       and len(llm.calls) == 2 and store.get_image(children[0]["id"])["vision_text"] == "")
+                async with session.post(f"{root}/images/{second}/summary-include", json={"include": True}) as response:
+                    result = await response.json()
+                check("识别后可独立选择纳入摘要", response.status == 200 and result["include"]
+                      and store.get_message(multi)["vision_text"])
                 async with session.post(f"{root}/images/{second}/summary-include", json={"include": False}) as response:
                     result = await response.json()
                 check("接口可独立排除已识别语义", response.status == 200 and not result["include"]

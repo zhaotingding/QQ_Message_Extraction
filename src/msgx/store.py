@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS message_images (
   vision_text TEXT NOT NULL DEFAULT '',
   media_state TEXT NOT NULL DEFAULT 'pending',
   vision_state TEXT NOT NULL DEFAULT 'skipped',
-  include_vision INTEGER NOT NULL DEFAULT 1,
+  include_vision INTEGER NOT NULL DEFAULT 0,
   UNIQUE(message_row, image_index)
 );
 CREATE INDEX IF NOT EXISTS idx_image_pending ON message_images(media_state, id);
@@ -143,7 +143,7 @@ MESSAGE_MIGRATIONS = (
     ("received_by", "TEXT NOT NULL DEFAULT ''"),
     ("vision_state", "TEXT DEFAULT ''"),
     ("vision_tries", "INTEGER DEFAULT 0"),
-    ("include_vision", "INTEGER NOT NULL DEFAULT 1"),
+    ("include_vision", "INTEGER NOT NULL DEFAULT 0"),
     ("at_all", "INTEGER DEFAULT 0"),  # v0.5.7：独立记录，不能依赖可能截断的 raw JSON
 )
 
@@ -224,6 +224,10 @@ class Store:
                      (row["vision_state"] or "skipped") if first else "skipped",
                      row["include_vision"]),
                 )
+        if self.conn.execute("PRAGMA user_version").fetchone()[0] < 704:
+            self.conn.execute("UPDATE message_images SET include_vision=0")
+            self.conn.execute("UPDATE messages SET include_vision=0 WHERE has_media=1")
+            self.conn.execute("PRAGMA user_version=704")
 
     def close(self) -> None:
         self.conn.close()
@@ -404,8 +408,8 @@ class Store:
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO messages"
             "(group_id, msg_id, sender_id, sender_name, ts, msg_type, text,"
-            " has_media, image_urls, media_state, at_me, at_all, reply_to, raw, received_by)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " has_media, image_urls, media_state, at_me, at_all, reply_to, raw, received_by, include_vision)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 m.group_id,
                 m.msg_id,
@@ -422,6 +426,7 @@ class Store:
                 m.reply_to,
                 "" if filtered else json.dumps(m.raw, ensure_ascii=False)[:20000],
                 bot_uin,
+                0,
             ),
         )
         if cur.rowcount == 0:
@@ -429,7 +434,7 @@ class Store:
         self.conn.execute("INSERT INTO message_receipts VALUES(?,?,?,?)",
                           (bot_uin, m.group_id, m.msg_id, cur.lastrowid))
         for index, url in enumerate(m.image_urls):
-            self.conn.execute("INSERT INTO message_images(message_row,image_index,image_url) VALUES(?,?,?)",
+            self.conn.execute("INSERT INTO message_images(message_row,image_index,image_url,include_vision) VALUES(?,?,?,0)",
                               (cur.lastrowid, index, str(url)))
         # 无条件注册群：群名可能暂时为空（待配置补全），但群必须出现在 groups 表里，
         # 否则摘要调度遍历 group_names() 时看不到这个群。upsert_group 内部已保护空名不覆盖已有名字。
@@ -530,8 +535,9 @@ class Store:
             "failed" if any(r["media_state"] == "failed" for r in images) else "done"
         )
         self.conn.execute("UPDATE messages SET ocr_text=?,vision_text=?,media_path=?,media_hash=?,"
-                          "vision_state=?,media_state=? WHERE id=?",
-                          (ocr, vision, first["media_path"], first["media_hash"], first["vision_state"], state, message_row))
+                          "vision_state=?,media_state=?,include_vision=? WHERE id=?",
+                          (ocr, vision, first["media_path"], first["media_hash"], first["vision_state"],
+                           state, int(any(r["include_vision"] for r in images)), message_row))
         self.conn.commit()
 
     def find_by_hash(self, media_hash: str) -> sqlite3.Row | None:
@@ -592,7 +598,7 @@ class Store:
 
     # ---------- 给界面「实时消息」页 ----------
 
-    def recent_messages(self, limit: int = 60) -> list:
+    def recent_messages(self, limit: int = 60, images_only: bool = False) -> list:
         """最近入库的消息（倒序）。带群名与图片处理状态，供界面直接展示。"""
         rows = list(
             self.conn.execute(
@@ -603,8 +609,9 @@ class Store:
                 " WHERE message_row=m.id AND account<>'') AS receiver_accounts,"
                 " COALESCE(g.name, '') AS group_name"
                 " FROM messages m LEFT JOIN groups g ON g.id = m.group_id"
+                " WHERE (?=0 OR EXISTS (SELECT 1 FROM message_images i WHERE i.message_row=m.id))"
                 " ORDER BY m.ts DESC, m.id DESC LIMIT ?",
-                (limit,),
+                (int(images_only), limit),
             )
         )
         result = []
@@ -619,7 +626,7 @@ class Store:
         return list(
             self.conn.execute(
                 "SELECT * FROM messages WHERE group_id=? AND ts>? AND ts<=?"
-                " AND (media_state<>'filtered' OR (include_vision=1 AND vision_text<>'')) ORDER BY ts ASC",
+                " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>''))) ORDER BY ts ASC",
                 (group_id, start, end),
             )
         )
@@ -633,7 +640,7 @@ class Store:
     def first_ts(self, group_id: str) -> int:
         row = self.conn.execute(
             "SELECT MIN(ts) AS t FROM messages WHERE group_id=?"
-            " AND (media_state<>'filtered' OR (include_vision=1 AND vision_text<>''))", (group_id,)
+            " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>'')))", (group_id,)
         ).fetchone()
         return int(row["t"]) if row and row["t"] else 0
 
@@ -641,7 +648,7 @@ class Store:
 
     def first_ts_all(self) -> int:
         row = self.conn.execute("SELECT MIN(ts) AS t FROM messages WHERE"
-                                " media_state<>'filtered' OR (include_vision=1 AND vision_text<>'')").fetchone()
+                                " media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>''))").fetchone()
         return int(row["t"]) if row and row["t"] else 0
 
     def window_end_by_kind(self, kind: str) -> int:
@@ -663,7 +670,7 @@ class Store:
         """窗口内消息按时间升序；逐张图片选择已勾选的语义或 OCR。"""
         rows = self.conn.execute(
             "SELECT * FROM messages WHERE ts>? AND ts<=?"
-            " AND (media_state<>'filtered' OR (include_vision=1 AND vision_text<>''))"
+            " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>'')))"
             " ORDER BY ts ASC,id ASC LIMIT ?", (start, end, limit),
         )
         result = []
@@ -679,13 +686,12 @@ class Store:
                 parts = []
                 for image in images:
                     if item["include_vision"] and image["include_vision"]:
-                        part = image["vision_text"] or (image["ocr_text"] if item["media_state"] != "filtered" else "")
+                        part = image["vision_text"] or image["ocr_text"]
                         if part:
                             parts.append(part)
                 item["summary_picture"] = "\n".join(parts)
             else:
-                item["summary_picture"] = ((item["vision_text"] or
-                                            (item["ocr_text"] if item["media_state"] != "filtered" else ""))
+                item["summary_picture"] = ((item["vision_text"] or item["ocr_text"])
                                            if item["include_vision"] else "")
             result.append(item)
         return result

@@ -92,7 +92,7 @@ def _rows_to_text_multi(rows: list) -> str:
     for r in rows:
         body = re.sub(r"\[(?:图片|表情|表情包|语音|视频|合并转发)\]", "", r["text"] or "").strip()
         picture = ((r["summary_picture"] if "summary_picture" in r.keys() else
-                   (r["vision_text"] or (r["ocr_text"] if r["media_state"] != "filtered" else ""))) or "").strip()
+                   ((r["vision_text"] or r["ocr_text"]) if r["include_vision"] else "")) or "").strip()
         lines.append("\n".join(part for part in (body, picture) if part))
     return "\n\n".join(lines)
 

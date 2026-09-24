@@ -116,6 +116,16 @@ check("有实时消息标签页", any(str(nb.tab(i, "text")) == "实时消息" f
 check("实时消息表格列齐全",
       list(app.rt["columns"]) == ["time", "group", "who", "text", "state", "image", "ocr", "vision", "recognize", "include", "account"],
       str(list(app.rt["columns"])))
+check("内容筛选默认显示全部消息", app.v_rt_filter.get() == "全部消息")
+old_proc = app.proc
+app.proc = object()
+app.v_rt_filter.set("仅看图片")
+with patch("msgx.gui.threading.Thread") as thread:
+    app.refresh_messages()
+    check("仅看图片筛选发送到服务端查询", thread.call_args.kwargs["args"] == (80, True))
+app._rt_busy = False
+app.proc = old_proc
+app.v_rt_filter.set("全部消息")
 app._render_messages(None)
 check("拉取失败时给出说明", "失败" in app.v_rt_status.get(), app.v_rt_status.get())
 app._render_messages([

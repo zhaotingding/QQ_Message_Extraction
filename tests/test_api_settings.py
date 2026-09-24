@@ -181,7 +181,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             row = self.store.get_message(row_id)
             self.assertEqual(row["vision_state"], "rejected")
             self.assertEqual(row["media_state"], "done")
-            self.assertEqual(row["ocr_text"], "本地文字")
+            self.assertEqual(self.store.get_image(image_id)["ocr_text"], "本地文字")
             self.assertEqual(self.store.get_image(image_id)["vision_state"], "rejected")
             self.assertEqual(session.post.call_count, 1)
             self.assertEqual(self.store.failed_vision(), [])
@@ -191,7 +191,9 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(worker, "_ocr_sync", return_value="本地文字"):
                 await worker.process_pending()
             self.assertEqual(self.store.get_message(duplicate)["vision_state"], "skipped")
-            self.assertEqual(self.store.get_message(duplicate)["ocr_text"], "本地文字")
+            duplicate_image = self.store.conn.execute(
+                "SELECT id FROM message_images WHERE message_row=?", (duplicate,)).fetchone()[0]
+            self.assertEqual(self.store.get_image(duplicate_image)["ocr_text"], "本地文字")
             self.assertEqual(session.post.call_count, 1)
         finally:
             await worker.close()

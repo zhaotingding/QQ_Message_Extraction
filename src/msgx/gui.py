@@ -414,6 +414,12 @@ class App:
         self.v_rt_limit = tk.StringVar(value="80")
         ttk.Label(bar, text="显示条数").pack(side="left", padx=(16, 4))
         ttk.Entry(bar, textvariable=self.v_rt_limit, width=6).pack(side="left")
+        self.v_rt_filter = tk.StringVar(value="全部消息")
+        ttk.Label(bar, text="内容筛选").pack(side="left", padx=(16, 4))
+        image_filter = ttk.Combobox(bar, textvariable=self.v_rt_filter, state="readonly", width=10,
+                                    values=("全部消息", "仅看图片"))
+        image_filter.pack(side="left")
+        image_filter.bind("<<ComboboxSelected>>", lambda _event: self.refresh_messages())
         self.v_rt_status = tk.StringVar(value="尚未加载")
         ttk.Label(bar, textvariable=self.v_rt_status, style="Hint.TLabel").pack(side="right")
 
@@ -450,7 +456,8 @@ class App:
         self.rt.tag_configure("failed", foreground="#a15c00")
 
         ttk.Label(tab, text="点击「打开」查看原图；点「□ 识别」才调用图片 API。"
-                         "「纳入摘要」只控制已识别语义是否参与摘要。", style="Hint.TLabel").pack(anchor="w", pady=(8, 0))
+                         "默认只做 OCR；勾选「纳入摘要」即可使用 OCR，无需先做图片识别。",
+                  style="Hint.TLabel").pack(anchor="w", pady=(8, 0))
         self.rt_detail = ScrolledText(tab, height=6, wrap="word", font=(FONT, 9))
         self.rt_detail.pack(fill="x", pady=(5, 0))
         self.rt_detail.configure(state="disabled")
@@ -1368,7 +1375,8 @@ class App:
             return
         self._rt_busy = True
         self._rt_limit = self._read_rt_limit()
-        threading.Thread(target=self._fetch_messages, args=(self._rt_limit,), daemon=True).start()
+        threading.Thread(target=self._fetch_messages,
+                         args=(self._rt_limit, self.v_rt_filter.get() == "仅看图片"), daemon=True).start()
 
     def _read_rt_limit(self) -> int:
         """在主线程里读控件（Tkinter 变量不能在子线程碰）。"""
@@ -1377,12 +1385,12 @@ class App:
         except ValueError:
             return 80
 
-    def _fetch_messages(self, limit: int) -> None:
+    def _fetch_messages(self, limit: int, images_only: bool = False) -> None:
         port = int(self.cfg["onebot"]["http_port"])
         rows = None
         try:
             op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with op.open(f"http://127.0.0.1:{port}/messages/recent?limit={limit}", timeout=5) as r:
+            with op.open(f"http://127.0.0.1:{port}/messages/recent?limit={limit}&images={int(images_only)}", timeout=5) as r:
                 rows = json.loads(r.read().decode("utf-8")).get("items")
         except Exception:  # noqa: BLE001
             rows = None
@@ -1930,7 +1938,8 @@ class App:
         if visible and self.v_rt_auto.get() and self.proc is not None and not self._rt_busy:
             self._rt_busy = True
             self._rt_limit = self._read_rt_limit()
-            threading.Thread(target=self._fetch_messages, args=(self._rt_limit,), daemon=True).start()
+            threading.Thread(target=self._fetch_messages,
+                             args=(self._rt_limit, self.v_rt_filter.get() == "仅看图片"), daemon=True).start()
         self.root.after(3000, self._tick_realtime)
 
     def _fetch_health(self) -> None:

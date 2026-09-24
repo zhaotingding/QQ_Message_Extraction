@@ -112,8 +112,9 @@ async def main():
         sm = make(llm, tmp)
         ids = insert(sm, 1)
         ocr, vision = "图中文字" * 200 + "OCR尾部", "图片解释" * 200 + "图片解析尾部"
-        sm.store.conn.execute("UPDATE messages SET ocr_text=?,vision_text=? WHERE id=?", (ocr, vision, ids[0]))
+        sm.store.conn.execute("UPDATE messages SET has_media=1,ocr_text=?,vision_text=? WHERE id=?", (ocr, vision, ids[0]))
         sm.store.conn.commit()
+        sm.store.set_vision_include(ids[0], True)
         result = await sm.run_digest(full=True, prompt="使用自定义格式")
         check("完整复用图片理解文字，不再同时发送OCR",
               ocr not in llm.calls[0][1] and vision in llm.calls[0][1])
@@ -147,6 +148,11 @@ async def main():
         await sm.run_digest(full=True)
         check("过滤图片勾选后仅把语义放进摘要", "手动语义" in llm.calls[-1][1]
               and "本地OCR" not in llm.calls[-1][1])
+        sm.store.conn.execute("UPDATE messages SET vision_text='' WHERE id=?", (row_id,))
+        sm.store.conn.commit()
+        await sm.run_digest(full=True)
+        check("过滤图片只勾选 OCR 也能纳入摘要", "本地OCR" in llm.calls[-1][1]
+              and "手动语义" not in llm.calls[-1][1])
         sm.store.close()
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -159,7 +165,11 @@ async def main():
                                        (row_id,)).fetchall()
         sm.store.set_image_result(images[0]["id"], media_state="done", ocr_text="第一张OCR", vision_text="第一张语义")
         sm.store.set_image_result(images[1]["id"], media_state="done", ocr_text="第二张OCR", vision_text="第二张语义")
-        sm.store.set_image_include(images[0]["id"], False)
+        await sm.run_digest(full=True)
+        check("新图片默认只送聊天正文", "第一张OCR" not in llm.calls[-1][1]
+              and "第二张OCR" not in llm.calls[-1][1]
+              and "第一张语义" not in llm.calls[-1][1] and "第二张语义" not in llm.calls[-1][1])
+        sm.store.set_image_include(images[1]["id"], True)
         await sm.run_digest(full=True)
         check("多图消息按单张纳入语义和 OCR", "第一张语义" not in llm.calls[-1][1]
               and "第一张OCR" not in llm.calls[-1][1] and "第二张语义" in llm.calls[-1][1])
