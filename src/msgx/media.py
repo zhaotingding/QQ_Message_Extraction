@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .llm import LLM
+from .llm import APIRequestRejected, LLM
 
 import asyncio
 import hashlib
@@ -269,7 +269,8 @@ class MediaWorker:
                 state="done",
                 # 复用同图的历史结果时，语义状态也要跟着复用，否则会被当成
                 # 「还没试过」而重复调用模型。
-                vision_state="ok" if (prev["vision_text"] or "").strip() else "failed",
+                vision_state=("ok" if (prev["vision_text"] or "").strip() else
+                              "rejected" if prev["vision_state"] == "rejected" else "failed"),
             )
             return
 
@@ -313,8 +314,11 @@ class MediaWorker:
         llm = self.llm.snapshot() if isinstance(self.llm, LLM) else self.llm
         if not llm.vision_available:
             return "", "skipped"
-        text, ok = await llm.describe_image(path, VISION_PROMPT, source_ids=[int(row["id"])],
-                                                 purpose="图片理解重试" if retry else "图片理解")
+        try:
+            text, ok = await llm.describe_image(path, VISION_PROMPT, source_ids=[int(row["id"])],
+                                             purpose="图片理解重试" if retry else "图片理解")
+        except APIRequestRejected:
+            return "", "rejected"
         return text, ("ok" if ok else "failed")
 
     async def retry_vision(self, limit: int = 8) -> list[int]:
@@ -349,7 +353,7 @@ class MediaWorker:
                 media_path=row["media_path"],
                 media_hash=row["media_hash"] or "",
                 state="done",
-                vision_state="ok" if state == "ok" else "failed",
+                vision_state=state,
             )
             if state == "ok":
                 done.append(int(row["id"]))

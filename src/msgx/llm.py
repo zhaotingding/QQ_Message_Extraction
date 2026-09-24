@@ -4,9 +4,11 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -17,6 +19,32 @@ log = logging.getLogger("msgx.llm")
 
 class BudgetExceeded(Exception):
     pass
+
+
+class APIRequestRejected(RuntimeError):
+    """服务端拒绝了请求；媒体后台也不能按临时网络故障自动重发。"""
+
+
+def _http_error(status: int, body: str, headers) -> str:
+    """只保留短诊断标识，不记录可能回显密钥、聊天或图片的 message/原始正文。"""
+    try:
+        data = json.loads(body)
+        error = data.get("error", {}) if isinstance(data, dict) else {}
+    except (ValueError, TypeError):
+        error = {}
+    if not isinstance(error, dict):
+        error = {}
+    fields = {name: error.get(name) for name in ("type", "code", "param")}
+    fields["request_id"] = headers.get("x-request-id")
+    safe = []
+    for name, value in fields.items():
+        if not isinstance(value, str):
+            continue
+        value = security.redact(value)
+        if re.fullmatch(r"[A-Za-z0-9_.\[\]-]{1,96}", value):
+            safe.append(f"{name}={value}")
+    detail = "；".join(safe) or "服务端未提供可安全显示的错误标识"
+    return f"HTTP {status}：API 请求未成功；{detail}（原始响应已隐藏）"
 
 
 class IncompleteResponse(RuntimeError):
@@ -229,9 +257,10 @@ class LLM:
         provider = self.cfg.get("api", {}).get("provider", "旧版 DeepSeek")
         try:
             data = await self._post(payload)
-        except Exception:
+        except Exception as exc:
+            status = f"请求被拒绝：{exc}；用量未知" if isinstance(exc, APIRequestRejected) else "请求失败，用量未知"
             self.store.record_api_call(ts=started, purpose=purpose, source_ids=source_ids or [],
-                                       model=payload["model"], usage=None, cost_cny=None, status="请求失败，用量未知", provider=provider)
+                                       model=payload["model"], usage=None, cost_cny=None, status=status, provider=provider)
             raise
         usage = data.get("usage")
         if usage and "prompt_cache_hit_tokens" not in usage:
@@ -405,6 +434,10 @@ class LLM:
             outgoing["reasoning_effort"] = effort
             if effort != "none":
                 outgoing.pop("temperature", None)
+        # 内部仍统一用 max_tokens；官方 Chat Completions 在线路层转换，
+        # 不把 OpenAI 参数强加给 DeepSeek 或其他兼容服务。
+        if not responses and urlsplit(base).hostname == "api.openai.com" and "max_tokens" in outgoing:
+            outgoing["max_completion_tokens"] = outgoing.pop("max_tokens")
         encoded = json.dumps(outgoing).encode("utf-8")
         paced = len(encoded) > 64 * 1024
         headers = {
@@ -453,7 +486,7 @@ class LLM:
                         except json.JSONDecodeError as e:
                             # 半截响应体：连接被掐断的另一种表现，同样值得重试
                             raise _Transient(f"响应不是完整 JSON: {e}") from e
-                    last = f"HTTP {r.status}：API 请求未成功（原始响应已隐藏）"
+                    last = _http_error(r.status, await r.text(), r.headers)
                     if r.status in RETRY_STATUS:
                         raise _Transient(last)
                     if r.status != 404:
@@ -467,7 +500,7 @@ class LLM:
             if responses and stage == "读取响应正文":
                 raise RuntimeError("API 流式结果超时，用量未知；未自动重发") from None
             raise _Transient(f"请求超时（阶段：{stage}）") from e
-        raise RuntimeError(last or "请求失败")
+        raise APIRequestRejected(last or "请求失败")
 
     def _responses_payload(self, payload: dict) -> dict:
         inputs = []
@@ -572,10 +605,8 @@ class LLM:
                              purpose: str = "图片理解") -> tuple[str, bool]:
         """让模型读图，返回 ``(文本, 是否成功)``。
 
-        失败**不抛异常**（图片语义是增强项，不该拖垮媒体流水线），但必须把失败
-        如实报给调用方 —— v0.4.x 的写法是失败也返回空串、调用方照样把这条记成
-        `done`，于是这张图永远不会再被处理。现在由调用方落 `vision_state`，
-        之后可以重跑。
+        临时失败返回 False；不可重试的 API 拒绝交给媒体层记录为 rejected，
+        防止后台重复提交。两种情况均保留本地 OCR，不影响后续消息接收。
         """
         if not self.vision_available:
             return "", False
@@ -616,4 +647,6 @@ class LLM:
             log.warning(
                 "图片语义提取失败（上传 %.0fKB）：%s", len(data) / 1024, e
             )
+            if isinstance(e, APIRequestRejected):
+                raise
             return "", False

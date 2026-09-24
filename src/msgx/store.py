@@ -119,6 +119,7 @@ USAGE_MIGRATIONS = (
 # 标成 media_state='done' → 这张图永远不会再被处理（实测丢掉 62 张）。
 # 有了独立状态才能「只重跑失败的语义提取」，不必重新下载和 OCR。
 #   '' = 未尝试或需重试 / 'ok' / 'failed' / 'skipped'（未启用或模型不支持图片）
+#   'rejected' = API 拒绝请求，不自动重试；保留图片和 OCR。
 #
 # vision_tries 是**补跑次数**：没有它，一张永远读不出来的图会被每一轮补跑
 # 反复送去推理，安静地烧钱。到上限就停在 'failed'，不再重试。
@@ -431,7 +432,7 @@ class Store:
 
     def find_by_hash(self, media_hash: str) -> sqlite3.Row | None:
         return self.conn.execute(
-            "SELECT ocr_text, vision_text, media_path FROM messages"
+            "SELECT ocr_text, vision_text, media_path, vision_state FROM messages"
             " WHERE media_hash=? AND media_state='done' LIMIT 1",
             (media_hash,),
         ).fetchone()

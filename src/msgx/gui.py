@@ -1340,6 +1340,8 @@ class App:
             return "下载失败"
         if v == "failed":
             return "图片未识别"
+        if v == "rejected":
+            return "请求被拒绝"
         if v == "skipped":
             return "仅 OCR" if row.get("ocr_text") else "已跳过"
         return "完成"

@@ -139,6 +139,7 @@ labels = {
     app._media_label({"media_state": "pending"}): "待处理",
     app._media_label({"media_state": "failed"}): "下载失败",
     app._media_label({"media_state": "done", "vision_state": "failed"}): "图片未识别",
+    app._media_label({"media_state": "done", "vision_state": "rejected"}): "请求被拒绝",
     app._media_label({"media_state": "done", "vision_state": "skipped", "ocr_text": "旧记录文字"}): "仅 OCR",
     app._media_label({"media_state": "done", "vision_state": "skipped"}): "已跳过",
     app._media_label({"media_state": "done", "vision_state": "ok"}): "完成",

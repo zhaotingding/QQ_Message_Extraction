@@ -115,6 +115,122 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(session.post.call_count, 1)
             self.assertFalse(session.post.call_args.kwargs["allow_redirects"])
 
+    async def test_chat_output_limit_matches_provider(self):
+        for profile in (api_settings.DEFAULTS, api_settings.catalog({}, {})[0]["deepseek"]):
+            cfg = api_settings.apply(self.cfg, {**profile, "protocol": "chat_completions"})
+            llm = LLM(cfg, self.store)
+            llm.configure(KEY)
+            session = Mock()
+            session.post.return_value = Response({"choices": [{"message": {"content": "完整"},
+                                                    "finish_reason": "stop"}]})
+            with patch.object(llm, "session", AsyncMock(return_value=session)):
+                await llm.chat("x", "y", max_tokens=2000, think=False)
+            body = json.loads(session.post.call_args.kwargs["data"])
+            expected = "max_completion_tokens" if profile is api_settings.DEFAULTS else "max_tokens"
+            self.assertEqual(body[expected], 2000)
+            self.assertNotIn("max_tokens" if expected == "max_completion_tokens" else "max_completion_tokens", body)
+
+    async def test_http_error_retains_only_safe_diagnostics(self):
+        response = Response({"error": {"type": "invalid_request_error", "code": "unsupported_parameter",
+                             "param": "max_tokens", "message": KEY + " private chat data:image/png;base64,AAAA"}}, 400)
+        response.headers["x-request-id"] = "req_test_123"
+        session = Mock()
+        session.post.return_value = response
+        with patch.object(self.llm, "session", AsyncMock(return_value=session)):
+            with self.assertRaises(RuntimeError) as raised:
+                await self.llm.chat("x", "y")
+        error = str(raised.exception)
+        for value in ("HTTP 400", "unsupported_parameter", "max_tokens", "req_test_123"):
+            self.assertIn(value, error)
+        for value in (KEY, "private chat", "base64"):
+            self.assertNotIn(value, error)
+        self.assertEqual(session.post.call_count, 1)
+        self.assertIn("unsupported_parameter", self.store.api_usage_details()["items"][0]["status"])
+        # 即使服务端把密钥放进结构化字段，也不能进入日志或账本。
+        response.data["error"].update(type=KEY, code="Bearer " + KEY, param="data:image/png;base64,AAAA")
+        response.headers["x-request-id"] = KEY
+        with patch.object(self.llm, "session", AsyncMock(return_value=session)):
+            with self.assertRaises(RuntimeError) as raised:
+                await self.llm.chat("x", "y")
+        self.assertNotIn(KEY, str(raised.exception))
+        self.assertNotIn("base64", str(raised.exception))
+
+    async def test_rejected_image_is_not_requeued_and_preserves_ocr(self):
+        from PIL import Image
+        from msgx.media import MediaWorker
+        from msgx.models import Msg
+        image = Path(self.tmp.name) / "image.png"
+        Image.new("RGB", (16, 16), "white").save(image)
+        self.cfg["app"]["media_dir"] = str(Path(self.tmp.name) / "media")
+        worker = MediaWorker(self.cfg, self.store, self.llm)
+        session = Mock()
+        session.post.return_value = Response({"error": {"code": "unsupported_parameter", "param": "max_tokens"}}, 400)
+        try:
+            for retry in (False, True):
+                row_id = self.store.insert_message(Msg(msg_id=str(retry), group_id="g", text="请看报错[图片]",
+                                                       image_urls=[image.as_uri()], msg_type="mixed"))
+                if retry:
+                    self.store.set_media_result(row_id, media_path=str(image), ocr_text="本地文字",
+                                                state="done", vision_state="failed")
+                with patch.object(self.llm, "snapshot", return_value=self.llm), \
+                        patch.object(self.llm, "session", AsyncMock(return_value=session)), \
+                        patch.object(worker, "_download", AsyncMock(return_value=image)), \
+                        patch.object(worker, "_ocr_sync", return_value="本地文字"):
+                    if retry:
+                        await worker.retry_vision()
+                    else:
+                        await worker._process_row(self.store.get_message(row_id))
+                    for _ in range(3):
+                        await worker.retry_vision()
+                row = self.store.get_message(row_id)
+                self.assertEqual(row["vision_state"], "rejected")
+                self.assertEqual(row["media_state"], "done")
+                self.assertEqual(row["ocr_text"], "本地文字")
+                self.assertEqual(row["vision_tries"], 1)
+            self.assertEqual(session.post.call_count, 2)
+            self.assertEqual(self.store.failed_vision(), [])
+            duplicate = self.store.insert_message(Msg(msg_id="duplicate", group_id="g", text="相同报错[图片]",
+                                                      image_urls=[image.as_uri()], msg_type="mixed"))
+            with patch.object(worker, "_download", AsyncMock(return_value=image)), \
+                    patch.object(self.llm, "snapshot", return_value=self.llm), \
+                    patch.object(self.llm, "session", AsyncMock(return_value=session)):
+                await worker._process_row(self.store.get_message(duplicate))
+                await worker.retry_vision()
+            self.assertEqual(self.store.get_message(duplicate)["vision_state"], "rejected")
+            self.assertEqual(session.post.call_count, 2)
+        finally:
+            await worker.close()
+
+    async def test_openai_image_succeeds_with_modern_chat_limit(self):
+        from PIL import Image
+        self.llm.llm["protocol"] = "chat_completions"
+        image = Path(self.tmp.name) / "image.png"
+        Image.new("RGB", (16, 16), "white").save(image)
+        def accept_request(url, **kwargs):
+            body = json.loads(kwargs["data"])
+            self.assertEqual(body["max_completion_tokens"], 2000)
+            self.assertNotIn("max_tokens", body)
+            self.assertTrue(body["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+            return Response({"choices": [{"message": {"content": "图片文字"}, "finish_reason": "stop"}],
+                             "usage": {"prompt_tokens": 100, "completion_tokens": 10}})
+        session = Mock()
+        session.post.side_effect = accept_request
+        with patch.object(self.llm, "session", AsyncMock(return_value=session)):
+            self.assertEqual(await self.llm.describe_image(image, "提取文字"), ("图片文字", True))
+        self.assertEqual(session.post.call_count, 1)
+
+    async def test_non_json_error_is_rejected_without_echo_or_retry(self):
+        response = Response({}, 400)
+        response.text = AsyncMock(return_value="<html>" + KEY + "private chat</html>")
+        session = Mock()
+        session.post.return_value = response
+        with patch.object(self.llm, "session", AsyncMock(return_value=session)):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 400") as raised:
+                await self.llm.chat("x", "y")
+        self.assertNotIn("private chat", str(raised.exception))
+        self.assertNotIn(KEY, str(raised.exception))
+        self.assertEqual(session.post.call_count, 1)
+
     async def test_incomplete_or_missing_terminal_is_not_saved_as_complete_or_retried(self):
         for events in ([{"type": "response.incomplete", "response": self.response("incomplete")}],
                        [{"type": "response.output_text.delta", "delta": "半篇"}]):
