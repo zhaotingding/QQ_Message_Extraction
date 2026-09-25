@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS messages (
   UNIQUE(group_id, msg_id)
 );
 CREATE INDEX IF NOT EXISTS idx_msg_group_ts ON messages(group_id, ts);
+CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages(ts);
 
 CREATE TABLE IF NOT EXISTS message_images (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,9 +66,15 @@ CREATE TABLE IF NOT EXISTS summaries (
   kind          TEXT DEFAULT 'periodic',
   content       TEXT DEFAULT '',
   report_path   TEXT DEFAULT '',
+  source_sig    TEXT NOT NULL DEFAULT '',
   created_at    INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sum_group ON summaries(group_id, window_end);
+
+CREATE TABLE IF NOT EXISTS daily_schedule (
+  id         INTEGER PRIMARY KEY CHECK(id=1),
+  start_date TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS alerts (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,6 +192,7 @@ class Store:
             ("messages", MESSAGE_MIGRATIONS),
             ("groups", GROUP_MIGRATIONS),
             ("api_calls", (("provider", "TEXT NOT NULL DEFAULT ''"),)),
+            ("summaries", (("source_sig", "TEXT NOT NULL DEFAULT ''"),)),
         ):
             cols = {c[1] for c in self.conn.execute(f"PRAGMA table_info({table})")}
             for name, spec in migs:
@@ -707,11 +715,13 @@ class Store:
         content: str,
         kind: str = "periodic",
         report_path: str = "",
+        source_sig: str = "",
     ) -> int:
         cur = self.conn.execute(
             "INSERT INTO summaries(group_id, window_start, window_end, msg_count, kind,"
-            " content, report_path, created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (group_id, window_start, window_end, msg_count, kind, content, report_path, int(time.time())),
+            " content, report_path, source_sig, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (group_id, window_start, window_end, msg_count, kind, content, report_path,
+             source_sig, int(time.time())),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -720,6 +730,44 @@ class Store:
         return list(
             self.conn.execute("SELECT * FROM summaries ORDER BY window_end DESC LIMIT ?", (limit,))
         )
+
+    def summary_for_window(self, kind: str, start: int, end: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM summaries WHERE kind=? AND window_start=? AND window_end=?"
+            " ORDER BY id DESC LIMIT 1", (kind, start, end),
+        ).fetchone()
+
+    def latest_summary_kind(self, kind: str, start: int | None = None) -> sqlite3.Row | None:
+        if start is None:
+            return self.conn.execute(
+                "SELECT * FROM summaries WHERE kind=? ORDER BY window_start DESC,id DESC LIMIT 1",
+                (kind,),
+            ).fetchone()
+        return self.conn.execute(
+            "SELECT * FROM summaries WHERE kind=? AND window_start=? ORDER BY id DESC LIMIT 1",
+            (kind, start),
+        ).fetchone()
+
+    def count_messages_window(self, start: int, end: int) -> int:
+        body = "COALESCE(text,'')"
+        for marker in ("[图片]", "[表情]", "[表情包]", "[语音]", "[视频]", "[合并转发]"):
+            body = f"REPLACE({body},'{marker}','')"
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE ts>=? AND ts<?"
+            " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>'')))"
+            f" AND (TRIM({body}, char(9)||char(10)||char(13)||' ')<>''"
+            " OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>'')))",
+            (start, end),
+        ).fetchone()
+        return int(row[0])
+
+    def auto_daily_start(self) -> str | None:
+        row = self.conn.execute("SELECT start_date FROM daily_schedule WHERE id=1").fetchone()
+        return str(row[0]) if row else None
+
+    def set_auto_daily_start(self, day: str) -> None:
+        self.conn.execute("INSERT OR IGNORE INTO daily_schedule(id,start_date) VALUES(1,?)", (day,))
+        self.conn.commit()
 
     # ---------- alerts ----------
 

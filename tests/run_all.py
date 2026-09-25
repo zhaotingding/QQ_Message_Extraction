@@ -25,6 +25,8 @@ SUITES = [
     ("LLM 调用层", "test_llm.py"),
     ("大摘要 HTTP 上传", "test_transport.py"),
     ("纪要长度", "test_digest.py"),
+    ("自然日日报与多日复用", "test_daily_summary.py"),
+    ("每日自动补做与日期接口", "test_daily_scheduler.py"),
     ("媒体校验", "test_media.py"),
     ("群列表属主", "test_groups.py"),
     ("无额外推理与过滤链路", "test_pipeline.py"),

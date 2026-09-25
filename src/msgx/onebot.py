@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import date
 
 from aiohttp import WSMsgType, web
 
@@ -148,17 +149,32 @@ async def _alerts(request: web.Request) -> web.Response:
 async def _summary_now(request: web.Request) -> web.Response:
     try:
         return await _summary_request(request)
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
     except Exception as exc:
         log.warning("摘要请求失败: %s", exc)
         return web.json_response({"ok": False, "error": str(exc)}, status=502)
 
 
+def _summary_dates(start: str, end: str) -> tuple[str, str]:
+    try:
+        start_day, end_day = date.fromisoformat(start), date.fromisoformat(end)
+    except ValueError as exc:
+        raise ValueError("日期必须采用 YYYY-MM-DD 格式") from exc
+    if start_day.isoformat() != start or end_day.isoformat() != end:
+        raise ValueError("日期必须采用 YYYY-MM-DD 格式")
+    if start_day > end_day:
+        raise ValueError("开始日期不能晚于结束日期")
+    return start_day.isoformat(), end_day.isoformat()
+
+
 async def _summary_request(request: web.Request) -> web.Response:
     pipe = request.app["pipe"]
     kind = request.query.get("kind", "digest")
-    if kind not in ("digest", "full", "range"):
-        return web.json_response({"ok": False, "error": "仅支持手动增量或按时间范围生成摘要"}, status=400)
+    if kind not in ("digest", "full", "range", "by_date"):
+        return web.json_response({"ok": False, "error": "不支持此摘要类型"}, status=400)
     options = {}
+    data = {}
     if request.can_read_body:
         try:
             data = await request.json()
@@ -175,6 +191,14 @@ async def _summary_request(request: web.Request) -> web.Response:
             if type(value) is not int or not 1 <= value <= 100000:
                 return web.json_response({"ok": False, "error": "目标字数必须是 1 到 100000 的整数"}, status=400)
             options["target_chars"] = value
+    if kind == "by_date":
+        start, end = _summary_dates(str(data.get("start_date") or ""),
+                                    str(data.get("end_date") or ""))
+        force = data.get("force", False)
+        if not isinstance(force, bool):
+            return web.json_response({"ok": False, "error": "force 必须是布尔值"}, status=400)
+        item = await pipe.summarizer.run_dates(start, end, force=force, **options)
+        return web.json_response({"ok": True, "created": [item] if item else []})
     if kind == "range":
         # 用户指定的统计窗口，不会创建定时摘要任务。
         try:
@@ -188,6 +212,16 @@ async def _summary_request(request: web.Request) -> web.Response:
     # digest（默认）= 接着上次已总结过的消息做增量纪要；full = 近 24h 全量重做
     item = await pipe.summarizer.run_digest(full=(kind == "full"), **options)
     return web.json_response({"ok": True, "created": [item] if item else []})
+
+
+async def _summary_days(request: web.Request) -> web.Response:
+    try:
+        start, end = _summary_dates(request.query.get("start_date", ""),
+                                    request.query.get("end_date", ""))
+        status = request.app["pipe"].summarizer.daily_status(start, end)
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    return web.json_response({"ok": True, **status})
 
 
 async def _messages_recent(request: web.Request) -> web.Response:
@@ -284,5 +318,6 @@ def build_app(cfg: dict, pipeline) -> web.Application:
     app.router.add_get("/usage/details", _usage_details)
     app.router.add_get(r"/usage/calls/{call_id:\d+}", _usage_sources)
     app.router.add_post("/summary/now", _summary_now)
+    app.router.add_get("/summary/days", _summary_days)
     app.router.add_post("/groups/refresh", _groups_refresh)
     return app

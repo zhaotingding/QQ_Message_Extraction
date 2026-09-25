@@ -23,16 +23,18 @@ import time
 import tkinter as tk
 import urllib.request
 import urllib.error
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
+from urllib.parse import urlencode
 
 from . import __version__, DISPLAY_VERSION
 from . import napcat as napcat_mod
 from . import prefs as prefs_mod
 from . import api_settings, credentials, security
 from .config import ROOT, abs_path, load
-from .summarize import DEFAULT_DIGEST_PROMPT, DIGEST_DEFAULT_CHARS, DIGEST_RANGES
+from .summarize import BEIJING, DEFAULT_DIGEST_PROMPT, DIGEST_DEFAULT_CHARS
 
 APP_TITLE = "消息萃取 msgx"
 FONT = "Microsoft YaHei UI"
@@ -85,6 +87,8 @@ class App:
         self._summary_busy = False
         self._summary_started = 0.0
         self._summary_path = ""
+        self._summary_days_busy = False
+        self._summary_days_checked = 0.0
         self._usage_busy = False
         self._usage_items = {}
         self._usage_sort = {}
@@ -229,26 +233,25 @@ class App:
         self.btn_stop = ttk.Button(buttons, text="停止服务", command=self.stop_service, state="disabled")
         self.btn_stop.pack(side="left", padx=8)
 
-        ttk.Label(buttons, text="摘要范围：").pack(side="left", padx=(16, 4))
-        self.v_range = tk.StringVar(value=DIGEST_RANGES[0][0])
-        self.cb_range = ttk.Combobox(
-            buttons,
-            textvariable=self.v_range,
-            values=[label for label, _h, _c in DIGEST_RANGES],
-            state="readonly",
-            width=11,
-            font=(FONT, 10),
-        )
-        self.cb_range.pack(side="left")
-        self.v_range_desc = tk.StringVar(value=self._range_desc(DIGEST_RANGES[0][0]))
-        self.cb_range.bind("<<ComboboxSelected>>", lambda _e: self._on_range_change())
-        self.btn_summary = ttk.Button(buttons, text="生成摘要", command=self.summary_by_range)
+        yesterday = (datetime.now(BEIJING).date() - timedelta(days=1)).isoformat()
+        ttk.Label(buttons, text="摘要日期：").pack(side="left", padx=(16, 4))
+        self.v_summary_start = tk.StringVar(value=yesterday)
+        self.v_summary_end = tk.StringVar(value=yesterday)
+        start_entry = ttk.Entry(buttons, textvariable=self.v_summary_start, width=12)
+        start_entry.pack(side="left")
+        ttk.Label(buttons, text="至").pack(side="left", padx=5)
+        end_entry = ttk.Entry(buttons, textvariable=self.v_summary_end, width=12)
+        end_entry.pack(side="left")
+        for entry in (start_entry, end_entry):
+            entry.bind("<FocusOut>", self._on_summary_dates_change)
+            entry.bind("<Return>", self._on_summary_dates_change)
+        self.btn_summary = ttk.Button(buttons, text="生成摘要", command=self.summary_by_date)
         self.btn_summary.pack(side="left", padx=6)
+        self.btn_regenerate = ttk.Button(buttons, text="重新生成", command=lambda: self.summary_by_date(force=True))
         ttk.Button(buttons, text="打开数据目录", command=self.open_data_dir).pack(side="right")
 
         buttons2 = ttk.Frame(tab)
         buttons2.pack(fill="x")
-        ttk.Label(buttons2, textvariable=self.v_range_desc, style="Hint.TLabel").pack(side="left")
         # 自动登录复用已有进程；强制重启保留为独立的手动恢复入口。
         if self.napcat_script() or self.napcat_dir():
             if napcat_mod.restart_script(self.cfg):
@@ -256,6 +259,13 @@ class App:
             self.btn_login = ttk.Button(buttons2, text="自动登录", command=self.auto_login)
             self.btn_login.pack(side="right")
         ttk.Button(buttons2, text="刷新账单", command=self.refresh_billing).pack(side="right", padx=8)
+
+        self.v_range_desc = tk.StringVar(value=self._summary_date_desc())
+        ttk.Label(tab, textvariable=self.v_range_desc, style="Hint.TLabel").pack(anchor="w", pady=(3, 0))
+        self.v_daily_latest = tk.StringVar(value="最近日报：启动服务后查看")
+        ttk.Label(tab, textvariable=self.v_daily_latest, wraplength=940).pack(anchor="w", pady=(3, 0))
+        self.v_summary_days = tk.StringVar(value="所选日期：启动服务后查看")
+        ttk.Label(tab, textvariable=self.v_summary_days, wraplength=940).pack(anchor="w", pady=(3, 0))
 
         progress = ttk.Frame(tab)
         progress.pack(fill="x", pady=(6, 0))
@@ -297,12 +307,9 @@ class App:
         self.log.pack(fill="both", expand=True)
         self.alt_log = self._make_log_text(log_frame)  # 协议端日志（默认不显示）
 
-    def _range_desc(self, label: str) -> str:
-        for text, hours, _chars in DIGEST_RANGES:
-            if text == label:
-                chars = self._summary_options()["target_chars"]
-                return f"模型总结目标约 {chars} 字，完整保留生成结果；数据源为最近 {hours // 24} 天"
-        return ""
+    def _summary_date_desc(self) -> str:
+        chars = self._summary_options()["target_chars"]
+        return f"北京时间自然日（YYYY-MM-DD）；单日目标约 {chars} 字，多日二次归纳会适当加长"
 
     @staticmethod
     def _make_log_text(parent) -> ScrolledText:
@@ -389,8 +396,12 @@ class App:
         else:
             widget.insert("end", line + "\n")
 
-    def _on_range_change(self) -> None:
-        self.v_range_desc.set(self._range_desc(self.v_range.get()))
+    def _on_summary_dates_change(self, _event=None) -> None:
+        self._summary_days_checked = 0.0
+        self.v_summary_days.set("所选日期：正在查询…")
+        self.btn_summary.configure(text="生成摘要")
+        self.btn_regenerate.pack_forget()
+        self.refresh_summary_days()
 
     # ---- 标签页 2：实时消息 ----
 
@@ -745,7 +756,7 @@ class App:
         self.txt_summary_prompt.delete("1.0", "end")
         self.txt_summary_prompt.insert("1.0", options["prompt"])
         self.v_summary_chars.set(str(options["target_chars"]))
-        self.v_range_desc.set(self._range_desc(self.v_range.get()))
+        self.v_range_desc.set(self._summary_date_desc())
         if not self._summary_busy:
             self.v_summary.set(f"摘要待生成，目标约 {options['target_chars']} 字")
 
@@ -853,7 +864,7 @@ class App:
         self.api_selector.configure(values=[p["provider"] for p in self._api_profiles.values()])
         self.api_selector.current(list(self._api_profiles).index(self._api_selected))
         self._api_key_status()
-        self.v_range_desc.set(self._range_desc(self.v_range.get()))
+        self.v_range_desc.set(self._summary_date_desc())
         if not self._summary_busy:
             self.v_summary.set(f"摘要待生成，目标约 {data['summary_target_chars']} 字")
         n_groups = len(data["groups"]) or "全部"
@@ -1191,10 +1202,11 @@ class App:
         self._summary_busy = False
         self.summary_bar.stop()
         self.btn_summary.configure(state="normal")
+        self.btn_regenerate.configure(state="normal")
         if data.get("error"):
             note = f"摘要生成失败：{data['error']}"
         elif not data.get("created"):
-            note = "本时间范围没有可总结的新消息"
+            note = "所选日期暂无可生成的摘要"
         else:
             item = data["created"][0]
             self._summary_path = str(Path(item["path"]).resolve())
@@ -1216,6 +1228,8 @@ class App:
         self.v_summary.set(note)
         self._log_ui(f"[界面] {note}\n")
         self.status.set(note)
+        self._summary_days_checked = 0.0
+        self.refresh_summary_days()
 
     # ---------------- 服务进程 ----------------
 
@@ -1287,19 +1301,55 @@ class App:
         finally:
             self.events.put(("exit", proc.wait()))
 
-    def summary_now(self, kind: str = "digest", hours: int | None = None) -> None:
+    def _chosen_summary_dates(self) -> tuple[date, date]:
+        raw_start = self.v_summary_start.get().strip()
+        raw_end = self.v_summary_end.get().strip()
+        if not all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) for value in (raw_start, raw_end)):
+            raise ValueError("摘要日期请按 YYYY-MM-DD 填写")
+        try:
+            start, end = date.fromisoformat(raw_start), date.fromisoformat(raw_end)
+        except ValueError as exc:
+            raise ValueError("摘要日期不是有效的日历日期") from exc
+        if end < start:
+            raise ValueError("结束日期不能早于起始日期")
+        if end > datetime.now(BEIJING).date():
+            raise ValueError("摘要日期不能晚于今天")
+        if (end - start).days >= 31:
+            raise ValueError("一次最多选择 31 天")
+        return start, end
+
+    def summary_now(self, kind: str = "by_date", hours: int | None = None,
+                    start_date: str | None = None, end_date: str | None = None,
+                    force: bool = False) -> None:
         if self._summary_busy:
             return
         if self.proc is None:
             self.v_summary.set("请先启动服务，再生成摘要。")
             self.status.set(self.v_summary.get())
             return
+        if kind == "by_date":
+            try:
+                start, end = self._chosen_summary_dates() if start_date is None or end_date is None else (
+                    date.fromisoformat(start_date), date.fromisoformat(end_date))
+            except ValueError as exc:
+                self.v_summary.set(str(exc))
+                self.status.set(str(exc))
+                return
+            start_date, end_date = start.isoformat(), end.isoformat()
         self._summary_busy = True
         self._summary_started = time.time()
         self.btn_summary.configure(state="disabled")
+        self.btn_regenerate.configure(state="disabled")
         self.summary_bar.start(12)
         options = self._summary_options()
-        target = f"最近 {hours // 24} 天" if kind == "range" and hours else "增量"
+        if kind == "by_date":
+            days = (end - start).days + 1
+            if days > 1:
+                extra, minimum = (1500, 4500) if days <= 3 else (3000, 6000) if days <= 7 else (7000, 10000)
+                options["target_chars"] = min(100000, max(options["target_chars"] + extra, minimum))
+            target = start_date if days == 1 else f"{start_date} 至 {end_date}"
+        else:
+            target = f"最近 {hours // 24} 天" if kind == "range" and hours else "增量"
         note = f"开始生成{target}摘要，目标约 {options['target_chars']} 字；正在读取消息并调用已配置的模型…"
         self.v_summary.set(note)
         self.status.set(note)
@@ -1311,6 +1361,8 @@ class App:
                 url = f"http://127.0.0.1:{port}/summary/now?kind={kind}"
                 if kind == "range" and hours:
                     url += f"&hours={int(hours)}"
+                if kind == "by_date":
+                    options.update({"start_date": start_date, "end_date": end_date, "force": force})
                 req = urllib.request.Request(
                     url, data=json.dumps(options, ensure_ascii=False).encode("utf-8"),
                     headers={"Content-Type": "application/json"}, method="POST",
@@ -1330,15 +1382,88 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
-    def summary_by_range(self) -> None:
-        """按选定时间范围生成完整摘要。"""
-        label = self.v_range.get()
-        hours = DIGEST_RANGES[0][1]
-        for text, h, _c in DIGEST_RANGES:
-            if text == label:
-                hours = h
-                break
-        self.summary_now("range", hours=hours)
+    def summary_by_date(self, force: bool = False) -> None:
+        """按北京时间的自然日生成日报，或复用日报生成多日摘要。"""
+        try:
+            start, end = self._chosen_summary_dates()
+        except ValueError as exc:
+            self.v_summary.set(str(exc))
+            self.status.set(str(exc))
+            return
+        self.summary_now("by_date", start_date=start.isoformat(), end_date=end.isoformat(), force=force)
+
+    def refresh_summary_days(self) -> None:
+        if self.proc is None or self._summary_days_busy:
+            return
+        try:
+            start, end = self._chosen_summary_dates()
+        except ValueError as exc:
+            self.v_summary_days.set(str(exc))
+            self.btn_regenerate.pack_forget()
+            return
+        self._summary_days_busy = True
+        self._summary_days_checked = time.time()
+        threading.Thread(target=self._fetch_summary_days,
+                         args=(start.isoformat(), end.isoformat()), daemon=True).start()
+
+    def _fetch_summary_days(self, start: str, end: str) -> None:
+        port = int(self.cfg["onebot"]["http_port"])
+        url = f"http://127.0.0.1:{port}/summary/days?{urlencode({'start_date': start, 'end_date': end})}"
+        try:
+            op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with op.open(url, timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError) as exc:
+            data = {"error": str(exc)}
+        finally:
+            self._summary_days_busy = False
+        self.events.put(("summary_days", (start, end, data)))
+
+    def _apply_summary_days(self, start: str, end: str, data: dict) -> None:
+        latest = data.get("latest_daily")
+        if latest is not None:
+            self._show_latest_daily(latest)
+        if (self.v_summary_start.get().strip(), self.v_summary_end.get().strip()) != (start, end):
+            return
+        if data.get("error"):
+            self.v_summary_days.set(f"所选日期状态读取失败：{data['error']}")
+            return
+        rows = {str(row.get("date")): row for row in data.get("days", [])}
+        first, last = date.fromisoformat(start), date.fromisoformat(end)
+        dates = [(first + timedelta(days=i)).isoformat() for i in range((last - first).days + 1)]
+        done = [day for day in dates if rows.get(day, {}).get("status") == "done"]
+        empty = [day for day in dates if rows.get(day, {}).get("status") == "empty"]
+        partial = [day for day in dates if rows.get(day, {}).get("status") == "partial"]
+        missing = [day for day in dates if day not in done and day not in empty and day not in partial]
+        if len(dates) == 1:
+            day = dates[0]
+            state = rows.get(day, {}).get("status")
+            labels = {"done": "已完成", "empty": "无消息", "partial": "截至当前的临时摘要"}
+            self.v_summary_days.set(f"所选日期 {day}：{labels.get(state, '待生成')}")
+            self.btn_summary.configure(text="查看摘要" if state == "done" else "生成摘要")
+            if state == "done":
+                self.btn_regenerate.pack(side="left", padx=(0, 6))
+            else:
+                self.btn_regenerate.pack_forget()
+        else:
+            detail = f"所选 {len(dates)} 天：已完成 {len(done)} 天，无消息 {len(empty)} 天"
+            if partial:
+                detail += f"，临时摘要 {len(partial)} 天"
+            if missing:
+                detail += f"；缺少 {len(missing)} 天（{', '.join(missing[:3])}{' 等' if len(missing) > 3 else ''}），点击生成会先补齐"
+            self.v_summary_days.set(detail)
+            self.btn_summary.configure(text="生成摘要")
+            self.btn_regenerate.pack_forget()
+
+    def _show_latest_daily(self, latest: dict | None) -> None:
+        yesterday = (datetime.now(BEIJING).date() - timedelta(days=1)).isoformat()
+        if latest and str(latest.get("date")) == yesterday and latest.get("status") == "done":
+            self.v_daily_latest.set(f"昨日日报 {yesterday}：已完成（{latest.get('chars', 0)} 字）")
+        elif latest:
+            status = "无消息" if latest.get("status") == "empty" else "待生成"
+            self.v_daily_latest.set(f"昨日日报 {yesterday}：{status}")
+        else:
+            self.v_daily_latest.set(f"昨日日报 {yesterday}：尚未完成")
 
     def open_data_dir(self) -> None:
         open_path(abs_path(self.cfg, "report_dir").parent)
@@ -1912,6 +2037,8 @@ class App:
         if not self.health_busy and self.proc is not None:
             self.health_busy = True
             threading.Thread(target=self._fetch_health, daemon=True).start()
+            if not self._summary_days_busy and time.time() - self._summary_days_checked >= 30:
+                self.refresh_summary_days()
         elif self.proc is None:
             self.v_peer.set("—")
             self.v_stored.set("—")
@@ -1919,6 +2046,8 @@ class App:
             self.v_total.set("—")
             self.v_balance.set("—")
             self.v_llm.set("—")
+            self.v_daily_latest.set("最近日报：启动服务后查看")
+            self.v_summary_days.set("所选日期：启动服务后查看")
         self.root.after(2000, self._tick_health)
         # 协议端日志是**快照**，不像服务日志那样有流 —— 显示着它就顺手刷新一下。
         # 读的是本地文件尾部，2 秒一次的开销可以忽略；不显示时一个字节都不读。
@@ -2009,6 +2138,9 @@ class App:
                 self.status.set(result.get("error") or "图片操作失败")
         elif kind == "summary_done":
             self._summary_finished(value)
+        elif kind == "summary_days":
+            start, end, data = value
+            self._apply_summary_days(start, end, data)
         elif kind == "login_done":
             self._login_finished(value)
         elif kind == "usage":
@@ -2087,9 +2219,18 @@ class App:
             f"其中已过滤 {c.get('filtered', 0)}）"
         )
         progress = data.get("summary_progress") or {}
-        if self._summary_busy and progress.get("state") == "running":
-            elapsed = int(time.time() - self._summary_started)
-            self.v_summary.set(f"{progress.get('message', '正在生成')} · 已用 {elapsed} 秒")
+        if progress.get("state") == "running":
+            elapsed = int(time.time() - self._summary_started) if self._summary_busy else 0
+            self.v_summary.set(f"{progress.get('message', '正在生成')} · 已用 {elapsed} 秒" if self._summary_busy
+                               else f"每日摘要：{progress.get('message', '正在生成')}")
+        if "latest_daily" in data:
+            self._show_latest_daily(data.get("latest_daily"))
+            daily = data.get("daily_schedule") or {}
+            state = daily.get("state")
+            if state in ("settling", "running"):
+                self.v_daily_latest.set(f"{self.v_daily_latest.get()}；自动任务：{daily.get('message') or '正在生成'}")
+            elif state == "failed":
+                self.v_daily_latest.set(f"{self.v_daily_latest.get()}；自动任务失败：{daily.get('message') or '请查看日志'}")
 
         # 账单：优先用服务抓到的真实数据；没抓到就退回本地估算，并标明是估算。
         budget = float(data.get("budget_cny") or 0)

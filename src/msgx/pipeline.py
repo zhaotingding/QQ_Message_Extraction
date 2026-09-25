@@ -5,7 +5,7 @@ import contextlib
 import json
 import logging
 import time
-from datetime import date, datetime
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 
 from aiohttp import WSCloseCode
 
@@ -19,6 +19,7 @@ from .store import Store
 from .summarize import Summarizer
 
 log = logging.getLogger("msgx.pipeline")
+SHANGHAI = timezone(timedelta(hours=8))
 
 
 class Pipeline:
@@ -77,6 +78,7 @@ class Pipeline:
         self._billing_ts = 0.0
         self._billing_data: dict = {}
         self._billing_lock: asyncio.Lock | None = None
+        self.daily_schedule = {"state": "idle", "message": "", "day": ""}
         self.started_at = time.time()
         self.counters = {
             "received": 0,
@@ -109,6 +111,7 @@ class Pipeline:
             asyncio.create_task(self._prune_loop(), name="prune"),
             asyncio.create_task(self._billing_loop(), name="billing"),
             asyncio.create_task(self._watchdog_loop(), name="watchdog"),
+            asyncio.create_task(self._daily_summary_loop(), name="daily-summary"),
         ]
         # v0.4.0 的下载缺陷误伤了一批图片（标记 failed）。启动时重置一次：
         # URL 仍有效即被挽回，已过期则再次 failed，不会死循环。
@@ -712,6 +715,80 @@ class Pipeline:
             except asyncio.CancelledError:
                 raise
 
+    async def _catch_up_daily_summaries(self) -> bool:
+        """补齐持久基线之后缺失的完整自然日；返回是否需要稍后重试。"""
+        yesterday = datetime.now(SHANGHAI).date() - timedelta(days=1)
+        start = self.store.auto_daily_start()
+        if start is None:
+            start = yesterday.isoformat()
+            self.store.set_auto_daily_start(start)
+        if not self.llm.available:
+            self.daily_schedule = {"state": "pending", "message": "尚未配置模型密钥，日摘要待补做",
+                                   "day": yesterday.isoformat()}
+            return False
+        cursor = date.fromisoformat(start)
+        if cursor > yesterday:
+            self.daily_schedule = {"state": "idle", "message": "", "day": ""}
+            return False
+        while cursor <= yesterday:
+            last = min(cursor + timedelta(days=30), yesterday)
+            days = self.summarizer.daily_status(cursor.isoformat(), last.isoformat())["days"]
+            for item in days:
+                if self._stop.is_set():
+                    return False
+                if item["status"] in ("done", "empty"):
+                    continue
+                day = item["date"]
+                try:
+                    self.daily_schedule = {"state": "running", "message": f"正在生成 {day} 的日摘要", "day": day}
+                    log.info("正在补做 %s 的日摘要", day)
+                    result = await self.summarizer.run_dates(day, day)
+                    if result:
+                        log.info("%s 日摘要已完成：%d 字", day, result.get("chars", 0))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("%s 日摘要生成失败，稍后重试（%s）", day, type(exc).__name__)
+                    self.daily_schedule = {"state": "failed", "message": f"{day} 日摘要失败，稍后重试", "day": day}
+                    return True
+            cursor = last + timedelta(days=1)
+        self.daily_schedule = {"state": "idle", "message": "", "day": ""}
+        return False
+
+    async def _daily_summary_loop(self) -> None:
+        """北京时间午夜后生成前一天摘要，重启时补做既有自动计划。"""
+        await asyncio.sleep(5)
+        now = datetime.now(SHANGHAI)
+        after_midnight = now.hour == 0 and now.minute == 0 and now.second < 30
+        while not self._stop.is_set():
+            if after_midnight:
+                day = (datetime.now(SHANGHAI).date() - timedelta(days=1)).isoformat()
+                log.info("北京时间 00:00 已到，准备生成 %s 日摘要；等待 30 秒让已接收消息入库", day)
+                self.daily_schedule = {"state": "settling", "message": "正在等待昨日消息入库完成", "day": day}
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=30)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+            try:
+                retry = await self._catch_up_daily_summaries()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("自动日摘要检查失败，稍后重试（%s）", type(exc).__name__)
+                self.daily_schedule = {"state": "failed", "message": "自动日摘要检查失败，稍后重试", "day": ""}
+                retry = True
+            now = datetime.now(SHANGHAI)
+            next_run = datetime.combine(now.date() + timedelta(days=1), datetime_time.min,
+                                        SHANGHAI)
+            wait = max(0.001, (next_run - now).total_seconds())
+            if retry:
+                wait = min(wait, 30 * 60)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=wait)
+            except asyncio.TimeoutError:
+                after_midnight = datetime.now(SHANGHAI) >= next_run
+
     # ---------- introspection ----------
 
     def health(self) -> dict:
@@ -733,6 +810,8 @@ class Pipeline:
             "last_protocol_message": dict(self.last_protocol_message),
             "protocol": self.protocol_status(),
             "summary_progress": self.summarizer.progress,
+            "latest_daily": self.summarizer.latest_daily_status(),
+            "daily_schedule": dict(self.daily_schedule),
             # ⚠️ ws_peers 是「对端 IP 的**集合**」：多份 NapCat 全从 127.0.0.1 连进来时
             # 会被去重成 1 个 —— 7 份实例看起来和 1 份完全一样，这正是 2026-09-21
             # 「消息冻结」排查中最费时间的一处盲点。真正该看的是**连接条数**：

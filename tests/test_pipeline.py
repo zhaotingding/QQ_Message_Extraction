@@ -45,8 +45,9 @@ async def main() -> None:
             await pipe.start()
             await asyncio.sleep(0)
             check("启动不发起模型探测", pipe.llm._post.await_count == 0)
-            check("启动不创建任何自动摘要任务",
-                  {task.get_name() for task in pipe._tasks} == {"ingest", "media", "prune", "billing", "watchdog"})
+            check("启动只创建新的自动日摘要任务",
+                  {task.get_name() for task in pipe._tasks} ==
+                  {"ingest", "media", "prune", "billing", "watchdog", "daily-summary"})
             check("旧摘要定时循环已删除",
                   not hasattr(pipe, "_summary_loop") and not hasattr(pipe, "_daily_loop"))
             check("评分器和通知器已从管道移除", not hasattr(pipe, "scorer") and not hasattr(pipe, "notifier"))

@@ -8,6 +8,7 @@ import logging
 import math
 import re
 import time
+from datetime import date, datetime, time as day_time, timedelta, timezone
 from pathlib import Path
 
 from .config import abs_path
@@ -16,6 +17,7 @@ from .llm import IncompleteResponse, LLM
 log = logging.getLogger("msgx.summarize")
 
 DIGEST_DEFAULT_CHARS = 3000
+BEIJING = timezone(timedelta(hours=8))
 
 # 时间范围只决定读取哪些消息，目标字数来自设置。
 DIGEST_RANGES = (
@@ -172,6 +174,176 @@ class Summarizer:
     def _progress(self, message: str) -> None:
         self.progress["message"] = message
         log.info("摘要生成进度：%s", message)
+
+    @staticmethod
+    def _day_bounds(day: date) -> tuple[int, int]:
+        start = int(datetime.combine(day, day_time.min, BEIJING).timestamp())
+        end = int(datetime.combine(day + timedelta(days=1), day_time.min, BEIJING).timestamp())
+        return start, end
+
+    @staticmethod
+    def _saved_result(row) -> dict:
+        return {
+            "id": row["id"], "group_id": row["group_id"], "path": row["report_path"],
+            "content": row["content"], "count": row["msg_count"], "chars": len(row["content"]),
+            "start_date": datetime.fromtimestamp(row["window_start"], BEIJING).date().isoformat(),
+            "end_date": datetime.fromtimestamp(max(row["window_start"], row["window_end"] - 1),
+                                               BEIJING).date().isoformat(),
+        }
+
+    def _day_status(self, day: date) -> dict:
+        start, end = self._day_bounds(day)
+        completed = self.store.summary_for_window("daily", start, end)
+        if completed:
+            return {"date": day.isoformat(), "status": "done", "chars": len(completed["content"]),
+                    "path": completed["report_path"], "count": completed["msg_count"]}
+        if day == datetime.now(BEIJING).date():
+            partial = self.store.latest_summary_kind("daily_partial", start)
+            if partial:
+                return {"date": day.isoformat(), "status": "partial", "chars": len(partial["content"]),
+                        "path": partial["report_path"], "count": partial["msg_count"]}
+        status = "empty" if self.store.count_messages_window(start, end) == 0 else "missing"
+        return {"date": day.isoformat(), "status": status, "chars": 0, "path": "", "count": 0}
+
+    def latest_daily_status(self) -> dict:
+        return self._day_status(datetime.now(BEIJING).date() - timedelta(days=1))
+
+    def daily_status(self, start_date: str, end_date: str) -> dict:
+        start, end = self._validate_dates(start_date, end_date)
+        days = [self._day_status(start + timedelta(days=i)) for i in range((end - start).days + 1)]
+        return {"days": days, "latest_daily": self.latest_daily_status()}
+
+    @staticmethod
+    def _validate_dates(start_date: str, end_date: str) -> tuple[date, date]:
+        try:
+            start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("日期须为 YYYY-MM-DD") from exc
+        if start.isoformat() != start_date or end.isoformat() != end_date:
+            raise ValueError("日期须为 YYYY-MM-DD")
+        if start > end:
+            raise ValueError("开始日期不能晚于结束日期")
+        if end > datetime.now(BEIJING).date():
+            raise ValueError("不能总结未来日期")
+        if (end - start).days >= 31:
+            raise ValueError("一次最多选择 31 天")
+        return start, end
+
+    async def run_dates(self, start_date: str, end_date: str,
+                        target_chars: int | None = None, prompt: str | None = None,
+                        force: bool = False) -> dict | None:
+        start, end = self._validate_dates(start_date, end_date)
+        if self._digest_lock.locked():
+            raise RuntimeError("已有摘要正在生成，请等待完成，避免重复请求")
+        days = (end - start).days + 1
+        default = self.scfg.get("target_chars", DIGEST_DEFAULT_CHARS)
+        recommended = 3000 if days == 1 else 4500 if days <= 3 else 6000 if days <= 7 else 10000
+        limit = int(target_chars if target_chars is not None else max(default, recommended))
+        if not 1 <= limit <= 100000:
+            raise ValueError("目标字数必须是 1 到 100000 的整数")
+        async with self._digest_lock:
+            self.progress = {"state": "running", "message": "正在检查每日摘要", "started_at": time.time()}
+            log.info("开始生成 %s 至 %s 摘要，目标约 %d 字", start_date, end_date, limit)
+            try:
+                worker = self
+                if isinstance(self.llm, LLM):
+                    llm = self.llm.snapshot()
+                    worker = Summarizer(llm.cfg, self.store, llm)
+                    worker.progress = self.progress
+                result = await worker._run_dates(start, end, limit, prompt, force)
+                self.progress.update(state="done", message="摘要已生成" if result else "所选日期没有可总结的消息")
+                return result
+            except Exception as exc:
+                self.progress.update(state="failed", message=f"摘要生成失败：{exc}")
+                raise
+
+    async def _run_dates(self, start: date, end: date, limit: int,
+                         prompt: str | None, force: bool) -> dict | None:
+        today = datetime.now(BEIJING).date()
+        day_count = (end - start).days + 1
+        daily_limit = int(self.scfg.get("target_chars", DIGEST_DEFAULT_CHARS))
+        reports = []
+        for offset in range(day_count):
+            day = start + timedelta(days=offset)
+            self._progress(f"正在检查第 {offset + 1}/{day_count} 天：{day.isoformat()}")
+            row = await self._run_day(day, limit if day_count == 1 else daily_limit,
+                                      prompt, force if day_count == 1 else False)
+            if row:
+                reports.append(row)
+        if day_count == 1:
+            return self._saved_result(reports[0]) if reports else None
+        if not reports:
+            return None
+        start_ts, _ = self._day_bounds(start)
+        _, end_ts = self._day_bounds(end)
+        if end == today:
+            end_ts = int(time.time())
+        system = digest_system(limit, prompt if prompt is not None else self.scfg.get("prompt"))
+        system += "\n\n以下材料是各自然日已经生成的摘要。请跨日合并同一主题，说明变化与分歧；"
+        system += "日报是有损归纳，不得把未提到的信息推断为不存在。"
+        source_sig = hashlib.sha256(json.dumps(
+            [row["id"] for row in reports] + [limit, system], ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        kind = "multi_partial" if end == today else "multi"
+        existing = self.store.summary_for_window(kind, start_ts, end_ts)
+        if existing and existing["source_sig"] == source_sig and not force:
+            self._progress("已找到同一批日报生成的多日摘要，直接打开")
+            return self._saved_result(existing)
+        blocks = [(f"{datetime.fromtimestamp(row['window_start'], BEIJING).date().isoformat()}\n"
+                   f"{row['content']}", []) for row in reports]
+        context_tokens, max_output = model_limits(self.cfg)
+        output_tokens = output_token_budget(limit)
+        if output_tokens > max_output:
+            raise ValueError(f"目标字数对应的输出额度 {output_tokens} Token 超过模型上限 {max_output}")
+        input_limit = context_tokens - output_tokens - max(2048, math.ceil(context_tokens * 0.01))
+        self._progress(f"正在归纳 {len(reports)} 份日报，目标约 {limit} 字")
+        content = await self._summarize_blocks(system, blocks, "", output_tokens, input_limit)
+        title = f"多日摘要（{start.isoformat()} 至 {end.isoformat()}{'，截至当前' if end == today else ''}）"
+        count = sum(int(row["msg_count"]) for row in reports)
+        path = self._write_report(title, content, "全部", start_ts, end_ts, count)
+        self.store.add_summary("digest", start_ts, end_ts, count, content, kind, str(path), source_sig)
+        saved = self.store.summary_for_window(kind, start_ts, end_ts)
+        log.info("多日摘要已生成（%d 份日报 / %d 字）：%s", len(reports), len(content), path)
+        return self._saved_result(saved)
+
+    async def _run_day(self, day: date, limit: int, prompt: str | None, force: bool):
+        start, end = self._day_bounds(day)
+        today = datetime.now(BEIJING).date()
+        kind = "daily_partial" if day == today else "daily"
+        if kind == "daily" and not force:
+            existing = self.store.summary_for_window(kind, start, end)
+            if existing:
+                self._progress(f"{day.isoformat()} 已有完整日报，直接复用")
+                return existing
+        if not self.llm.available:
+            raise RuntimeError("LLM 未配置，无法补做缺失的日报")
+        actual_end = int(time.time()) if day == today else end
+        rows = self.store.messages_between_all(start - 1, actual_end - 1)
+        blocks = []
+        for row in rows:
+            body = _rows_to_text_multi([row])
+            if body:
+                blocks.append((body, [int(row["id"])]))
+        if not blocks:
+            self._progress(f"{day.isoformat()} 没有可总结的正文或已选择的图片文字")
+            return None
+        system = digest_system(limit, prompt if prompt is not None else self.scfg.get("prompt"))
+        system += (f"\n\n本次只总结北京时间 {day.isoformat()} 的已入库消息。"
+                   "保留重要事实、数字、讨论进展、分歧和未解决问题，供多日归纳复用。")
+        context_tokens, max_output = model_limits(self.cfg)
+        output_tokens = output_token_budget(limit)
+        if output_tokens > max_output:
+            raise ValueError(f"目标字数对应的输出额度 {output_tokens} Token 超过模型上限 {max_output}")
+        input_limit = context_tokens - output_tokens - max(2048, math.ceil(context_tokens * 0.01))
+        input_tokens = estimate_tokens(system) + estimate_tokens("\n\n".join(part for part, _ in blocks)) + 128
+        self._progress(f"{day.isoformat()}：已读取 {len(blocks)} 条有效消息，预估输入 {input_tokens} Token")
+        content = await self._summarize_blocks(system, blocks, "", output_tokens, input_limit)
+        title = f"日摘要（{day.isoformat()}{'，截至当前' if day == today else ''}）"
+        path = self._write_report(title, content, "全部", start, actual_end, len(blocks))
+        self.store.add_summary("digest", start, actual_end, len(blocks), content, kind, str(path))
+        saved = self.store.summary_for_window(kind, start, actual_end)
+        log.info("%s 已生成（%d 条有效消息 / %d 字）：%s", title, len(blocks), len(content), path)
+        return saved
 
     async def run_digest(self, full: bool = False, hours: int = 24,
                          target_chars: int | None = None, prompt: str | None = None) -> dict | None:

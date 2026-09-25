@@ -12,6 +12,7 @@ from __future__ import annotations
 import sys
 import json
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 PROJ = Path(__file__).resolve().parent.parent
@@ -89,25 +90,17 @@ wheel_bound = [w for w in allw if w.bind("<MouseWheel>") and not isinstance(w, (
 check("滚轮已绑到设置页控件上", len(wheel_bound) >= 5, f"{len(wheel_bound)} 个控件")
 buttons = [str(w.cget("text")) for w in allw if isinstance(w, ttk.Button)]
 check("只有一个摘要按钮", buttons.count("生成摘要") == 1 and "生成最新摘要" not in buttons, str(buttons))
-# v0.5.0：原来的「全量重做」被换成「范围下拉 + 生成」——因为它没说清范围与字数，
-# 用户原话是「意义不明」。这里锁死「不再有那个按钮」+「必须有范围选择器」。
+# 手动摘要用自然日日期范围，已有日报可以查看或明确选择重新生成。
 check("不再有说不清范围的『全量重做』", not any("全量" in b for b in buttons), str(buttons))
 check("保留强制重启并替换原启动入口", "强制重启" in buttons and "自动登录" in buttons
       and "启动协议端(NapCat)" not in buttons, str(buttons))
 # v0.5.4：群列表是历次登录的并集，换过账号就会混进别的账号的群，得有个清理入口。
 check("有「只保留当前账号的群」按钮",
       any("只保留当前账号" in b for b in buttons), str(buttons))
-combos = [w for w in allw if isinstance(w, ttk.Combobox)]
-check("有摘要范围下拉", len(combos) >= 1, f"{len(combos)} 个 Combobox")
-if combos:
-    from msgx.summarize import DIGEST_RANGES  # noqa: E402
-
-    values = list(combos[0].cget("values"))
-    check(
-        "范围选项 = 最近 1/3/7 天 + 1 个月",
-        values == [label for label, _h, _c in DIGEST_RANGES],
-        str(values),
-    )
+yesterday = (date.today() - timedelta(days=1)).isoformat()
+check("日期范围默认选昨日单日", app.v_summary_start.get() == yesterday and app.v_summary_end.get() == yesterday)
+check("摘要日期格式与重新生成入口可见", "YYYY-MM-DD" in app.v_range_desc.get()
+      and app.btn_regenerate.cget("text") == "重新生成")
 
 print("\n=== 实时消息页（v0.5.0：替代 NapCat 的 CMD 黑框）===")
 nb = app.nb
@@ -741,30 +734,37 @@ with patch("msgx.gui.prefs_mod.save") as _save:
 app.txt_summary_prompt.delete("1.0", "end")
 app.txt_summary_prompt.insert("1.0", "尚未保存的内容")
 app.v_summary_chars.set("9000")
+_start = (date.today() - timedelta(days=3)).isoformat()
+_end = (date.today() - timedelta(days=1)).isoformat()
+app.v_summary_start.set(_start)
+app.v_summary_end.set(_end)
 with patch("msgx.gui.threading.Thread") as _thread:
-    app.summary_now("range", 72)
-    app.summary_now("range", 72)
+    app.summary_by_date()
+    app.summary_by_date()
     check("点击立即标记忙碌并阻止重复请求", app._summary_busy and _thread.call_count == 1)
-    check("生成期间唯一入口禁用", app.btn_summary.instate(["disabled"]) and not hasattr(app, "btn_summary_range"))
-    check("无需等 API 即可看到开始日志", "开始生成最近 3 天摘要" in app.log.get("1.0", "end"))
-    check("日志采用已保存目标字数", "目标约 4200 字" in app.v_summary.get())
+    check("生成期间禁用摘要按钮", app.btn_summary.instate(["disabled"]))
+    check("无需等 API 即可看到开始日志", f"开始生成{_start} 至 {_end}摘要" in app.log.get("1.0", "end"))
+    check("多日归纳目标长于已保存单日字数", "目标约 5700 字" in app.v_summary.get())
     with patch("msgx.gui.urllib.request.build_opener") as _opener:
         _opener.return_value.open.return_value.__enter__.return_value.read.return_value = b'{"created": []}'
         _thread.call_args.kwargs["target"]()
         _request = _opener.return_value.open.call_args.args[0]
         _payload = json.loads(_request.data.decode("utf-8"))
         check("手动请求携带已保存提示词和字数，忽略未保存编辑", _payload == {
-            "prompt": "请按主题总结到 {{目标字数}} 字", "target_chars": 4200})
-        check("时间范围与提示词一并提交", "kind=range&hours=72" in _request.full_url
+            "prompt": "请按主题总结到 {{目标字数}} 字", "target_chars": 5700,
+            "start_date": _start, "end_date": _end, "force": False})
+        check("选定日期与提示词一并提交", "kind=by_date" in _request.full_url
               and _request.get_header("Content-type") == "application/json")
     app._apply_health({"summary_progress": {"state": "running", "message": "正在总结第 2/6 块"}})
     check("阶段进度和耗时可见", "第 2/6 块" in app.v_summary.get() and "秒" in app.v_summary.get())
-    app._summary_finished({"error": "模型输出未完成"})
+    with patch.object(app, "refresh_summary_days"):
+        app._summary_finished({"error": "模型输出未完成"})
     check("失败恢复按钮并明确原因", not app._summary_busy and app.btn_summary.instate(["!disabled"])
           and "输出未完成" in app.v_summary.get())
     _full_text = "# 本期讨论总览\n\n**工具进展**\n\n" + "完整保留的内容。" * 400 + "\n\n**后续事项**\n\n全文最后一句。"
     _report_path = str((PROJ / "data" / "reports" / "gui-test-full.html").resolve())
-    app._summary_finished({"created": [{"path": _report_path, "content": _full_text, "chars": len(_full_text)}]})
+    with patch.object(app, "refresh_summary_days"):
+        app._summary_finished({"created": [{"path": _report_path, "content": _full_text, "chars": len(_full_text)}]})
     check("生成后自动展示全文及末尾内容", app.nb.select() == str(app.report_tab)
           and "全文最后一句。" in app.report_text.get("1.0", "end") and len(app.report_text.get("1.0", "end")) > 3000)
     check("总标题和主题小标题使用加粗样式", bool(app.report_text.tag_ranges("title")) and bool(app.report_text.tag_ranges("heading")))
@@ -788,6 +788,46 @@ with patch("msgx.gui.threading.Thread") as _thread:
     check("切换记录后不混入过期来源响应", "过期响应" not in app.usage_detail.get("1.0", "end"))
     app.usage_table.selection_remove("7")
 app.proc = _saved_proc
+
+print("\n=== 按日期生成与日报状态 ===")
+_old_start, _old_end = app.v_summary_start.get(), app.v_summary_end.get()
+app.v_summary_start.set("2026-02-30")
+app.v_summary_end.set(yesterday)
+with patch("msgx.gui.threading.Thread") as _thread:
+    app.summary_by_date()
+    check("无效日历日期在界面拒绝", "不是有效的日历日期" in app.v_summary.get() and not _thread.called)
+app.v_summary_start.set(yesterday)
+app.v_summary_end.set((date.today() + timedelta(days=1)).isoformat())
+with patch("msgx.gui.threading.Thread") as _thread:
+    app.summary_by_date()
+    check("未来日期在界面拒绝", "不能晚于今天" in app.v_summary.get() and not _thread.called)
+
+app.v_summary_end.set(yesterday)
+app._apply_summary_days(yesterday, yesterday, {"days": [{"date": yesterday, "status": "done", "chars": 2800}],
+                                               "latest_daily": {"date": yesterday, "status": "done", "chars": 2800}})
+check("已完成日报可查看并显示明确重新生成入口", app.btn_summary.cget("text") == "查看摘要"
+      and app.btn_regenerate.winfo_manager() == "pack" and "已完成" in app.v_summary_days.get())
+check("最近日报状态显示日期和字数", yesterday in app.v_daily_latest.get() and "2800" in app.v_daily_latest.get())
+with patch.object(app, "summary_now") as _summary:
+    app.btn_regenerate.invoke()
+    check("重新生成明确传 force", _summary.call_args.kwargs["force"] is True)
+app.v_summary_start.set(_start)
+app.v_summary_end.set(_end)
+app._apply_summary_days(_start, _end, {"days": [{"date": _start, "status": "missing"},
+                                                {"date": (date.fromisoformat(_start) + timedelta(days=1)).isoformat(),
+                                                 "status": "done"},
+                                                {"date": _end, "status": "done"}]})
+check("多日范围列出缺失日报", "缺少 1 天" in app.v_summary_days.get()
+      and _start in app.v_summary_days.get() and app.btn_regenerate.winfo_manager() == "")
+app.v_summary_start.set(date.today().isoformat())
+app.v_summary_end.set(date.today().isoformat())
+app._apply_summary_days(date.today().isoformat(), date.today().isoformat(),
+                        {"days": [{"date": date.today().isoformat(), "status": "partial"}]})
+check("今天的手动日报明确为临时摘要", "临时摘要" in app.v_summary_days.get()
+      and app.btn_summary.cget("text") == "生成摘要")
+app.v_summary_start.set(_old_start)
+app.v_summary_end.set(_old_end)
+
 app.reset_summary_prompt()
 from msgx.summarize import DEFAULT_DIGEST_PROMPT  # noqa: E402
 check("恢复默认仅修改编辑框，尚需保存", app.txt_summary_prompt.get("1.0", "end").strip() == DEFAULT_DIGEST_PROMPT.strip()
@@ -874,9 +914,11 @@ check("重连后清除登录故障说明", "已连接" in app.v_peer.get() and n
 print("\n=== 0.6.4 自动登录、合并入口与消费排序 ===")
 check("登录入口改为自动登录", app.btn_login.cget("text") == "自动登录")
 with patch.object(app, "summary_now") as _summary:
-    app.v_range.set("最近 3 天")
+    app.v_summary_start.set(_start)
+    app.v_summary_end.set(_end)
     app.btn_summary.invoke()
-    check("唯一生成按钮按所选范围提交", _summary.call_args.args == ("range",) and _summary.call_args.kwargs == {"hours": 72})
+    check("唯一生成按钮按选定日期提交", _summary.call_args.args == ("by_date",)
+          and _summary.call_args.kwargs == {"start_date": _start, "end_date": _end, "force": False})
 with patch("msgx.gui.threading.Thread") as _thread, patch.object(N, "running_instances", return_value={"injectors": 1}), \
         patch.object(N, "launch") as _launch, patch.object(N, "quick_login", return_value={"ok": True, "note": "自动登录成功"}) as _quick:
     app.auto_login()
