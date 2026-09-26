@@ -34,7 +34,7 @@ from . import napcat as napcat_mod
 from . import prefs as prefs_mod
 from . import api_settings, credentials, security
 from .config import ROOT, abs_path, load
-from .summarize import BEIJING, DEFAULT_DIGEST_PROMPT, DIGEST_DEFAULT_CHARS
+from .summarize import BEIJING, DEFAULT_DIGEST_PROMPT, DIGEST_DEFAULT_CHARS, summary_chars
 
 APP_TITLE = "消息萃取 msgx"
 FONT = "Microsoft YaHei UI"
@@ -89,6 +89,14 @@ class App:
         self._summary_path = ""
         self._summary_days_busy = False
         self._summary_days_checked = 0.0
+        self._report_history_busy = False
+        self._report_history_checked = 0.0
+        self._report_history_seq = 0
+        self._report_pending_path = ""
+        self._report_items: dict[str, dict] = {}
+        self._report_content = ""
+        self._report_identity = None
+        self._report_outline: list[str] = []
         self._usage_busy = False
         self._billing_busy = False
         self._usage_items = {}
@@ -128,6 +136,7 @@ class App:
         self._build()
         self._load_into_widgets()
         self.refresh_groups()
+        self.root.after(0, self.refresh_report_history)
         self.root.after(100, self._drain)
         self.root.after(800, self._tick_health)
         self.root.after(1200, self._tick_realtime)
@@ -1214,15 +1223,233 @@ class App:
     def _build_report_tab(self, nb: ttk.Notebook) -> None:
         self.report_tab = ttk.Frame(nb, padding=12)
         nb.add(self.report_tab, text="摘要全文")
+        panes = ttk.Panedwindow(self.report_tab, orient="horizontal")
+        panes.pack(fill="both", expand=True)
+        history = ttk.Frame(panes, width=260)
+        history.pack_propagate(False)
+        reader = ttk.Frame(panes, padding=(14, 0, 0, 0))
+        panes.add(history, weight=1)
+        panes.add(reader, weight=3)
+        bar = ttk.Frame(history)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="最近摘要", font=(FONT, 11, "bold")).pack(side="left")
+        self.btn_report_refresh = ttk.Button(bar, text="刷新", command=self.refresh_report_history)
+        self.btn_report_refresh.pack(side="right")
+        self.v_report_history = tk.StringVar(value="正在读取本地摘要…")
+        ttk.Label(history, textvariable=self.v_report_history, style="Hint.TLabel").pack(anchor="w", pady=(3, 6))
+        rows = ttk.Frame(history)
+        rows.pack(fill="both", expand=True)
+        self.report_history = ttk.Treeview(rows, show="tree", selectmode="browse")
+        self.report_history.column("#0", width=460, stretch=False)
+        self.report_history.tag_configure("metadata", foreground=MUTED)
+        scroll = ttk.Scrollbar(rows, orient="vertical", command=self.report_history.yview)
+        horizontal = ttk.Scrollbar(rows, orient="horizontal", command=self.report_history.xview)
+        self.report_history.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
+        self.report_history.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        rows.rowconfigure(0, weight=1)
+        rows.columnconfigure(0, weight=1)
+        self.report_history.bind("<<TreeviewSelect>>", self._report_selected)
+        self.v_report_meta = tk.StringVar(value="选择左侧摘要即可阅读；查看不调用 API。")
+        self.report_meta_label = ttk.Label(reader, textvariable=self.v_report_meta, wraplength=620)
+        self.report_meta_label.pack(fill="x")
         self.v_report_path = tk.StringVar(value="生成完成后在这里展示全文及完整文件路径。")
-        ttk.Label(self.report_tab, textvariable=self.v_report_path, wraplength=880).pack(fill="x")
-        self.btn_open_report = ttk.Button(self.report_tab, text="打开完整 HTML 文件", state="disabled",
+        self.report_path_label = ttk.Label(reader, textvariable=self.v_report_path, style="Hint.TLabel", wraplength=620)
+        self.report_path_label.pack(fill="x", pady=(3, 6))
+        def wrap_labels(event) -> None:
+            for label in (self.report_meta_label, self.report_path_label):
+                label.configure(wraplength=max(180, event.width - 18))
+        reader.bind("<Configure>", wrap_labels)
+        actions = ttk.Frame(reader)
+        actions.pack(fill="x")
+        self.btn_open_report = ttk.Button(actions, text="打开完整 HTML 文件", state="disabled",
                                          command=lambda: open_path(Path(self._summary_path)))
-        self.btn_open_report.pack(anchor="w", pady=6)
-        self.report_text = ScrolledText(self.report_tab, wrap="word", font=(FONT, 11), state="disabled")
-        self.report_text.tag_configure("title", font=(FONT, 17, "bold"), spacing3=16)
-        self.report_text.tag_configure("heading", font=(FONT, 12, "bold"), spacing1=10, spacing3=6)
+        self.btn_open_report.pack(side="left")
+        self.btn_copy_report = ttk.Button(actions, text="复制全文", command=self._copy_report, state="disabled")
+        self.btn_copy_report.pack(side="left", padx=6)
+        outline = ttk.Frame(history)
+        outline.pack(fill="x", pady=(10, 0))
+        ttk.Label(outline, text="主题目录 · 点击跳转", style="Hint.TLabel").pack(anchor="w")
+        outline_rows = ttk.Frame(outline)
+        outline_rows.pack(fill="x", pady=(5, 0))
+        self.report_outline = tk.Listbox(outline_rows, height=5, font=(FONT, 10), exportselection=False,
+                                         relief="flat", background="#f0f5fa", selectbackground="#d6e8fa")
+        self.report_outline.grid(row=0, column=0, sticky="ew")
+        outline_vertical = ttk.Scrollbar(outline_rows, orient="vertical", command=self.report_outline.yview)
+        self.report_outline.configure(yscrollcommand=outline_vertical.set)
+        outline_vertical.grid(row=0, column=1, sticky="ns")
+        outline_rows.columnconfigure(0, weight=1)
+        outline_scroll = ttk.Scrollbar(outline, orient="horizontal", command=self.report_outline.xview)
+        self.report_outline.configure(xscrollcommand=outline_scroll.set)
+        outline_scroll.pack(fill="x")
+        self.report_outline.bind("<<ListboxSelect>>", self._report_jump)
+        self.report_text = ScrolledText(reader, wrap="word", font=(FONT, 12), state="disabled",
+                                       background="#ffffff", foreground="#253342", relief="flat",
+                                       padx=18, pady=16, spacing1=4, spacing3=8, spacing2=5)
+        self.report_text.tag_configure("title", font=(FONT, 18, "bold"), spacing3=20)
+        self.report_text.tag_configure("heading", font=(FONT, 13, "bold"), foreground="#164b78",
+                                       spacing1=16, spacing3=10)
+        self.report_text.tag_configure("bold", font=(FONT, 12, "bold"))
+        for i, color in enumerate(("#f2f6fa", "#f7f5ef")):
+            self.report_text.tag_configure(f"card{i}", background=color, lmargin1=12, lmargin2=12, rmargin=12)
         self.report_text.pack(fill="both", expand=True)
+        self.nb.bind("<<NotebookTabChanged>>", self._report_tab_changed, add="+")
+
+    def _report_tab_changed(self, _event=None) -> None:
+        if self.nb.select() == str(self.report_tab) and time.time() - self._report_history_checked >= 30:
+            self.refresh_report_history()
+
+    def refresh_report_history(self, preferred_path: str = "") -> None:
+        if self._report_history_busy:
+            if preferred_path:
+                self._report_pending_path = preferred_path
+            return
+        self._report_history_busy = True
+        self._report_history_seq += 1
+        seq = self._report_history_seq
+        self.btn_report_refresh.configure(state="disabled")
+        self.v_report_history.set("正在读取本地摘要…")
+        db = abs_path(self.cfg, "db_path")
+
+        def work() -> None:
+            items, error = [], ""
+            try:
+                if db.exists():
+                    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+                    try:
+                        conn.row_factory = sqlite3.Row
+                        items = [dict(row) for row in conn.execute(
+                            "SELECT id,window_start,window_end,kind,content,report_path,msg_count,created_at"
+                            " FROM summaries ORDER BY created_at DESC,id DESC LIMIT 50")]
+                    finally:
+                        conn.close()
+            except (OSError, sqlite3.Error) as exc:
+                error = security.redact(str(exc))
+            self.events.put(("report_history", (seq, items, error, preferred_path)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_report_history(self, seq: int, items: list[dict], error: str, preferred_path: str = "") -> None:
+        if seq != self._report_history_seq:
+            return
+        self._report_history_busy = False
+        self._report_history_checked = time.time()
+        self.btn_report_refresh.configure(state="normal")
+        if error:
+            self.v_report_history.set(f"读取失败：{error}")
+            if self._report_pending_path:
+                pending, self._report_pending_path = self._report_pending_path, ""
+                self.refresh_report_history(pending)
+            return
+        selected = self.report_history.selection()
+        current = selected[0].removeprefix("detail-") if selected else ""
+        shown_path = self._summary_path
+        self._report_items = {str(item["id"]): item for item in items}
+        self.report_history.delete(*self.report_history.get_children())
+        chosen = ""
+        for iid, item in self._report_items.items():
+            content = item.get("content") or ""
+            title = next((re.sub(r"^#{1,6}\s*|\*\*", "", line).strip()
+                          for line in content.splitlines() if line.strip()), "无标题摘要")
+            start = datetime.fromtimestamp(item["window_start"], BEIJING)
+            end = datetime.fromtimestamp(item["window_end"], BEIJING)
+            kind = {"daily": "日报", "daily_partial": "当天未结束", "multi": "多日归纳",
+                    "multi_partial": "多日归纳 · 含当天", "digest": "全量纪要", "full": "旧版全量摘要",
+                    "periodic": "旧版摘要", "hotspot": "旧版热点"}.get(item["kind"], item["kind"])
+            self.report_history.insert("", "end", iid=iid, text=title, open=True)
+            self.report_history.insert(iid, "end", iid=f"detail-{iid}", tags=("metadata",),
+                                       text=f"{kind} · {summary_chars(content)} 字 · {start:%Y-%m-%d %H:%M} — {end:%Y-%m-%d %H:%M}")
+            if preferred_path and shown_path == str(Path(preferred_path).resolve()) and item.get("report_path") == preferred_path:
+                chosen = iid
+        chosen = chosen or (current if current in self._report_items else "")
+        if not chosen and shown_path:
+            chosen = next((iid for iid, item in self._report_items.items()
+                           if item.get("report_path") == shown_path), "")
+        if not chosen and not self._report_content and items:
+            chosen = str(items[0]["id"])
+        if chosen:
+            self.report_history.selection_set(chosen)
+            self.report_history.see(chosen)
+            self._show_report(self._report_items[chosen])
+        self.v_report_history.set(f"最近 {len(items)} 份 · 本地读取" if items else "暂无摘要；生成后会显示在这里")
+        if self._report_pending_path:
+            pending, self._report_pending_path = self._report_pending_path, ""
+            self.refresh_report_history(pending)
+
+    def _report_selected(self, _event=None) -> None:
+        selected = self.report_history.selection()
+        iid = selected[0].removeprefix("detail-") if selected else ""
+        if iid in self._report_items:
+            self._show_report(self._report_items[iid])
+
+    def _show_report(self, item: dict) -> None:
+        path = item.get("report_path") or item.get("path") or ""
+        identity = (item.get("id"), path)
+        content = item.get("content") or ""
+        unchanged = identity == self._report_identity and content == self._report_content
+        selected = self.report_history.selection()
+        selected_id = selected[0].removeprefix("detail-") if selected else ""
+        selected_item = self._report_items.get(selected_id)
+        if selected_item and selected_item.get("id") != item.get("id") and selected_item.get("report_path") != path:
+            self.report_history.selection_remove(*selected)
+        self._report_identity = identity
+        self._report_content = content
+        self._summary_path = str(Path(path).resolve()) if path else ""
+        self.v_report_path.set(self._summary_path or "未保存 HTML 文件；数据库全文仍可阅读。")
+        self.btn_open_report.configure(state="normal" if self._summary_path and Path(self._summary_path).is_file() else "disabled")
+        self.btn_copy_report.configure(state="normal" if self._report_content else "disabled")
+        dates = ""
+        if item.get("window_start") is not None and item.get("window_end") is not None:
+            start = datetime.fromtimestamp(item["window_start"], BEIJING)
+            end = datetime.fromtimestamp(item["window_end"], BEIJING)
+            dates = f"{start:%Y-%m-%d %H:%M} — {end:%Y-%m-%d %H:%M} · "
+        self.v_report_meta.set(f"{dates}{summary_chars(self._report_content)} 字 · 完整正文")
+        if unchanged:
+            return
+        self.report_outline.delete(0, "end")
+        self._report_outline = []
+        self.report_text.configure(state="normal")
+        self.report_text.delete("1.0", "end")
+        card_start, card = "", 0
+        for line in self._report_content.splitlines():
+            main = re.match(r"^#\s+(.+)$", line)
+            heading = re.match(r"^#{2,6}\s+(.+)$", line)
+            if heading is None:
+                heading = re.match(r"^(?:(?:[一二三四五六七八九十百]+、|\d+[.、)]\s*)\s*)?\*\*(.+?)\*\*[:：]?$", line.strip())
+            if main:
+                self.report_text.insert("end", main.group(1) + "\n", "title")
+            elif heading:
+                if card_start:
+                    self.report_text.tag_add(f"card{card % 2}", card_start, "end-1c")
+                    card += 1
+                    self.report_text.insert("end", "\n")
+                card_start = self.report_text.index("end-1c")
+                title = (heading.group(1) if line.startswith("#") else line.strip()).replace("**", "")
+                self._report_outline.append(card_start)
+                self.report_outline.insert("end", title)
+                self.report_text.insert("end", title + "\n", "heading")
+            else:
+                for part in re.split(r"(\*\*.+?\*\*)", line):
+                    self.report_text.insert("end", part[2:-2] if part.startswith("**") else part,
+                                            "bold" if part.startswith("**") else "")
+                self.report_text.insert("end", "\n")
+        if card_start:
+            self.report_text.tag_add(f"card{card % 2}", card_start, "end-1c")
+        if not self._report_outline:
+            self.report_outline.insert("end", "正文未设置主题小标题")
+        self.report_text.configure(state="disabled")
+        self.report_text.yview_moveto(0)
+
+    def _report_jump(self, _event=None) -> None:
+        selected = self.report_outline.curselection()
+        if selected and selected[0] < len(self._report_outline):
+            self.report_text.yview(self._report_outline[selected[0]])
+
+    def _copy_report(self) -> None:
+        if self._report_content:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self._report_content)
+            self.status.set("已复制完整摘要")
 
     def _summary_finished(self, data: dict) -> None:
         self._summary_busy = False
@@ -1235,20 +1462,8 @@ class App:
             note = "所选日期暂无可生成的摘要"
         else:
             item = data["created"][0]
-            self._summary_path = str(Path(item["path"]).resolve())
-            self.v_report_path.set(self._summary_path)
-            self.btn_open_report.configure(state="normal")
-            self.report_text.configure(state="normal")
-            self.report_text.delete("1.0", "end")
-            for line in item.get("content", "").splitlines():
-                if line.startswith("# "):
-                    self.report_text.insert("end", line[2:] + "\n", "title")
-                else:
-                    for part in re.split(r"(\*\*.+?\*\*)", line):
-                        self.report_text.insert("end", part[2:-2] if part.startswith("**") else part,
-                                                "heading" if part.startswith("**") else "")
-                    self.report_text.insert("end", "\n")
-            self.report_text.configure(state="disabled")
+            self._show_report(item)
+            self.refresh_report_history(preferred_path=item.get("path", ""))
             self.nb.select(self.report_tab)
             note = f"摘要已生成（{item.get('chars', 0)} 字），完整文件：{self._summary_path}"
         self.v_summary.set(note)
@@ -2075,6 +2290,8 @@ class App:
             self.v_daily_latest.set("最近日报：启动服务后查看")
             self.v_summary_days.set("所选日期：启动服务后查看")
         self.root.after(2000, self._tick_health)
+        if self.nb.select() == str(self.report_tab) and time.time() - self._report_history_checked >= 30:
+            self.refresh_report_history()
         # 协议端日志是**快照**，不像服务日志那样有流 —— 显示着它就顺手刷新一下。
         # 读的是本地文件尾部，2 秒一次的开销可以忽略；不显示时一个字节都不读。
         if self.v_log_src.get() == "协议端日志":
@@ -2165,6 +2382,8 @@ class App:
                 self.status.set(result.get("error") or "图片操作失败")
         elif kind == "summary_done":
             self._summary_finished(value)
+        elif kind == "report_history":
+            self._render_report_history(*value)
         elif kind == "summary_days":
             start, end, data = value
             self._apply_summary_days(start, end, data)

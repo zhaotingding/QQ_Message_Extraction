@@ -12,7 +12,10 @@ from __future__ import annotations
 import sys
 import json
 import time
+import sqlite3
+import tempfile
 from datetime import date, timedelta
+from contextlib import closing
 from pathlib import Path
 
 PROJ = Path(__file__).resolve().parent.parent
@@ -47,6 +50,8 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 print("=== 构建界面 ===")
 root = tk.Tk()
 app = App(root)
+_reader_temp = tempfile.TemporaryDirectory(prefix="msgx-reader-")
+app.cfg["app"]["db_path"] = str(Path(_reader_temp.name) / "history.db")
 app.prefs["qq_account"] = "123"
 app.v_qq_account.set("123")
 root.update()  # 强制完成一次几何计算，布局错误会在这时抛出
@@ -762,7 +767,8 @@ with patch("msgx.gui.threading.Thread") as _thread:
     check("失败恢复按钮并明确原因", not app._summary_busy and app.btn_summary.instate(["!disabled"])
           and "输出未完成" in app.v_summary.get())
     _full_text = "# 本期讨论总览\n\n**工具进展**\n\n" + "完整保留的内容。" * 400 + "\n\n**后续事项**\n\n全文最后一句。"
-    _report_path = str((PROJ / "data" / "reports" / "gui-test-full.html").resolve())
+    _report_path = str((Path(_reader_temp.name) / "gui-test-full.html").resolve())
+    Path(_report_path).write_text("<html>本地假摘要</html>", encoding="utf-8")
     with patch.object(app, "refresh_summary_days"):
         app._summary_finished({"created": [{"path": _report_path, "content": _full_text, "chars": len(_full_text)}]})
     check("生成后自动展示全文及末尾内容", app.nb.select() == str(app.report_tab)
@@ -1114,8 +1120,101 @@ with patch("msgx.gui.credentials.delete") as _delete:
 app._apply_health({"llm_available": True, "vision_enabled": True, "api_provider": "DeepSeek", "api_model": "test-model"})
 check("运行状态展示服务实际使用的平台模型", "DeepSeek / test-model" in app.v_llm.get())
 
+print("\n=== 本地历史摘要与主题阅读（v0.7.7）===")
+_history_db = Path(app.cfg["app"]["db_path"])
+_first_text = "# 假日报标题\n\n## 第一主题\n\n" + "第一主题完整内容。" * 80 + "\n\n**第二主题**\n\n第二主题最后一句。"
+_older_text = "旧版完整段落，没有 Markdown 标题。\n第二段内容保留。"
+with closing(sqlite3.connect(_history_db)) as _conn:
+    _conn.execute("CREATE TABLE summaries(id INTEGER PRIMARY KEY,window_start INTEGER,window_end INTEGER,"
+                  "kind TEXT,content TEXT,report_path TEXT,msg_count INTEGER,created_at INTEGER)")
+    _conn.executemany("INSERT INTO summaries VALUES(?,?,?,?,?,?,?,?)", [
+        (1, 1790179200, 1790265600, "periodic", _older_text, "", 50, 100),
+        (2, 1790265600, 1790352000, "daily", _first_text, str(Path(_reader_temp.name) / "missing.html"), 120, 200),
+    ])
+    _conn.commit()
+_before_db = _history_db.read_bytes()
+# 清空先前假生成状态，仅在本地 fixture 验证启动默认最新。
+app._report_content = ""
+app._report_identity = None
+app._summary_path = ""
+app.report_history.selection_remove(*app.report_history.selection())
+app._report_history_busy = False
+with patch("msgx.gui.threading.Thread") as _thread, patch("msgx.gui.urllib.request.build_opener") as _network:
+    with patch("msgx.gui.sqlite3.connect", wraps=sqlite3.connect) as _connect:
+        app.refresh_report_history()
+        _thread.call_args.kwargs["target"]()
+        _read_call = _connect.call_args
+        while not app.events.empty():
+            _kind, _value = app.events.get_nowait()
+            if _kind == "report_history":
+                app._dispatch_event(_kind, _value)
+    check("摘要数据库连接明确只读", "?mode=ro" in _read_call.args[0] and _read_call.kwargs["uri"])
+    check("启动默认最近生成的摘要", app.report_history.selection() == ("2",)
+          and "假日报标题" in app.report_text.get("1.0", "end"))
+    check("历史列表显示标题、完整日期、类型和字数", app.report_history.item("2", "text") == "假日报标题"
+          and "2026-09-25 00:00 — 2026-09-26 00:00" in app.report_history.item("detail-2", "text")
+          and "日报" in app.report_history.item("detail-2", "text") and "字" in app.report_history.item("detail-2", "text"))
+    check("HTML缺失时数据库正文可读", "第二主题最后一句。" in app.report_text.get("1.0", "end")
+          and app.btn_open_report.instate(["disabled"]))
+    check("标题识别成目录及淡色主题块", list(app.report_outline.get(0, "end")) == ["第一主题", "第二主题"]
+          and bool(app.report_text.tag_ranges("card0")) and bool(app.report_text.tag_ranges("card1")))
+    check("目录有纵向滚动且类型字数优先显示", bool(app.report_outline.cget("yscrollcommand"))
+          and app.report_history.item("detail-2", "text").startswith("日报 · "))
+    root.update_idletasks()
+    app.report_outline.selection_set(1)
+    app._report_jump()
+    check("主题目录可定位对应正文", app.report_text.yview()[0] > 0 and len(app._report_outline) == 2)
+    _scroll = app.report_text.yview()
+    app._render_report_history(app._report_history_seq, list(app._report_items.values()), "")
+    check("自动刷新同一摘要保持阅读位置及目录选择", app.report_text.yview() == _scroll
+          and app.report_outline.curselection() == (1,))
+    _saved_item = dict(app._report_items["2"])
+    app._show_report({"id": 2, "path": _saved_item["report_path"], "content": _first_text})
+    app.report_outline.selection_set(1)
+    app._report_jump()
+    _same_scroll = app.report_text.yview()
+    app._show_report(_saved_item)
+    check("同一生成结果从历史补全日期且保持阅读位置", "2026-09-25 00:00 — 2026-09-26 00:00" in app.v_report_meta.get()
+          and app.report_text.yview() == _same_scroll)
+    Path(_saved_item["report_path"]).write_text("<p>fixture report</p>", encoding="utf-8")
+    app._show_report(_saved_item)
+    check("同一摘要文件恢复后更新打开按钮且不重排正文", app.btn_open_report.instate(["!disabled"])
+          and app.report_text.yview() == _same_scroll)
+    with patch.object(root, "clipboard_clear"), patch.object(root, "clipboard_append") as _copy:
+        app._copy_report()
+        check("复制保留全部原始摘要", _copy.call_args.args == (_first_text,))
+    app.report_history.selection_set("detail-1")
+    app._report_selected()
+    check("点击历史元信息也能读取旧纯正文", _older_text in app.report_text.get("1.0", "end")
+          and not app._report_outline and not app.report_text.tag_ranges("card0"))
+    app._render_report_history(app._report_history_seq, list(app._report_items.values()), "")
+    check("刷新历史列表保留所选旧摘要", app.report_history.selection() == ("1",)
+          and _older_text in app.report_text.get("1.0", "end"))
+    _displayed = app.report_text.get("1.0", "end")
+    app._render_report_history(app._report_history_seq - 1, [], "")
+    check("过期历史响应不覆盖当前摘要", app.report_text.get("1.0", "end") == _displayed
+          and bool(app.report_history.get_children()))
+    app._render_report_history(app._report_history_seq, [], "测试读取失败")
+    check("历史读取失败保留已展示正文", app.report_text.get("1.0", "end") == _displayed
+          and "读取失败" in app.v_report_history.get())
+    _old_items = list(app._report_items.values())
+    app._report_history_busy = True
+    _new_path = str(Path(_reader_temp.name) / "new.html")
+    app._show_report({"path": _new_path, "content": "# 刚生成的假摘要\n\n## 新主题\n新的内容。"})
+    app.refresh_report_history(preferred_path=_new_path)
+    app._render_report_history(app._report_history_seq, _old_items, "")
+    check("新生成遇到旧列表读取不会被覆盖并补刷新", "刚生成的假摘要" in app.report_text.get("1.0", "end")
+          and app._report_history_busy and not app._report_pending_path)
+    check("查看、切换、目录和复制不请求网络", not _network.called)
+check("本地查看不改写摘要数据库", _history_db.read_bytes() == _before_db)
+root.geometry("820x560")
+root.update_idletasks()
+check("最小窗口文件路径按正文宽度换行", int(app.report_path_label.cget("wraplength"))
+      <= app.report_path_label.master.winfo_width() - 14)
+
 root.update()
 root.destroy()
+_reader_temp.cleanup()
 
 print()
 if fails:
