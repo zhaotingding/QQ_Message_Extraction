@@ -4,7 +4,7 @@ import json
 import sqlite3
 import time
 from contextlib import closing
-from datetime import date, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import Msg
@@ -191,7 +191,10 @@ class Store:
             ("usage", USAGE_MIGRATIONS),
             ("messages", MESSAGE_MIGRATIONS),
             ("groups", GROUP_MIGRATIONS),
-            ("api_calls", (("provider", "TEXT NOT NULL DEFAULT ''"),)),
+            ("api_calls", (("provider", "TEXT NOT NULL DEFAULT ''"),
+                           ("cost_usd", "REAL"), ("service_tier", "TEXT NOT NULL DEFAULT ''"),
+                           ("request_id", "TEXT NOT NULL DEFAULT ''"), ("pricing", "TEXT NOT NULL DEFAULT ''"),
+                           ("cache_write_tokens", "INTEGER"))),
             ("summaries", (("source_sig", "TEXT NOT NULL DEFAULT ''"),)),
         ):
             cols = {c[1] for c in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -797,7 +800,9 @@ class Store:
     # ---------- usage ----------
 
     def record_api_call(self, *, ts: float, purpose: str, source_ids: list[int], model: str,
-                        usage: dict | None, cost_cny: float | None, status: str, provider: str = "") -> None:
+                        usage: dict | None, cost_cny: float | None, status: str, provider: str = "",
+                        cost_usd: float | None = None, service_tier: str = "",
+                        request_id: str = "", pricing: dict | None = None) -> None:
         ids = list(dict.fromkeys(source_ids))
         source_type = ("汇总报告" if purpose in ("日报合并", "摘要合并", "摘要成稿") else "系统检查") if not ids else "多条消息汇总"
         if len(ids) == 1:
@@ -807,21 +812,24 @@ class Store:
         incoming = int(usage.get("prompt_tokens", 0)) if usage is not None else None
         outgoing = int(usage.get("completion_tokens", 0)) if usage is not None else None
         hit = int(usage.get("prompt_cache_hit_tokens", 0)) if usage is not None else None
+        written = int(usage["prompt_cache_write_tokens"]) if usage is not None and usage.get("prompt_cache_write_tokens") is not None else None
         self.conn.execute(
-            "INSERT INTO api_calls(ts,purpose,source_ids,source_type,model,in_tokens,out_tokens,cache_hit_tokens,cost_cny,status,provider)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (ts, purpose, json.dumps(ids), source_type, model, incoming, outgoing, hit, cost_cny, status, provider),
+            "INSERT INTO api_calls(ts,purpose,source_ids,source_type,model,in_tokens,out_tokens,cache_hit_tokens,cost_cny,status,provider,cost_usd,service_tier,request_id,pricing,cache_write_tokens)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ts, purpose, json.dumps(ids), source_type, model, incoming, outgoing, hit, cost_cny, status, provider,
+             cost_usd, service_tier, request_id, json.dumps(pricing, ensure_ascii=False) if pricing else "", written),
         )
         if usage is not None:
-            self.add_usage(time.strftime("%Y-%m-%d", time.localtime(ts)), incoming, outgoing,
-                           cost_cny, hit, max(0, incoming - hit))
+            self.add_usage(datetime.fromtimestamp(ts, timezone(timedelta(hours=8))).date().isoformat(), incoming, outgoing,
+                           cost_cny or 0.0, hit, max(0, incoming - hit))
         else:
             self.conn.commit()  # 无返回用量时保留未知值，不把失败伪装成免费
 
     def api_usage_details(self, limit: int = 500, *, active_only: bool = False) -> dict:
-        today = date.today()
-        start = time.mktime(today.timetuple())
-        end = time.mktime((today + timedelta(days=1)).timetuple())
+        beijing = timezone(timedelta(hours=8))
+        today = datetime.now(beijing).date()
+        start = datetime.combine(today, datetime.min.time(), beijing).timestamp()
+        end = start + 86400
         # 仅显示现用流程；旧账不删除、不改写。超上下文步骤仍归入摘要总结。
         purpose = "CASE WHEN purpose IN ('摘要分块','超上下文合并') THEN '摘要总结' ELSE purpose END"
         where = "WHERE purpose IN ('摘要总结','图片理解','摘要分块','超上下文合并')" if active_only else ""
@@ -836,12 +844,22 @@ class Store:
         grouped = [dict(r) for r in self.conn.execute(
             f"SELECT {purpose if active_only else 'purpose'} AS purpose,source_type,provider,model,COUNT(*) AS calls,SUM(in_tokens) AS in_tokens,"
             " SUM(out_tokens) AS out_tokens,COALESCE(SUM(cost_cny),0) AS cost_cny,"
+            " SUM(cost_usd) AS cost_usd,SUM(cost_usd IS NULL) AS unknown_usd_calls,"
+            " SUM(cache_write_tokens) AS cache_write_tokens,SUM(cache_write_tokens IS NULL) AS unknown_cache_write_calls,"
             " COALESCE(SUM(CASE WHEN ts>=? AND ts<? THEN cost_cny END),0) AS today_cost_cny,"
             " SUM(CASE WHEN ts>=? AND ts<? AND cost_cny IS NULL THEN 1 ELSE 0 END) AS today_unknown_calls,"
             f" SUM(cost_cny IS NULL) AS unknown_calls FROM api_calls {where} GROUP BY 1,2,3,4 ORDER BY cost_cny DESC",
             (start, end, start, end))]
         known = float(self.conn.execute("SELECT COALESCE(SUM(cost_cny),0) FROM api_calls").fetchone()[0])
+        utc_days = [dict(r) for r in self.conn.execute(
+            "SELECT strftime('%Y-%m-%d',ts,'unixepoch') AS day,COUNT(*) AS calls,"
+            " SUM(cost_cny) AS cost_cny,SUM(cost_usd) AS cost_usd,"
+            " SUM(cost_cny IS NULL) AS unknown_calls,SUM(cost_usd IS NULL) AS unknown_usd_calls"
+            " FROM api_calls WHERE provider='OpenAI 官方' OR"
+            " (json_valid(pricing) AND json_extract(pricing,'$.base_url')='https://api.openai.com/v1')"
+            " GROUP BY 1 ORDER BY day DESC LIMIT 31")]
         return {"items": items, "groups": grouped, "recorded_cost_cny": known,
+                "openai_utc_days": utc_days, "today_timezone": "Asia/Shanghai",
                 "visible_cost_cny": sum(r["cost_cny"] for r in grouped),
                 "today_cost_cny": sum(r["today_cost_cny"] for r in grouped),
                 "historical_unattributed_cny": max(0.0, self.cost_totals()["cost_cny"] - known)}

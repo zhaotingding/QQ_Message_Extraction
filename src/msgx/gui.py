@@ -90,6 +90,7 @@ class App:
         self._summary_days_busy = False
         self._summary_days_checked = 0.0
         self._usage_busy = False
+        self._billing_busy = False
         self._usage_items = {}
         self._usage_sort = {}
         self._usage_numbers = {}
@@ -252,13 +253,16 @@ class App:
 
         buttons2 = ttk.Frame(tab)
         buttons2.pack(fill="x")
-        # 自动登录复用已有进程；强制重启保留为独立的手动恢复入口。
+        # 强制重启和重新扫码保留为手动恢复入口。
+        self.btn_restart = None
         if self.napcat_script() or self.napcat_dir():
             if napcat_mod.restart_script(self.cfg):
-                ttk.Button(buttons2, text="强制重启", command=self.restart_napcat).pack(side="right")
-            self.btn_login = ttk.Button(buttons2, text="自动登录", command=self.auto_login)
-            self.btn_login.pack(side="right")
-        ttk.Button(buttons2, text="刷新账单", command=self.refresh_billing).pack(side="right", padx=8)
+                self.btn_restart = ttk.Button(buttons2, text="强制重启", command=self.restart_napcat)
+                self.btn_restart.pack(side="right")
+        self.btn_billing = ttk.Button(buttons2, text="刷新账单", command=self.refresh_billing)
+        self.btn_billing.pack(side="right", padx=8)
+        self.v_billing_feedback = tk.StringVar(value="账单金额为本地估算")
+        ttk.Label(buttons2, textvariable=self.v_billing_feedback, wraplength=640).pack(side="left")
 
         self.v_range_desc = tk.StringVar(value=self._summary_date_desc())
         ttk.Label(tab, textvariable=self.v_range_desc, style="Hint.TLabel").pack(anchor="w", pady=(3, 0))
@@ -1067,33 +1071,41 @@ class App:
         nb.add(tab, text="消费明细")
         self.usage_tab = tab
         ttk.Button(tab, text="刷新消费明细", command=self.refresh_usage).pack(anchor="w")
-        self.v_usage = tk.StringVar(value="升级后开始逐次记录；Token 来自 API，金额按配置费率估算。")
+        self.v_usage = tk.StringVar(value="Token 来自 API；金额为本地估算。今日按北京时间，OpenAI 平台按 UTC 日期统计。")
         ttk.Label(tab, textvariable=self.v_usage, wraplength=880).pack(fill="x", pady=6)
-        self.usage_groups = ttk.Treeview(tab, columns=("purpose", "type", "calls", "input", "output", "cost", "today", "api"),
+        self.v_openai_utc = tk.StringVar(value="OpenAI UTC 日用量：启动服务后查看")
+        ttk.Label(tab, textvariable=self.v_openai_utc, wraplength=1040).pack(fill="x", pady=(0, 6))
+        self.usage_groups = ttk.Treeview(tab, columns=("purpose", "type", "calls", "input", "output", "cost", "today", "api", "usd"),
                                         show="headings", height=6)
         for key, label, width in (("purpose", "用途", 150), ("type", "消息类型", 120), ("calls", "请求数", 70),
-                                  ("input", "输入 Token", 100), ("output", "输出 Token", 100), ("cost", "总金额（元）", 110),
-                                  ("today", "今日消费（元）", 110), ("api", "平台 / 模型", 190)):
+                                  ("input", "输入 Token", 90), ("output", "输出 Token", 90), ("cost", "总金额（元·估算）", 130),
+                                  ("today", "今日消费（北京·元）", 145), ("api", "平台 / 模型", 170), ("usd", "美元（估算）", 110)):
             self.usage_groups.heading(key, text=label)
-            if key in ("calls", "input", "output", "cost", "today"):
+            if key in ("calls", "input", "output", "cost", "today", "usd"):
                 self.usage_groups.heading(key, command=lambda k=key: self._sort_usage(self.usage_groups, k))
             self.usage_groups.column(key, width=width, stretch=True)
         self.usage_groups.pack(fill="x", pady=(0, 10))
+        group_xscroll = ttk.Scrollbar(tab, orient="horizontal", command=self.usage_groups.xview)
+        self.usage_groups.configure(xscrollcommand=group_xscroll.set)
+        group_xscroll.pack(fill="x", pady=(0, 6))
         ttk.Label(tab, text="点击请求数、Token 或金额表头排序；最近 500 次请求，选中一行查看关联消息（上方汇总覆盖全部明细）").pack(anchor="w")
         frame = ttk.Frame(tab)
         frame.pack(fill="both", expand=True)
-        columns = ("time", "purpose", "source", "input", "output", "cache", "cost", "state", "today", "api")
+        columns = ("time", "purpose", "source", "input", "output", "cache", "cost", "state", "today", "api", "usd", "tier", "cache_write")
         self.usage_table = ttk.Treeview(frame, columns=columns, show="headings", height=9)
-        for key, label, width in zip(columns, ("时间", "用途", "消息/任务", "输入", "输出", "缓存命中", "总金额（元）", "结果", "今日消费（元）", "平台 / 模型"),
-                                   (125, 100, 115, 70, 70, 75, 95, 130, 110, 190)):
+        for key, label, width in zip(columns, ("时间（北京）", "用途", "消息/任务", "输入", "输出", "缓存读命中", "总金额（元·估算）", "结果", "今日消费（北京·元）", "平台 / 模型", "美元（估算）", "服务层级", "缓存写入"),
+                                   (125, 90, 100, 65, 65, 90, 125, 115, 145, 160, 105, 80, 80)):
             self.usage_table.heading(key, text=label)
-            if key in ("input", "output", "cache", "cost", "today"):
+            if key in ("input", "output", "cache", "cost", "today", "usd", "cache_write"):
                 self.usage_table.heading(key, command=lambda k=key: self._sort_usage(self.usage_table, k))
             self.usage_table.column(key, width=width, stretch=True)
         scroll = ttk.Scrollbar(frame, command=self.usage_table.yview)
         self.usage_table.configure(yscrollcommand=scroll.set)
         self.usage_table.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+        xscroll = ttk.Scrollbar(tab, orient="horizontal", command=self.usage_table.xview)
+        self.usage_table.configure(xscrollcommand=xscroll.set)
+        xscroll.pack(fill="x")
         self.usage_table.bind("<<TreeviewSelect>>", self._usage_selected)
         self.usage_detail = ScrolledText(tab, height=8, wrap="word", font=(FONT, 10), state="disabled")
         self.usage_detail.pack(fill="both", pady=(8, 0))
@@ -1119,10 +1131,19 @@ class App:
     def _render_usage(self, data: dict) -> None:
         self._usage_busy = False
         if data.get("error"):
-            self.v_usage.set(f"消费明细读取失败：{data['error']}")
+            self.v_usage.set(f"消费明细读取失败：{security.redact(str(data['error']))}")
             return
         self.v_usage.set(f"当前用途总金额 ¥{data.get('visible_cost_cny', 0):.6f}；今日消费 ¥{data.get('today_cost_cny', 0):.6f}。"
-                         "仅显示摘要总结、图片理解；Token 为 API 返回值，金额为估算，未知费用另行标注。")
+                         "仅显示摘要总结、图片理解；金额为本地估算，今日按北京时间。"
+                         "旧记录缺缓存写入、服务层级或美元信息，无法精确对账；未知费用另行标注。")
+        utc_days = data.get("openai_utc_days", [])
+        utc_labels = []
+        for day in utc_days[:3]:
+            amount = f"${day['cost_usd']:.6f}" if day.get("cost_usd") is not None else "美元未知"
+            unknown = max(int(day.get("unknown_calls") or 0), int(day.get("unknown_usd_calls") or 0))
+            utc_labels.append(f"{day['day']}：{amount}" + (f" + {unknown} 次未知" if unknown else ""))
+        self.v_openai_utc.set("OpenAI UTC 日用量（本地估算）：" + ("；".join(utc_labels) if utc_labels else "暂无记录")
+                             + "。UTC 00:00 = 北京 08:00；平台账单为最终依据，可能包含其他程序调用。")
         self.usage_groups.delete(*self.usage_groups.get_children())
         self._usage_numbers = {self.usage_groups: {}, self.usage_table: {}}
         for row in data.get("groups", []):
@@ -1132,19 +1153,24 @@ class App:
                 row["in_tokens"] or 0, row["out_tokens"] or 0,
                 f"{row['cost_cny']:.6f}" + (f" + {row['unknown_calls']} 次未知" if row["unknown_calls"] else ""),
                 f"{row.get('today_cost_cny', 0):.6f}" + (f" + {row['today_unknown_calls']} 次未知" if row.get("today_unknown_calls") else ""),
-                f"{row.get('provider') or '历史未记录'} / {row.get('model') or '未知'}"))
+                f"{row.get('provider') or '历史未记录'} / {row.get('model') or '未知'}",
+                (f"{row['cost_usd']:.6f}" if row.get("cost_usd") is not None else "未知")
+                + (f" + {row['unknown_usd_calls']} 次未知" if row.get("unknown_usd_calls") else "")))
             self._usage_numbers[self.usage_groups][iid] = dict(calls=row["calls"], input=row["in_tokens"],
-                                                              output=row["out_tokens"], cost=row["cost_cny"], today=row.get("today_cost_cny", 0))
+                                                              output=row["out_tokens"], cost=row["cost_cny"], today=row.get("today_cost_cny", 0), usd=row.get("cost_usd"))
         self.usage_table.delete(*self.usage_table.get_children())
         self._usage_items = {str(r["id"]): r for r in data.get("items", []) if r["purpose"] in ("摘要总结", "图片理解")}
         for iid, row in self._usage_items.items():
-            self.usage_table.insert("", "end", iid=iid, values=(time.strftime("%m-%d %H:%M:%S", time.localtime(row["ts"])),
+            self.usage_table.insert("", "end", iid=iid, values=(datetime.fromtimestamp(row["ts"], BEIJING).strftime("%m-%d %H:%M:%S"),
                 row["purpose"], row["source_label"], *[row[k] if row[k] is not None else "未知" for k in ("in_tokens", "out_tokens", "cache_hit_tokens")],
                 f"{row['cost_cny']:.6f}" if row["cost_cny"] is not None else "未知", row["status"],
                 f"{row.get('today_cost_cny', 0):.6f}" if row.get("today_cost_cny", 0) is not None else "未知",
-                f"{row.get('provider') or '历史未记录'} / {row.get('model') or '未知'}"))
+                f"{row.get('provider') or '历史未记录'} / {row.get('model') or '未知'}",
+                f"{row['cost_usd']:.6f}" if row.get("cost_usd") is not None else "未知", row.get("service_tier") or "未记录",
+                row["cache_write_tokens"] if row.get("cache_write_tokens") is not None else "未知"))
             self._usage_numbers[self.usage_table][iid] = dict(input=row["in_tokens"], output=row["out_tokens"],
-                                                             cache=row["cache_hit_tokens"], cost=row["cost_cny"], today=row.get("today_cost_cny", 0))
+                                                             cache=row["cache_hit_tokens"], cost=row["cost_cny"], today=row.get("today_cost_cny", 0), usd=row.get("cost_usd"),
+                                                             cache_write=row.get("cache_write_tokens"))
         for tree, (key, descending) in self._usage_sort.items():
             self._sort_usage(tree, key, descending)
 
@@ -1649,25 +1675,52 @@ class App:
 
     def refresh_billing(self) -> None:
         """刷新当前服务的费用统计；新 API 只使用本机请求估算。"""
+        if self._billing_busy:
+            return
         if self.proc is None:
             self.status.set("请先启动服务，再刷新账单。")
+            self.v_billing_feedback.set("请先启动服务，再刷新账单。")
             return
+        self._billing_busy = True
+        self.btn_billing.configure(state="disabled", text="正在刷新…")
         port = int(self.cfg["onebot"]["http_port"])
-        self.status.set("正在刷新消费统计…")
+        self.v_billing_feedback.set("正在刷新账单与消费明细…")
+        self.status.set(self.v_billing_feedback.get())
+        self._log_ui("[界面] 开始刷新账单与消费明细…\n")
 
         def work() -> None:
             try:
                 op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
                 with op.open(f"http://127.0.0.1:{port}/billing", timeout=90) as r:
                     body = json.loads(r.read().decode("utf-8"))
-                if body.get("ok"):
-                    self.events.put(("billing", body))
-                else:
-                    self.events.put(("note", f"账单抓取失败：{body.get('error')}"))
+                if not isinstance(body, dict):
+                    raise ValueError("invalid billing response")
+                self.events.put(("billing_done", body))
+            except urllib.error.HTTPError as exc:
+                self.events.put(("billing_done", {"ok": False, "error": f"HTTP {exc.code}"}))
+            except TimeoutError:
+                self.events.put(("billing_done", {"ok": False, "error": "请求超时（等待上限 90 秒）"}))
             except Exception as exc:  # noqa: BLE001
-                self.events.put(("note", f"账单抓取失败：{exc}"))
+                self.events.put(("billing_done", {"ok": False, "error": type(exc).__name__}))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _billing_finished(self, body: dict) -> None:
+        self._billing_busy = False
+        self.btn_billing.configure(state="normal", text="刷新账单")
+        if body.get("ok"):
+            self._apply_billing(body)
+            if body.get("source") == "estimate":
+                note = "本地估算已刷新；未读取平台账单，实际扣费请查看平台"
+            else:
+                note = f"账单已刷新：{self.status.get()}"
+            self.refresh_usage()
+        else:
+            detail = security.redact(str(body.get("error") or "服务未返回有效结果"))[:180]
+            note = f"账单刷新失败：{detail}；可再次点击重试"
+        self.v_billing_feedback.set(note)
+        self.status.set(note)
+        self._log_ui(f"[界面] {note}\n")
 
     # 账单口径的显示名。**每个数字都必须带口径**：用户没法从数值本身分辨
     # 它是官方数字还是本地估算，含糊显示等于骗人。
@@ -1774,42 +1827,11 @@ class App:
             return None
         return {**self.cfg, "napcat": {**self.cfg.get("napcat", {}), "account": account}}
 
-    def auto_login(self) -> None:
-        if self._login_busy:
-            return
-        cfg = self._login_config()
-        if cfg is None:
-            return
-        self._login_busy = True
-        self._login_verify_since = time.time()
-        self._login_pending = False
-        self._login_account = cfg["napcat"]["account"]
-        self._login_wait_noted = False
-        self.btn_login.configure(state="disabled")
-        note = "正在自动登录：复用已保存账号；协议端未运行时将请求启动（可能需要 UAC 授权）…"
-        self.status.set(note)
-        self._log_ui(f"[界面] {note}\n")
-        visible = not bool(self.v_napcat_hidden.get())
-
-        def work() -> None:
-            try:
-                if not napcat_mod.running_instances().get("injectors"):
-                    result = napcat_mod.launch(cfg, visible=visible)
-                    if not result.get("ok"):
-                        self.events.put(("login_done", {"ok": False, "note": result.get("error", "启动失败")}))
-                        return
-                result = napcat_mod.quick_login(cfg)
-                if result.get("scan"):
-                    result = napcat_mod.refresh_login_qrcode(cfg)
-                self.events.put(("login_done", result))
-            except Exception:
-                self.events.put(("login_done", {"ok": False, "note": "自动登录异常，请查看协议端日志"}))
-
-        threading.Thread(target=work, daemon=True).start()
-
     def _login_finished(self, result: dict) -> None:
         self._login_busy = False
-        self.btn_login.configure(state="normal")
+        self.btn_relogin.configure(state="normal")
+        if self.btn_restart is not None:
+            self.btn_restart.configure(state="normal")
         self.status.set(result["note"])
         self._log_ui(f"[界面] {result['note']}\n")
         if result.get("ok"):
@@ -1854,7 +1876,9 @@ class App:
         self._login_pending = False
         self._login_account = cfg["napcat"]["account"]
         self._login_wait_noted = False
-        self.btn_login.configure(state="disabled")
+        self.btn_relogin.configure(state="disabled")
+        if self.btn_restart is not None:
+            self.btn_restart.configure(state="disabled")
         self.status.set("正在刷新 NapCat 登录二维码…")
 
         def work() -> None:
@@ -1875,7 +1899,9 @@ class App:
         self._login_account = account
         self._login_pending = False
         self._login_wait_noted = False
-        self.btn_login.configure(state="disabled")
+        self.btn_relogin.configure(state="disabled")
+        if self.btn_restart is not None:
+            self.btn_restart.configure(state="disabled")
         self.status.set("正在请求重启目标账号的 NapCat…")
         self._log_ui(f"[界面] 正在请求重启目标 QQ {account} 的 NapCat…\n")
 
@@ -2124,7 +2150,8 @@ class App:
             self._apply_health(value)
         elif kind == "billing":
             self._apply_billing(value)
-            self.status.set("账单已刷新")
+        elif kind == "billing_done":
+            self._billing_finished(value)
         elif kind == "messages":
             self._render_messages(value)
         elif kind == "message_action":
@@ -2183,7 +2210,7 @@ class App:
         self.v_protocol_detail.set(protocol.get("message", "") if state != "connected" else "")
         self.btn_relogin.grid_remove()
         if state == "login_required":
-            self.v_peer.set("QQ 登录失效 · 等待自动登录或扫码")
+            self.v_peer.set("QQ 登录失效 · 请重新扫码")
             self.btn_relogin.grid()
         elif state == "offline":
             self.v_peer.set("连接存在 · QQ 已离线")
@@ -2207,7 +2234,7 @@ class App:
         elif state == "disconnected":
             self.v_peer.set("连接中断 · 等待自动重连")
         elif self.napcat_script() or self.napcat_dir():
-            self.v_peer.set("协议端未连接 —— 请点「自动登录」")
+            self.v_peer.set("协议端未连接 · 可强制重启或重新扫码")
         else:
             self.v_peer.set("未连接（NapCat 未启动）")
 

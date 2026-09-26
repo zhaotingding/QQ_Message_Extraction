@@ -93,6 +93,138 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         cost = (600 * .1 + 400 * .01 + 100 * .5) / 1000000 * 7
         self.assertAlmostEqual(self.store.cost_totals()["cost_cny"], cost)
 
+    async def test_tier_currency_and_utc_accounting_preserve_history(self):
+        from datetime import datetime, timezone
+        from contextlib import closing
+        import sqlite3
+        for tier, multiplier in (("default", 1), ("priority", 2), ("fast", 2), ("flex", .5), ("scale", None)):
+            value = self.response()
+            value["service_tier"] = tier
+            response = Response(value)
+            response.headers["x-request-id"] = "req_accounting_test"
+            session = Mock()
+            session.post.return_value = response
+            with patch.object(self.llm, "session", AsyncMock(return_value=session)), \
+                    patch("msgx.llm.time.time", return_value=datetime(2026, 9, 25, 16, tzinfo=timezone.utc).timestamp()):
+                await self.llm.chat("x", "y", purpose="摘要总结")
+            body = json.loads(session.post.call_args.kwargs["data"])
+            self.assertEqual(body["service_tier"], "default")
+            row = self.store.api_usage_details()["items"][0]
+            self.assertEqual(row["service_tier"], tier)
+            self.assertEqual(row["request_id"], "req_accounting_test")
+            self.assertEqual(json.loads(row["pricing"])["currency"], "USD")
+            if multiplier is None:
+                self.assertIsNone(row["cost_usd"])
+                self.assertIsNone(row["cost_cny"])
+            else:
+                expected = (600 * .1 + 400 * .01 + 100 * .5) / 1000000 * multiplier
+                self.assertAlmostEqual(row["cost_usd"], expected)
+                self.assertAlmostEqual(row["cost_cny"], expected * 7)
+        utc = self.store.api_usage_details(limit=1)["openai_utc_days"][0]
+        self.assertEqual(utc["day"], "2026-09-25")
+        self.assertEqual(utc["calls"], 5)
+        self.assertEqual(utc["unknown_calls"], 1)
+        self.assertAlmostEqual(utc["cost_usd"], (600 * .1 + 400 * .01 + 100 * .5) / 1000000 * 5.5)
+        self.assertAlmostEqual(self.store.daily_cost_cny("2026-09-26"), utc["cost_cny"])
+        # 旧账的原币和服务等级没有证据，迁移不按新费率回算。
+        old_path = Path(self.tmp.name) / "old.db"
+        with closing(sqlite3.connect(old_path)) as old:
+            old.execute("CREATE TABLE api_calls(id INTEGER PRIMARY KEY,ts REAL NOT NULL,purpose TEXT NOT NULL,source_ids TEXT NOT NULL,source_type TEXT NOT NULL,model TEXT NOT NULL,in_tokens INTEGER,out_tokens INTEGER,cache_hit_tokens INTEGER,cost_cny REAL,status TEXT NOT NULL,provider TEXT NOT NULL)")
+            old.execute("INSERT INTO api_calls VALUES(1,0,'摘要总结','[]','汇总报告','gpt-6-luna',1000,100,0,1.23,'完成','OpenAI 官方')")
+            old.commit()
+        migrated = Store(old_path)
+        try:
+            row = migrated.api_usage_details()["items"][0]
+            self.assertEqual(row["cost_cny"], 1.23)
+            self.assertIsNone(row["cost_usd"])
+            self.assertIsNone(row["cache_write_tokens"])
+            self.assertEqual(row["service_tier"], "")
+        finally:
+            migrated.close()
+
+    async def test_cache_write_replaces_ordinary_input_and_preserves_tokens(self):
+        value = self.response()
+        value["usage"]["input_tokens_details"]["cache_write_tokens"] = 300
+        session = Mock()
+        session.post.return_value = Response(value)
+        with patch.object(self.llm, "session", AsyncMock(return_value=session)):
+            await self.llm.chat("x", "y", purpose="摘要总结")
+        row = self.store.api_usage_details()["items"][0]
+        self.assertEqual(row["cache_write_tokens"], 300)
+        self.assertEqual(row["cache_hit_tokens"], 400)
+        expected = (300 * .1 + 300 * .125 + 400 * .01 + 100 * .5) / 1000000
+        self.assertAlmostEqual(row["cost_usd"], expected)
+        self.assertEqual(json.loads(row["pricing"])["cache_write_multiplier"], 1.25)
+        self.assertNotIn("缓存写入用量未返回", row["status"])
+        self.assertEqual(self.store.api_usage_details()["groups"][0]["cache_write_tokens"], 300)
+        # 长输入与服务等级乘数在缓存写入价上统一计算。
+        long_expected = (100000 * .1 * 2 + 100000 * .125 * 2 + 100000 * .01 * 2 + 1000 * .5 * 1.5) / 1000000 * 7
+        for tier, mult in (("default", 1), ("fast", 2), ("priority", 2), ("flex", .5)):
+            self.assertAlmostEqual(self.llm.cost_cny(300000, 1000, 100000,
+                                   cache_write_tokens=100000, service_tier=tier), long_expected * mult)
+        # 缺字段保留未知并说明估算基础，不倒推历史写入量。
+        session.post.return_value = Response(self.response())
+        with patch.object(self.llm, "session", AsyncMock(return_value=session)):
+            await self.llm.chat("x", "y", purpose="摘要总结")
+        unknown = self.store.api_usage_details()["items"][0]
+        self.assertIsNone(unknown["cache_write_tokens"])
+        self.assertIn("缓存写入用量未返回", unknown["status"])
+        self.assertGreater(unknown["cost_cny"], 0)
+        # Chat Completions 的详情字段也能进入同一账本。
+        self.llm.llm["protocol"] = "chat_completions"
+        session.post.return_value = Response({"choices": [{"message": {"content": "完整"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 100,
+                      "prompt_tokens_details": {"cached_tokens": 400, "cache_write_tokens": 300}}})
+        with patch.object(self.llm, "session", AsyncMock(return_value=session)):
+            await self.llm.chat("x", "y", purpose="摘要总结")
+        chat = self.store.api_usage_details()["items"][0]
+        self.assertEqual(chat["cache_write_tokens"], 300)
+        self.assertAlmostEqual(chat["cost_usd"], expected)
+        # 兼容服务不套用 OpenAI 缓存写入溢价。
+        ds = LLM(api_settings.apply(self.cfg, api_settings.catalog({}, {})[0]["deepseek"]), self.store)
+        self.assertEqual(ds.cost_cny(1000, 100, cache_write_tokens=600), ds.cost_cny(1000, 100))
+
+    async def test_snapshot_reads_saved_summary_only_without_changing_running_config(self):
+        path = Path(self.tmp.name) / "summary-prefs.json"
+        prefs.save({"summary_target_chars": 2000, "summary_prompt": "新提示词",
+                    "filters": {"skip_image_only": True}}, path)
+        original = copy.deepcopy(self.cfg)
+        with patch.dict(os.environ, {prefs.ENV_PREFS: str(path)}):
+            snapshot = self.llm.snapshot()
+        self.assertEqual(snapshot.cfg["summary"]["target_chars"], 2000)
+        self.assertEqual(snapshot.cfg["summary"]["prompt"], "新提示词")
+        self.assertEqual(snapshot.cfg["filters"], original["filters"])
+        self.assertEqual(self.cfg, original)
+        self.assertIs(snapshot._session_owner, self.llm)
+
+    async def test_accounting_distinguishes_requested_tier_and_sanitizes_request_ids(self):
+        value = self.response()
+        value["usage"]["input_tokens_details"]["cache_write_tokens"] = 0
+        value["request_id"] = KEY
+        response = Response(value)
+        response.headers["x-request-id"] = KEY
+        session = Mock()
+        session.post.return_value = response
+        with patch.object(self.llm, "session", AsyncMock(return_value=session)):
+            await self.llm.chat("x", "y", purpose="摘要总结")
+        row = self.store.api_usage_details()["items"][0]
+        self.assertEqual(row["request_id"], "")
+        self.assertEqual(row["service_tier"], "")
+        self.assertIn("服务等级未返回", row["status"])
+        self.assertEqual(json.loads(row["pricing"])["service_tier_source"], "request_default")
+        self.assertGreater(row["cost_cny"], 0)
+        self.assertNotIn(KEY, json.dumps(row))
+        # 兼容接口的响应正文也须经过同一诊断标识检查。
+        self.llm.llm["protocol"] = "chat_completions"
+        response.data = {"choices": [{"message": {"content": "完整"}, "finish_reason": "stop"}],
+                         "usage": {"prompt_tokens": 1000, "completion_tokens": 100},
+                         "request_id": "private chat " + KEY}
+        with patch.object(self.llm, "session", AsyncMock(return_value=session)):
+            await self.llm.chat("x", "y", purpose="摘要总结")
+        row = self.store.api_usage_details()["items"][0]
+        self.assertEqual(row["request_id"], "")
+        self.assertNotIn(KEY, json.dumps(row))
+
     async def test_images_and_reasoning_use_responses_format(self):
         self.cfg["api"]["reasoning"] = "high"
         wire = self.llm._responses_payload({"model": "gpt-6-luna", "max_tokens": 2000,

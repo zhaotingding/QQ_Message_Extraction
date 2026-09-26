@@ -6,7 +6,6 @@ import json
 import logging
 import re
 import time
-from datetime import date
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -23,6 +22,11 @@ class BudgetExceeded(Exception):
 
 class APIRequestRejected(RuntimeError):
     """服务端拒绝了请求；媒体后台也不能按临时网络故障自动重发。"""
+
+
+def _safe_request_id(value) -> str:
+    value = security.redact(value) if isinstance(value, str) else ""
+    return value if re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", value) else ""
 
 
 def _http_error(status: int, body: str, headers) -> str:
@@ -134,9 +138,19 @@ class LLM:
         from . import api_settings, prefs
         from .config import api_key
         saved = prefs.load_from_env() or {}
-        if "api" not in self.cfg and "api_profiles" not in saved:
+        if "api" not in self.cfg and "api_profiles" not in saved and not any(
+                key in saved for key in ("summary_prompt", "summary_target_chars")):
             return self
-        cfg = self.cfg
+        cfg = {**self.cfg, "summary": dict(self.cfg.get("summary", {}))}
+        prompt = str(saved.get("summary_prompt") or "").strip()
+        if prompt:
+            cfg["summary"]["prompt"] = prompt
+        try:
+            target = int(saved.get("summary_target_chars") or 0)
+            if target > 0:
+                cfg["summary"]["target_chars"] = target
+        except (TypeError, ValueError):
+            pass
         if "api_profiles" in saved or "api" in saved:
             profiles, active = api_settings.catalog(cfg, saved)
             cfg = api_settings.apply(cfg, profiles[active])
@@ -147,6 +161,11 @@ class LLM:
         return result
 
     # ---------- budget ----------
+
+    def cache_write_multiplier(self, model: str | None = None) -> float:
+        name = model or self.llm["model"]
+        official = urlsplit(self.llm["base_url"]).hostname == "api.openai.com"
+        return 1.25 if official and name.startswith(("gpt-6", "gpt-5.6")) else 1.0
 
     def is_peak(self, ts: float | None = None) -> bool:
         """调用时刻是否处于 DeepSeek 高峰时段。
@@ -179,12 +198,15 @@ class LLM:
         cache_hit_tokens: int = 0,
         ts: float | None = None,
         peak: bool | None = None,
+        service_tier: str = "",
+        cache_write_tokens: int = 0,
+        model: str | None = None,
     ) -> float:
         """按调用**发生的那一刻**的峰谷价计算人民币金额。
 
-        账单的三档计价：输入分「缓存命中 / 未命中」、输出单列；
+        输入分「缓存命中 / 写入 / 普通输入」，输出单列；
         高峰时段各项都是空闲时段的 peak_multiplier 倍。
-        缓存命中 token 由 API 返回；缺失时视为全部未命中（保守，宁高不低）。
+        缓存 Token 由 API 返回；缺写入字段时暂按零估算并在账本标注。
 
         ``peak`` 显式传值可覆盖时间判定 —— 给「只有日期、没有小时」的历史数据
         补算金额时用得到（那就只能按空闲价估，是个下限）。
@@ -192,12 +214,17 @@ class LLM:
         if "api" in self.cfg:
             p = self.cfg["api"]
             hit = max(0, min(int(cache_hit_tokens), int(in_tokens)))
+            written = max(0, min(int(cache_write_tokens), int(in_tokens) - hit))
             long = p["long_context_threshold"] > 0 and in_tokens > p["long_context_threshold"]
             input_mult = p["long_input_multiplier"] if long else 1
             output_mult = p["long_output_multiplier"] if long else 1
             fx = p["usd_cny"] if p["currency"] == "USD" else 1
             peak_mult = p["peak_multiplier"] if (self.is_peak(ts) if peak is None else peak) else 1
-            return fx * peak_mult / 1_000_000 * ((hit * p["cached_price"] + (in_tokens - hit) * p["input_price"]) * input_mult
+            tier_mult = {"priority": 2, "fast": 2, "flex": 0.5}.get(service_tier, 1) if urlsplit(p["base_url"]).hostname == "api.openai.com" else 1
+            # 缓存写入属于输入的一部分，按写入价替换普通价，不能重复相加。
+            return fx * peak_mult * tier_mult / 1_000_000 * ((hit * p["cached_price"]
+                                      + (in_tokens - hit - written) * p["input_price"]
+                                      + written * p["input_price"] * self.cache_write_multiplier(model)) * input_mult
                                       + out_tokens * p["output_price"] * output_mult)
         mult = float(self.llm.get("peak_multiplier", 2.0)) if (
             self.is_peak(ts) if peak is None else bool(peak)
@@ -244,7 +271,7 @@ class LLM:
 
 
     def spent_today_cny(self) -> float:
-        return self.store.daily_cost_cny(date.today().isoformat())
+        return self.store.daily_cost_cny(time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600)))
 
     def budget_ok(self) -> bool:
         return self.spent_today_cny() < float(self.llm.get("max_daily_cost_cny", 10.0))
@@ -265,12 +292,21 @@ class LLM:
         usage = data.get("usage")
         if usage and "prompt_cache_hit_tokens" not in usage:
             usage["prompt_cache_hit_tokens"] = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+        if usage and "prompt_cache_write_tokens" not in usage:
+            usage["prompt_cache_write_tokens"] = (usage.get("prompt_tokens_details") or {}).get("cache_write_tokens")
         if not usage or "prompt_tokens" not in usage or "completion_tokens" not in usage:
             usage = None
+        official = urlsplit(self.llm["base_url"]).hostname == "api.openai.com"
+        tier_returned = bool(data.get("service_tier"))
+        tier = str(data.get("service_tier") or "")
+        if tier not in ("default", "priority", "fast", "flex", "scale", "auto", ""):
+            tier = "unknown"
         cost = None
-        if usage is not None:
+        estimated_tier = tier or ("default" if official else "")
+        if usage is not None and (not official or estimated_tier in ("default", "priority", "fast", "flex")):
             cost = self.cost_cny(int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)),
-                                 int(usage.get("prompt_cache_hit_tokens", 0)), ts=started)
+                                 int(usage.get("prompt_cache_hit_tokens", 0)), ts=started, service_tier=estimated_tier,
+                                 cache_write_tokens=int(usage.get("prompt_cache_write_tokens") or 0), model=payload["model"])
         choice = (data.get("choices") or [{}])[0]
         finish_reason = choice.get("finish_reason") or "missing"
         content = (choice.get("message") or {}).get("content") or ""
@@ -279,8 +315,18 @@ class LLM:
         status = "完成" if complete else f"输出未完成（{reason}）"
         if usage is None:
             status += "，用量未知"
+        elif self.cache_write_multiplier(payload["model"]) != 1 and usage.get("prompt_cache_write_tokens") is None:
+            status += "，缓存写入用量未返回（按0估算）"
+        if official and not tier_returned:
+            status += "，服务等级未返回（按请求Standard估算）"
         self.store.record_api_call(ts=started, purpose=purpose, source_ids=source_ids or [],
-                                   model=payload["model"], usage=usage, cost_cny=cost, status=status, provider=provider)
+                                   model=payload["model"], usage=usage, cost_cny=cost, status=status, provider=provider,
+                                   cost_usd=cost / self.cfg["api"]["usd_cny"] if cost is not None and self.cfg.get("api", {}).get("currency") == "USD" else None,
+                                   service_tier=tier, request_id=_safe_request_id(data.get("request_id")),
+                                   pricing={**{key: self.cfg["api"][key] for key in ("currency", "usd_cny", "input_price", "cached_price", "output_price",
+                                            "long_context_threshold", "long_input_multiplier", "long_output_multiplier", "peak_multiplier", "peak_windows_utc", "base_url")},
+                                            "cache_write_multiplier": self.cache_write_multiplier(payload["model"]),
+                                            "service_tier_source": "response" if tier_returned else "request_default" if official else "unknown"} if "api" in self.cfg else None)
         if complete:
             log.info("API 请求成功 · %s · 输入 %s / 输出 %s Token", purpose,
                      (usage or {}).get("prompt_tokens", "未知"), (usage or {}).get("completion_tokens", "未知"))
@@ -440,6 +486,8 @@ class LLM:
         # 不把 OpenAI 参数强加给 DeepSeek 或其他兼容服务。
         if not responses and urlsplit(base).hostname == "api.openai.com" and "max_tokens" in outgoing:
             outgoing["max_completion_tokens"] = outgoing.pop("max_tokens")
+        if urlsplit(base).hostname == "api.openai.com":
+            outgoing["service_tier"] = "default"
         encoded = json.dumps(outgoing).encode("utf-8")
         paced = len(encoded) > 64 * 1024
         headers = {
@@ -484,7 +532,13 @@ class LLM:
                             return await self._read_response(r)
                         body = security.redact(await r.text())
                         try:
-                            return json.loads(body)
+                            result = json.loads(body)
+                            request_id = _safe_request_id(getattr(r, "headers", {}).get("x-request-id")) or _safe_request_id(result.get("request_id"))
+                            if request_id:
+                                result["request_id"] = request_id
+                            else:
+                                result.pop("request_id", None)
+                            return result
                         except json.JSONDecodeError as e:
                             # 半截响应体：连接被掐断的另一种表现，同样值得重试
                             raise _Transient(f"响应不是完整 JSON: {e}") from e
@@ -518,7 +572,8 @@ class LLM:
                 "reasoning": {"effort": effort}, "store": False, "stream": True}
 
     async def _read_response(self, response) -> dict:
-        if "text/event-stream" not in response.headers.get("Content-Type", ""):
+        headers = getattr(response, "headers", {})
+        if "text/event-stream" not in headers.get("Content-Type", ""):
             data = json.loads(security.redact(await response.text()))
         else:
             data = None
@@ -550,9 +605,16 @@ class LLM:
         normalized = None
         if usage and "input_tokens" in usage and "output_tokens" in usage:
             normalized = {"prompt_tokens": usage["input_tokens"], "completion_tokens": usage["output_tokens"],
-                          "prompt_cache_hit_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)}
-        return {"choices": [{"message": {"content": text},
+                          "prompt_cache_hit_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens", 0),
+                          "prompt_cache_write_tokens": (usage.get("input_tokens_details") or {}).get("cache_write_tokens")}
+        result = {"choices": [{"message": {"content": text},
                              "finish_reason": "stop" if status == "completed" else "incomplete"}], "usage": normalized}
+        if data.get("service_tier"):
+            result["service_tier"] = data["service_tier"]
+        request_id = _safe_request_id(headers.get("x-request-id")) or _safe_request_id(data.get("request_id"))
+        if request_id:
+            result["request_id"] = request_id
+        return result
 
     # 这里原本有个 `_reset_session()`（close 掉共享 session 以「换掉半死的连接池」）。
     # v0.5.1 **已把它删掉**，不是重构、是修 bug：它会把并发的在途请求一起掐死

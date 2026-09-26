@@ -92,7 +92,7 @@ buttons = [str(w.cget("text")) for w in allw if isinstance(w, ttk.Button)]
 check("只有一个摘要按钮", buttons.count("生成摘要") == 1 and "生成最新摘要" not in buttons, str(buttons))
 # 手动摘要用自然日日期范围，已有日报可以查看或明确选择重新生成。
 check("不再有说不清范围的『全量重做』", not any("全量" in b for b in buttons), str(buttons))
-check("保留强制重启并替换原启动入口", "强制重启" in buttons and "自动登录" in buttons
+check("保留强制重启并移除自动登录入口", "强制重启" in buttons and "自动登录" not in buttons
       and "启动协议端(NapCat)" not in buttons, str(buttons))
 # v0.5.4：群列表是历次登录的并集，换过账号就会混进别的账号的群，得有个清理入口。
 check("有「只保留当前账号的群」按钮",
@@ -871,12 +871,7 @@ with patch.object(_mb, "showinfo") as _info, patch.object(_mb, "showerror") as _
           and "测试服务停止失败" in app.log.get("1.0", "end"))
     app.proc = _saved_proc
 
-    with patch.object(N, "running_instances", return_value={"injectors": 0}), \
-            patch.object(N, "launch", return_value={"ok": False, "error": "测试协议端启动失败"}), \
-            patch("msgx.gui.threading.Thread") as _thread, patch.object(app.events, "put") as _put:
-        app.auto_login()
-        _thread.call_args.kwargs["target"]()
-        app._dispatch_event(*_put.call_args.args[0])
+    app._login_finished({"ok": False, "note": "测试协议端启动失败"})
     check("协议端失败留在状态栏和日志", "测试协议端启动失败" in app.status.get()
           and "测试协议端启动失败" in app.log.get("1.0", "end"))
     app._dispatch_event("exit", 1)
@@ -911,34 +906,65 @@ check("普通断线不诱导重复启动", "自动重连" in app.v_peer.get() an
 app._apply_health({"ws_peers": ["127.0.0.1"], "protocol": {"state": "connected"}})
 check("重连后清除登录故障说明", "已连接" in app.v_peer.get() and not app.v_protocol_detail.get())
 
-print("\n=== 0.6.4 自动登录、合并入口与消费排序 ===")
-check("登录入口改为自动登录", app.btn_login.cget("text") == "自动登录")
+print("\n=== 0.7.6 移除自动登录、保留手动恢复与消费排序 ===")
+check("删除无用自动登录控件与方法", not hasattr(app, "btn_login") and not hasattr(app, "auto_login"))
+_before_billing_proc = app.proc
+app.proc = object()
+with patch("msgx.gui.threading.Thread") as _thread, patch("msgx.gui.urllib.request.build_opener") as _opener, \
+        patch.object(app.events, "put") as _put, patch.object(app, "refresh_usage") as _usage:
+    _opener.return_value.open.return_value.__enter__.return_value.read.return_value = json.dumps({
+        "ok": True, "source": "estimate", "today_cny": 0.15, "total_cny": 0.3}).encode()
+    app.refresh_billing()
+    app.refresh_billing()
+    check("账单刷新立即显示忙碌且防重复", _thread.call_count == 1 and app._billing_busy
+          and app.btn_billing.instate(["disabled"]) and "正在刷新" in app.v_billing_feedback.get()
+          and "开始刷新账单" in app.log.get("1.0", "end"))
+    _thread.call_args.kwargs["target"]()
+    app._dispatch_event(*_put.call_args.args[0])
+    check("账单成功更新明细并恢复按钮", not app._billing_busy and app.btn_billing.instate(["!disabled"])
+          and _usage.called and "已刷新" in app.v_billing_feedback.get()
+          and "本地" in app.v_billing_feedback.get() and "0.30" in app.v_total.get())
+    _billing_feedback = app.v_billing_feedback.get()
+    app._apply_health({"billing": {"source": "estimate", "total_cny": 0.3}})
+    check("健康刷新不清除账单结果反馈", app.v_billing_feedback.get() == _billing_feedback)
+    _opener.return_value.open.side_effect = RuntimeError("sk-test-private-token-12345678")
+    app.refresh_billing()
+    _thread.call_args.kwargs["target"]()
+    app._dispatch_event(*_put.call_args.args[0])
+    check("账单失败恢复按钮且不暴露异常原文", not app._billing_busy and app.btn_billing.instate(["!disabled"])
+          and "刷新失败" in app.v_billing_feedback.get() and "RuntimeError" in app.v_billing_feedback.get()
+          and "private-token" not in app.v_billing_feedback.get())
+    app._billing_busy = True
+    app._billing_finished({"ok": False, "error": "Bearer secret-auth-token"})
+    check("账单服务错误也脱敏", "secret-auth-token" not in app.v_billing_feedback.get()
+          and "已隐藏密钥" in app.v_billing_feedback.get())
+app.proc = _before_billing_proc
 with patch.object(app, "summary_now") as _summary:
     app.v_summary_start.set(_start)
     app.v_summary_end.set(_end)
     app.btn_summary.invoke()
     check("唯一生成按钮按选定日期提交", _summary.call_args.args == ("by_date",)
           and _summary.call_args.kwargs == {"start_date": _start, "end_date": _end, "force": False})
-with patch("msgx.gui.threading.Thread") as _thread, patch.object(N, "running_instances", return_value={"injectors": 1}), \
-        patch.object(N, "launch") as _launch, patch.object(N, "quick_login", return_value={"ok": True, "note": "自动登录成功"}) as _quick:
-    app.auto_login()
-    app.auto_login()
-    check("自动登录防止重复点击且立即提示", _thread.call_count == 1 and app.btn_login.instate(["disabled"])
-          and "正在自动登录" in app.status.get())
+with patch("msgx.gui.threading.Thread") as _thread, patch.object(_mb, "askyesno", return_value=True), \
+        patch.object(N, "restart_target", return_value={"ok": True, "note": "已请求重启"}) as _restart, \
+        patch.object(app.events, "put") as _put, patch.object(app, "_start_qrcode_watch") as _watch:
+    app.restart_napcat()
+    app.restart_napcat()
+    check("强制重启保留且防重复", _thread.call_count == 1 and app._login_busy)
     _thread.call_args.kwargs["target"]()
-    check("已有实例只复用登录，不再启动第二份 QQ", _quick.call_count == 1 and not _launch.called)
-    app._login_finished({"ok": True, "note": "自动登录成功"})
-    check("登录完成恢复按钮", not app._login_busy and app.btn_login.instate(["!disabled"]))
-with patch("msgx.gui.threading.Thread") as _thread, patch.object(N, "running_instances", return_value={"injectors": 0}), \
-        patch.object(N, "launch", return_value={"ok": True}) as _launch, \
-        patch.object(N, "quick_login", return_value={"ok": False, "scan": True, "note": "请重新扫码"}) as _quick, \
-        patch.object(N, "refresh_login_qrcode", return_value={"ok": False, "scan": True, "note": "模拟二维码"}), \
-        patch.object(app, "_start_qrcode_watch") as _watch, patch.object(N, "restart") as _restart:
-    app.auto_login()
+    app._dispatch_event(*_put.call_args.args[0])
+    check("移除自动登录后强制重启回调不访问旧控件", _restart.call_count == 1 and not app._login_busy
+          and _watch.called and app._login_pending)
+with patch("msgx.gui.threading.Thread") as _thread, \
+        patch.object(N, "refresh_login_qrcode", return_value={"ok": False, "scan": True, "note": "请重新扫码"}) as _refresh, \
+        patch.object(app, "_start_qrcode_watch") as _watch:
+    app.relogin_napcat()
+    app.relogin_napcat()
+    check("重新扫码防止重复点击", _thread.call_count == 1 and app.btn_relogin.instate(["disabled"]))
     _thread.call_args.kwargs["target"]()
-    check("未启动时只启动一份后尝试凭证登录", _launch.call_count == 1 and _quick.call_count == 1)
     app._login_finished({"ok": False, "scan": True, "note": "请重新扫码"})
-    check("凭证失败给扫码入口而非强制重启", _watch.called and not _restart.called)
+    check("移除自动登录后扫码仍可完成并恢复控件", _refresh.call_count == 1 and _watch.called
+          and not app._login_busy and app.btn_relogin.instate(["!disabled"]))
 
 print("\n=== 0.6.5 新消息验证 ===")
 app._login_verify_since = time.time() - 2
@@ -988,6 +1014,19 @@ check("再次点击升序且未知仍在末尾", app.usage_table.get_children() 
 app._render_usage(_usage_data)
 check("刷新后保留排序方向", app.usage_table.get_children() == ("2", "0", "1", "3")
       and app.usage_table.heading("cost", "text").endswith("▲"))
+_usage_usd = {"groups": [{**_usage_data["groups"][0], "cost_usd": 0.02}],
+              "items": [{**_usage_data["items"][0], "cost_usd": 0.02, "service_tier": "default", "cache_write_tokens": 22},
+                        {**_usage_data["items"][1]}],
+              "openai_utc_days": [{"day": "2026-09-25", "cost_usd": 0.0449043, "calls": 3,
+                                    "unknown_calls": 1, "unknown_usd_calls": 1}]}
+app._render_usage(_usage_usd)
+check("美元与服务层级显示，历史不伪造美元", app.usage_table.set("0", "usd") == "0.020000"
+      and app.usage_table.set("0", "tier") == "default" and app.usage_table.set("1", "usd") == "未知")
+check("缓存写入显示且历史缺失保持未知", app.usage_table.set("0", "cache_write") == "22"
+      and app.usage_table.set("1", "cache_write") == "未知" and "缓存读" in app.usage_table.heading("cache", "text"))
+check("北京与平台UTC日期明确区分", "北京" in app.usage_table.heading("time", "text")
+      and "UTC 00:00 = 北京 08:00" in app.v_openai_utc.get() and "2026-09-25：$0.044904" in app.v_openai_utc.get()
+      and "1 次未知" in app.v_openai_utc.get() and "本地估算" in app.v_openai_utc.get())
 
 print("\n=== 0.7.0 API 配置与密钥隔离 ===")
 from msgx import api_settings, credentials
