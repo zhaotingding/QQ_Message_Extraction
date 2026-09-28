@@ -42,6 +42,7 @@ import hashlib
 import json
 import re
 import subprocess
+import uuid
 import time
 import urllib.request
 import urllib.error
@@ -299,8 +300,8 @@ def recover_worker(cfg: dict, account: str) -> dict:
         return {"ok": False, "note": "请求恢复 NapCat 未成功；本次不重复重启，请查看协议端日志"}
 
 
-def restart_target(cfg: dict) -> dict:
-    """手动重启只通过本机 NapCat 管理接口，不使用全退 QQ 的脚本。"""
+def restart_target(cfg: dict, wait_seconds: float = 120) -> dict:
+    """手动重启独立于自动恢复：定向退出并等待本次新二维码。"""
     target = str((cfg.get("napcat") or {}).get("account") or "").strip()
     dir_ = resolve_dir(cfg)
     if not target.isascii() or not target.isdigit() or target == "0" or dir_ is None:
@@ -308,14 +309,57 @@ def restart_target(cfg: dict) -> dict:
     try:
         client = _WebUI(dir_)
         info = client.call("/QQLogin/GetQQLoginInfo") or {}
-        saved = str(client.call("/QQLogin/GetQuickLoginQQ") or "")
         current = str(info.get("uin") or "")
-        if current not in ("", "0", target) or saved != target:
-            return {"ok": False, "note": "NapCat 当前账号或自动登录账号与目标 QQ 不一致；请先在 NapCat 管理页切换，未重启"}
-        client.call("/QQLogin/RestartNapCat")
-        return {"ok": True, "account": target, "note": f"已请求重启目标 QQ {target} 的 NapCat；等待新消息验证"}
+        if current not in ("", "0", target):
+            return {"ok": False, "note": "NapCat 当前账号与目标 QQ 不一致，未重启"}
     except (OSError, ValueError, KeyError, RuntimeError):
-        return {"ok": False, "note": "NapCat 管理接口无法重启；未执行全退 QQ，请手动检查 NapCat"}
+        pass  # 接口失效时由提权脚本根据安装路径定向查找，不能全退 QQ。
+    pf = preflight(dir_, cfg)
+    if not pf["ok"]:
+        return {"ok": False, "note": "NapCat 安装目录或 QQ 程序不完整，未重启"}
+    script = ROOT / "tools" / "restart_napcat_target.ps1"
+    if not script.is_file():
+        return {"ok": False, "note": "缺少定向重启脚本，未重启"}
+    folder = ROOT / ".ui" / "napcat-restart"
+    ident = uuid.uuid4().hex
+    request = folder / f"{ident}.request.json"
+    result_file = folder / f"{ident}.result.json"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        request.write_text(json.dumps({"dir": str(dir_.resolve()), "account": target,
+                                       "qq": pf["qq"], "result": str(result_file)}), encoding="utf-8")
+        params = subprocess.list2cmdline(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                                         "-File", str(script), "-RequestFile", str(request)])
+        rc = _shell_execute_runas("powershell.exe", params, show=0)
+    except (OSError, ValueError):
+        return {"ok": False, "note": "无法准备或启动强制重启，请检查项目目录写入权限"}
+    if rc <= 32:
+        try:
+            request.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return {"ok": False, "note": "强制重启未启动，请允许本次 UAC 授权"}
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if result_file.exists():
+            try:
+                result = json.loads(result_file.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                time.sleep(0.25)
+                continue
+            try:
+                request.unlink(missing_ok=True)
+                result_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if result.get("scan") and isinstance(result.get("qr_since"), (int, float)):
+                note = "已结束旧 NapCat 进程并生成新二维码；请用目标 QQ 扫码，随后等待新消息验证"
+                if result.get("note"):
+                    note += "；" + result["note"]
+                return {"ok": False, "scan": True, "account": target, "qr_since": result["qr_since"], "note": note}
+            return {"ok": False, "note": str(result.get("note") or "强制重启未完成，请查看协议端日志")}
+        time.sleep(0.5)
+    return {"ok": False, "note": "等待强制重启完成超时；请查看协议端日志，勿连续重复点击"}
 
 
 def refresh_login_qrcode(cfg: dict) -> dict:

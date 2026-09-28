@@ -142,11 +142,12 @@ class AccountTests(unittest.TestCase):
             '/QQLogin/GetQuickLoginQQ': '111',
         }[path]
         cfg = {'napcat':{'dir':'mock','account':'222'}}
-        with patch.object(napcat, '_WebUI', return_value=client):
+        with patch.object(napcat, '_WebUI', return_value=client), patch.object(napcat, '_shell_execute_runas') as launch:
             self.assertFalse(napcat.quick_login(cfg, wait_seconds=0)['ok'])
             self.assertFalse(napcat.refresh_login_qrcode(cfg)['ok'])
             self.assertFalse(napcat.restart_target(cfg)['ok'])
             self.assertFalse(napcat.recover_worker(cfg, '111')['ok'])
+        launch.assert_not_called()
         self.assertFalse(any('Set' in c.args[0] or 'Restart' in c.args[0] for c in client.call.call_args_list))
 
     def test_offline_quick_login_selects_target_not_previous_account(self):
@@ -161,17 +162,19 @@ class AccountTests(unittest.TestCase):
         client.call.assert_any_call('/QQLogin/SetQuickLogin', {'uin':'222'})
         self.assertFalse(any(c.args[-1] == {'uin':'111'} for c in client.call.call_args_list))
 
-    def test_manual_restart_only_uses_target_worker(self):
+    def test_manual_restart_does_not_use_automatic_worker_recovery(self):
         client = Mock()
         client.call.side_effect = lambda path: {
             '/QQLogin/GetQQLoginInfo': {'uin':'222'},
             '/QQLogin/GetQuickLoginQQ': '222',
             '/QQLogin/RestartNapCat': None,
         }[path]
-        with patch.object(napcat, '_WebUI', return_value=client), patch.object(napcat, 'restart') as force:
+        with patch.object(napcat, '_WebUI', return_value=client), \
+                patch.object(napcat, 'preflight', return_value={'ok': False}), \
+                patch.object(napcat, 'restart') as force:
             result = napcat.restart_target({'napcat':{'dir':'mock','account':'222'}})
-        self.assertTrue(result['ok'])
-        client.call.assert_any_call('/QQLogin/RestartNapCat')
+        self.assertFalse(result['ok'])
+        self.assertFalse(any('RestartNapCat' in c.args[0] for c in client.call.call_args_list))
         force.assert_not_called()
 
 

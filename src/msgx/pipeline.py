@@ -796,6 +796,7 @@ class Pipeline:
         return {
             "ok": True,
             "uptime_seconds": int(time.time() - self.started_at),
+            "target_account": self.target_account,
             "llm_available": llm.available,
             "vision_enabled": llm.vision_available,
             "api_provider": llm.cfg.get("api", {}).get("provider", "旧版 DeepSeek"),

@@ -31,7 +31,7 @@ except ImportError:
     raise SystemExit(1)
 
 from msgx.gui import App  # noqa: E402
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 # 测试界面不得接触用户的真实凭据存储。
 patch("msgx.gui.credentials.read", return_value="").start()
@@ -188,7 +188,7 @@ for got, want in labels.items():
 
 print("\n=== 显示刷新（用假数据）===")
 app._apply_health(None)
-check("health=None 时不崩", "超时" in app.v_peer.get(), app.v_peer.get())
+check("服务未响应时不误报 QQ 掉线", "消息服务未响应" in app.v_peer.get() and "QQ 状态未知" in app.v_peer.get(), app.v_peer.get())
 
 app._apply_health({
     "ok": True,
@@ -556,18 +556,17 @@ app.cfg["napcat"] = {"dir": "tests/nonexistent-napcat"}  # 不碰真实协议端
 # 刚武装的监视线程 2 秒内被掐死，而 bat（UAC→清场→重登→写码）20~60 秒后才写新码，
 # 等真要扫码时已经没人在盯文件。用户连点 4 次重置全部哑火，就是这个死循环。
 # ---------------------------------------------------------------------------
-print("\n=== 二维码监视：保护窗（v0.5.6）===")
+print("\n=== 二维码监视：旧连接不能关闭（v0.7.8）===")
 app.qr_watching = True
-app.qr_hold_until = time.time() + 120  # 刚点过「重启协议端」
 app._apply_health({
     "ok": True, "ws_peers": ["127.0.0.1"], "counters": {}, "stats": {},
 })
-check("保护窗内：旧连接还在也不许杀监视线程", app.qr_watching is True, str(app.qr_watching))
-app.qr_hold_until = 0.0  # 保护窗已过
+check("旧连接还在也不许停止扫码监视", app.qr_watching is True, str(app.qr_watching))
+app.qr_started_at = time.time() - 600
 app._apply_health({
     "ok": True, "ws_peers": ["127.0.0.1"], "counters": {}, "stats": {},
 })
-check("保护窗外：连上即停（恢复原语义）", app.qr_watching is False, str(app.qr_watching))
+check("等待十分钟后旧连接仍不能关闭扫码监视", app.qr_watching is True, str(app.qr_watching))
 
 print("\n=== 二维码监视：每次武装都换代（v0.5.6）===")
 app.cfg["napcat"] = {"dir": "tests/nonexistent-napcat"}  # 不碰真实协议端的二维码
@@ -577,7 +576,7 @@ _g1 = app.qr_gen
 app._start_qrcode_watch(fresh_only=True)
 check("每次调用换代号 +1（重置时的新基线请求不再被旧线程吞掉）",
       app.qr_gen == _g0 + 2, f"{_g0} -> {app.qr_gen}")
-check("武装时设了 2 分钟保护窗", app.qr_hold_until > time.time() + 100, str(app.qr_hold_until))
+check("武装时固定新二维码起点", time.time() - 2 < app.qr_started_at <= time.time(), str(app.qr_started_at))
 check("武装后监视为开启态", app.qr_watching is True, str(app.qr_watching))
 app.qr_watching = False
 
@@ -638,11 +637,22 @@ with _tf.TemporaryDirectory() as _tmp:
         _Img.new("RGB", (20, 20), "green").save(_qr)
         _written = time.time()
         os.utime(_qr, (_written, _written))
-        return {"ok": True, "note": "测试重置", "log": "测试日志"}
+        return {"ok": False, "scan": True, "qr_since": _written - 0.01, "note": "测试重置", "log": "测试日志"}
+
+    _before_restart_proc = app.proc
+    _receiver = Mock(stdout=None)
+    _receiver.poll.return_value = None
+
+    def _fake_start_receiver():
+        app.proc = _receiver
+        return True
 
     with patch.dict(os.environ, {"NAPCAT_HOME": str(_nc)}), \
             patch.object(N, "restart_target", side_effect=_fake_restart) as _restart, \
-            patch.object(_mb, "askyesno", return_value=True):
+            patch.object(_mb, "askyesno", return_value=True), \
+            patch.object(app, "start_service", side_effect=_fake_start_receiver), \
+            patch.object(app, "_wait_receiver_ready", return_value=True), \
+            patch.object(app, "_fetch_health"), patch.object(app, "refresh_summary_days"):
         check("未填目录时 GUI 与启动器定位同一目录", app.napcat_dir() == N.resolve_dir(app.cfg) == _nc)
         app.restart_napcat()
         _deadline = time.monotonic() + 3
@@ -699,17 +709,34 @@ with _tf.TemporaryDirectory() as _tmp:
         app.qr_watching = False
         app.qr_gen += 1
         app._close_qrcode()
+    app.proc = _before_restart_proc
 
-print("\n=== 登录成功后立即关闭二维码（v0.5.7）===")
+print("\n=== 0.7.8 只有本轮目标账号新消息才能关闭二维码 ===")
 app.qr_shown_mtime = 0.0
 app._show_qrcode(_ok_png)
 app.qr_watching = True
-app.qr_started_at = time.time()
-app.qr_hold_until = time.time() + 120
+app.qr_started_at = time.time() - 2
+app._login_verify_since = app.qr_started_at
+app._login_account = "123"
+app._login_pending = True
+app._login_busy = False
 app._apply_health({"ws_peers": ["127.0.0.1"], "ws_connected_at": app.qr_started_at - 10})
 check("保护期内旧连接不关闭二维码", app.qr_win is not None and app.qr_watching)
-app._apply_health({"ws_peers": ["127.0.0.1"], "ws_connected_at": app.qr_started_at + 1})
-check("保护期内新连接立即关闭二维码并停监视", app.qr_win is None and not app.qr_watching)
+_qr_health = {"ws_peers": ["127.0.0.1"], "ws_connected_at": app.qr_started_at + 1,
+              "protocol": {"state": "connected"}}
+app._apply_health(_qr_health)
+check("新连接和在线心跳也不能代替新消息关码", app.qr_win is not None and app.qr_watching)
+_qr_health["last_protocol_message"] = dict(received_at=time.time(), message_time=int(time.time()), self_id="456")
+app._apply_health(_qr_health)
+check("其他账号的新消息不能关闭目标账号二维码", app.qr_win is not None and app.qr_watching and app._login_pending)
+_qr_health["last_protocol_message"]["self_id"] = "123"
+app._login_busy = True
+app._apply_health(_qr_health)
+check("重启尚未结束时旧进程新消息不能判定成功", app.qr_win is not None and app.qr_watching and app._login_pending)
+app._login_busy = False
+app._apply_health(_qr_health)
+check("收到目标账号本轮新消息才关闭二维码并确认成功", app.qr_win is None and not app.qr_watching
+      and not app._login_pending and "登录成功" in app.status.get())
 app._close_qrcode()
 check("图片列明确显示已过滤", App._media_label({"media_state": "filtered"}) == "已过滤")
 check("普通无图消息仍显示横线", App._media_label({"media_state": "none", "text": "普通文字"}) == "—")
@@ -951,16 +978,110 @@ with patch.object(app, "summary_now") as _summary:
     app.btn_summary.invoke()
     check("唯一生成按钮按选定日期提交", _summary.call_args.args == ("by_date",)
           and _summary.call_args.kwargs == {"start_date": _start, "end_date": _end, "force": False})
+_before_restart_proc = app.proc
+app.proc = None
+_receiver = Mock(stdout=None)
+_receiver.poll.return_value = None
+_restart_steps = []
+
+
+def _start_test_receiver():
+    _restart_steps.append("start")
+    app.proc = _receiver
+    return True
+
+
+def _ready_test_receiver(*args, **kwargs):
+    _restart_steps.append("ready")
+    return True
+
+
+def _restart_test_target(cfg):
+    _restart_steps.append("restart")
+    return {"ok": False, "scan": True, "qr_since": time.time(), "account": "123", "note": "请扫码"}
+
+
 with patch("msgx.gui.threading.Thread") as _thread, patch.object(_mb, "askyesno", return_value=True), \
-        patch.object(N, "restart_target", return_value={"ok": True, "note": "已请求重启"}) as _restart, \
+        patch.object(N, "restart_target", side_effect=_restart_test_target) as _restart, \
+        patch.object(app, "start_service", side_effect=_start_test_receiver) as _start, \
+        patch.object(app, "_wait_receiver_ready", side_effect=_ready_test_receiver) as _ready, \
         patch.object(app.events, "put") as _put, patch.object(app, "_start_qrcode_watch") as _watch:
     app.restart_napcat()
     app.restart_napcat()
     check("强制重启保留且防重复", _thread.call_count == 1 and app._login_busy)
     _thread.call_args.kwargs["target"]()
     app._dispatch_event(*_put.call_args.args[0])
-    check("移除自动登录后强制重启回调不访问旧控件", _restart.call_count == 1 and not app._login_busy
+    check("服务未启动时先启动且确认就绪才重启协议端", _restart_steps == ["start", "ready", "restart"]
+          and _start.call_count == 1 and _ready.call_count == 1)
+    check("强制扫码回调进入新消息待验证而非登录成功", _restart.call_count == 1 and not app._login_busy
           and _watch.called and app._login_pending)
+
+print("\n=== 0.7.8 接收服务失败门禁和进程归属 ===")
+app.proc = None
+with patch.object(_mb, "askyesno", return_value=True), \
+        patch.object(app, "start_service", return_value=False), \
+        patch.object(N, "restart_target") as _restart, \
+        patch("msgx.gui.threading.Thread") as _thread:
+    app.restart_napcat()
+    check("接收服务启动失败不进入协议重启线程", not _restart.called and not _thread.called
+          and not app._login_busy and app.btn_restart.instate(["!disabled"]))
+
+app.proc = _receiver
+with patch.object(_mb, "askyesno", return_value=True), \
+        patch.object(app, "start_service") as _start, \
+        patch.object(app, "_wait_receiver_ready", return_value=False), \
+        patch.object(N, "restart_target") as _restart, \
+        patch("msgx.gui.threading.Thread") as _thread, patch.object(app.events, "put") as _put:
+    app.restart_napcat()
+    _thread.call_args.kwargs["target"]()
+    app._dispatch_event(*_put.call_args.args[0])
+    check("接收服务未就绪不会重启协议端且恢复按钮", not _restart.called and not _start.called
+          and not app._login_busy and not app._login_pending and app.btn_restart.instate(["!disabled"]))
+
+_ready_cfg = {**app.cfg, "napcat": {"account": "123"}}
+for _health_result, _socket_error, _expected in [
+        ({"ok": True, "target_account": "123"}, None, True),
+        ({"ok": True, "target_account": "456"}, None, False),
+        ({"ok": False, "target_account": "123"}, None, False),
+        ({"ok": True, "target_account": "123"}, OSError("测试 WS 端口未监听"), False)]:
+    with patch("msgx.gui.urllib.request.build_opener") as _opener, \
+            patch("msgx.gui.socket.create_connection", side_effect=_socket_error) as _socket, \
+            patch("msgx.gui.time.monotonic", side_effect=[0, 0, 1]), \
+            patch("msgx.gui.time.sleep"), patch.object(Path, "exists", return_value=False):
+        _opener.return_value.open.return_value.__enter__.return_value.read.return_value = json.dumps(_health_result).encode()
+        _ready_result = app._wait_receiver_ready(_receiver, _ready_cfg, timeout=1)
+        check("就绪门禁同时核对健康结果、目标账号和 WS 端口", _ready_result is _expected,
+              f"health={_health_result}, socket_error={bool(_socket_error)}, ready={_ready_result}")
+        check("健康检查仅请求本机端点", _opener.return_value.open.call_args.args[0]
+              == f"http://127.0.0.1:{app.cfg['onebot']['http_port']}/health")
+        if _socket.called:
+            check("WS 就绪检查使用已配置本机端口", _socket.call_args.args[0] == ("127.0.0.1", app.cfg["onebot"]["ws_port"]))
+
+for _case in ("进程退出", "关闭界面", "停止信号", "就绪超时"):
+    _receiver.poll.return_value = 1 if _case == "进程退出" else None
+    app.closing = _case == "关闭界面"
+    with patch("msgx.gui.urllib.request.build_opener") as _opener, \
+            patch("msgx.gui.socket.create_connection") as _socket, \
+            patch.object(Path, "exists", return_value=_case == "停止信号"):
+        _ready_result = app._wait_receiver_ready(_receiver, _ready_cfg, timeout=0 if _case == "就绪超时" else 1)
+        check(f"就绪等待遇到{_case}立即返回失败", not _ready_result and not _opener.return_value.open.called and not _socket.called)
+app.closing = False
+_receiver.poll.return_value = None
+
+_old_receiver = Mock(stdout=Mock())
+app.proc = _receiver
+app.v_service.set("新进程启动中")
+app._dispatch_event("health", (_old_receiver, {"ok": True}))
+check("旧进程健康响应不把新服务提前标成运行中", app.v_service.get() == "新进程启动中")
+app._dispatch_event("exit", (_old_receiver, 1))
+check("旧进程延迟退出事件不清除新接收进程", app.proc is _receiver)
+app._dispatch_event("exit", (_receiver, 2))
+check("当前接收进程退出才恢复启动按钮", app.proc is None and app.btn_start.instate(["!disabled"])
+      and "服务异常退出" in app.status.get())
+app._dispatch_event("health", (_receiver, {"ok": True}))
+check("退出后的排队健康响应不会把服务改回运行中", app.v_service.get() == "未运行")
+app.proc = _before_restart_proc
+
 with patch("msgx.gui.threading.Thread") as _thread, \
         patch.object(N, "refresh_login_qrcode", return_value={"ok": False, "scan": True, "note": "请重新扫码"}) as _refresh, \
         patch.object(app, "_start_qrcode_watch") as _watch:

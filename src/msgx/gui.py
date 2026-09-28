@@ -16,6 +16,7 @@ import os
 import queue
 import re
 import sqlite3
+import socket
 import subprocess
 import sys
 import threading
@@ -115,17 +116,11 @@ class App:
         #   qr_gen          —— 监视线程的「换代号」。每次 _start_qrcode_watch 都 +1，
         #                      旧线程发现代数对不上就自行退出。此前用「在跑就不重开」的
         #                      单例守卫，重置时的新基线请求会被旧线程吞掉。
-        #   qr_hold_until   —— 保护窗截止时刻。重置/启动后的 2 分钟内，健康轮询
-        #                      不许因旧连接还在而停掉监视线程；新连接可提前结束保护。
-        #                      冻结形态恰恰是「连着但不推」，旧连接在重置后还存活十几秒，
-        #                      没有这道窗，刚武装的线程 2 秒内就会被健康轮询掐死，
-        #                      等 bat 清场重登写出新码时已经没人在盯文件 ——
-        #                      表现就是「点了重置，二维码从不弹出」。
+        #   仅目标账号在本次扫码后收到的新消息可以关闭二维码；连接和心跳不能代替它。
         #   qr_shown_mtime  —— 已成功展示的二维码 mtime。展示失败（图片正被
         #                      NapCat 重写、读到半张 PNG）就不推进监视基线，
         #                      下一秒同一张码再试，直到弹出来为止。
         self.qr_gen = 0
-        self.qr_hold_until = 0.0
         self.qr_started_at = 0.0
         self.qr_shown_mtime = 0.0
         self._qr_fail_logged = 0.0
@@ -265,9 +260,8 @@ class App:
         # 强制重启和重新扫码保留为手动恢复入口。
         self.btn_restart = None
         if self.napcat_script() or self.napcat_dir():
-            if napcat_mod.restart_script(self.cfg):
-                self.btn_restart = ttk.Button(buttons2, text="强制重启", command=self.restart_napcat)
-                self.btn_restart.pack(side="right")
+            self.btn_restart = ttk.Button(buttons2, text="强制重启", command=self.restart_napcat)
+            self.btn_restart.pack(side="right")
         self.btn_billing = ttk.Button(buttons2, text="刷新账单", command=self.refresh_billing)
         self.btn_billing.pack(side="right", padx=8)
         self.v_billing_feedback = tk.StringVar(value="账单金额为本地估算")
@@ -1474,15 +1468,20 @@ class App:
 
     # ---------------- 服务进程 ----------------
 
-    def start_service(self) -> None:
+    def start_service(self) -> bool:
         if self.proc is not None:
-            return
+            return self.proc.poll() is None
         if not self.save_prefs(silent=False):
-            return
+            return False
         if self._login_config() is None:
-            return
+            return False
 
-        self.stop_file.unlink(missing_ok=True)  # 清掉上次停止留下的信号，否则新进程会立刻退出
+        try:
+            self.stop_file.unlink(missing_ok=True)  # 清掉旧停止信号，否则新进程会立刻退出
+        except OSError as exc:
+            self.status.set("无法清理旧停止信号，服务未启动；请查看界面日志")
+            self._trace_gui(f"清理停止信号失败：{exc}")
+            return False
         env = os.environ.copy()
         env["MSGX_PREFS"] = str(self.prefs_file)  # 让服务读到界面偏好
         env["PYTHONPATH"] = str(ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
@@ -1497,6 +1496,7 @@ class App:
             cmd += ["--config", str(self.config_path)]
 
         self._log_ui("正在启动服务…\n")
+        self._trace_gui("请求启动消息服务")
         try:
             self.proc = subprocess.Popen(
                 cmd,
@@ -1514,19 +1514,23 @@ class App:
             self.proc = None
             self.status.set(f"服务启动失败：{exc}")
             self._log_ui(f"[界面] 服务启动失败：{exc}\n")
-            return
+            self._trace_gui(f"服务启动失败：{exc}")
+            return False
 
-        self.v_service.set("运行中")
+        self.v_service.set("启动中")
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
-        self.status.set("服务已启动，等待协议端连入…")
+        self.status.set("服务进程已创建，正在等待接收端口就绪…")
+        self._trace_gui(f"服务进程已创建 pid={self.proc.pid}")
         threading.Thread(target=self._read_pipe, args=(self.proc,), daemon=True).start()
+        return True
 
     def stop_service(self) -> None:
         if self.proc is None:
             return
         try:
             self.stop_file.touch()
+            self._trace_gui("用户请求停止消息服务，已写入停止信号")
         except OSError as exc:
             self.status.set(f"服务停止失败：{exc}")
             self._log_ui(f"[界面] 服务停止失败：{exc}\n")
@@ -1540,7 +1544,7 @@ class App:
             for line in proc.stdout:  # type: ignore[union-attr]
                 self.events.put(("line", line))
         finally:
-            self.events.put(("exit", proc.wait()))
+            self.events.put(("exit", (proc, proc.wait())))
 
     def _chosen_summary_dates(self) -> tuple[date, date]:
         raw_start = self.v_summary_start.get().strip()
@@ -2049,20 +2053,21 @@ class App:
             self.btn_restart.configure(state="normal")
         self.status.set(result["note"])
         self._log_ui(f"[界面] {result['note']}\n")
-        if result.get("ok"):
+        self._trace_gui(f"协议操作结果：{result['note']}")
+        if result.get("ok") or result.get("scan"):
             self._login_pending = True
             self._login_account = str(result.get("account") or self.prefs.get("qq_account") or "")
-            self._login_verify_since = self._login_verify_since or time.time()
-            self.status.set("已连接，等待新消息验证；收到新 QQ 群消息后才确认登录成功")
-            self.qr_watching = False
+            self._login_verify_since = float(result.get("qr_since") or self._login_verify_since or time.time())
+        if result.get("scan"):
             self._close_qrcode()
+            self._start_qrcode_watch(fresh_only=True, since=self._login_verify_since)
+        elif result.get("ok"):
+            self.status.set("已连接，等待新消息验证；收到新 QQ 群消息后才确认登录成功")
             if result.get("restart_since"):
                 self._start_qrcode_watch(fresh_only=True, since=result["restart_since"])
-        elif result.get("scan"):
-            self._start_qrcode_watch(fresh_only=True, since=result.get("qr_since", time.time() - 120))
 
     def _verify_login_message(self, data: dict) -> None:
-        if not self._login_pending:
+        if not self._login_pending or self._login_busy:
             return
         message = data.get("last_protocol_message") or {}
         if ((data.get("protocol") or {}).get("state") == "connected"
@@ -2073,6 +2078,7 @@ class App:
             note = "登录成功，已收到新 QQ 群消息，消息接收已恢复"
             self.status.set(note)
             self._log_ui(f"[界面] {note}\n")
+            self._trace_gui(note)
         elif not self._login_wait_noted and time.time() - self._login_verify_since >= 60:
             self._login_wait_noted = True
             note = "尚未验证消息接收：暂未收到新 QQ 群消息；继续等待，不自动重启"
@@ -2102,12 +2108,14 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def restart_napcat(self) -> None:
-        """仅重启已绑定账号的 NapCat Worker，不结束普通 QQ。"""
+        """先确保接收服务就绪，再重启目标 NapCat 并请求新二维码。"""
         cfg = self._login_config()
         if cfg is None or self._login_busy:
             return
         account = cfg["napcat"]["account"]
-        if not messagebox.askyesno("强制重启协议端", f"仅重启目标 QQ {account} 的 NapCat 登录进程。继续吗？", parent=self.root):
+        if not messagebox.askyesno("强制重启协议端", f"退出目标 QQ {account} 的 NapCat 进程并重新扫码。\n"
+                                  "消息接收服务未运行时会先启动；不结束普通 QQ，不删除历史数据。\n"
+                                  "可能需要一次 UAC 授权。继续吗？", parent=self.root):
             return
         self._login_busy = True
         self._login_verify_since = time.time()
@@ -2117,16 +2125,49 @@ class App:
         self.btn_relogin.configure(state="disabled")
         if self.btn_restart is not None:
             self.btn_restart.configure(state="disabled")
-        self.status.set("正在请求重启目标账号的 NapCat…")
-        self._log_ui(f"[界面] 正在请求重启目标 QQ {account} 的 NapCat…\n")
+        self.qr_watching = False
+        self.qr_gen += 1
+        self._close_qrcode()
+        self.status.set("正在检查消息接收服务；就绪后重启协议端并生成新二维码…")
+        self._log_ui(f"[界面] 开始强制重启目标 QQ {account}：先检查消息接收服务…\n")
+        self._trace_gui(f"用户请求强制重启目标 QQ {account}")
+        if self.proc is not None and self.proc.poll() is not None:
+            self._dispatch_event("exit", (self.proc, self.proc.returncode))
+        if self.proc is None and not self.start_service():
+            self._login_finished({"ok": False, "note": "消息服务未能启动，未重启协议端；请检查设置和服务日志"})
+            return
+        proc = self.proc
 
         def work() -> None:
+            if not self._wait_receiver_ready(proc, cfg):
+                self.events.put(("login_done", {"ok": False, "note": "消息接收服务未就绪或已停止，未重启协议端；请查看服务日志"}))
+                return
+            self.events.put(("note", "消息接收服务已就绪，正在退出目标 NapCat 并请求新二维码；如有 UAC 请允许…"))
             result = napcat_mod.restart_target(cfg)
-            if result.get("ok"):
-                result["restart_since"] = self._login_verify_since
             self.events.put(("login_done", result))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _wait_receiver_ready(self, proc, cfg: dict, timeout: float = 30) -> bool:
+        """工作线程就绪门禁，只访问本机；失败时不动协议端。"""
+        port = int(cfg["onebot"]["http_port"])
+        ws_port = int(cfg["onebot"]["ws_port"])
+        account = str(cfg["napcat"]["account"])
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if proc is None or proc.poll() is not None or self.closing or self.stop_file.exists():
+                return False
+            try:
+                with opener.open(f"http://127.0.0.1:{port}/health", timeout=2) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                if data.get("ok") and str(data.get("target_account") or "") == account:
+                    with socket.create_connection(("127.0.0.1", ws_port), timeout=2):
+                        return proc.poll() is None and not self.closing and not self.stop_file.exists()
+            except (OSError, ValueError, AttributeError):
+                pass
+            time.sleep(0.5)
+        return False
 
     # ---------------- 登录二维码 ----------------
 
@@ -2141,7 +2182,7 @@ class App:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as f:
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} "
-                        f"thread={threading.current_thread().name} {message}\n")
+                        f"thread={threading.current_thread().name} {security.redact(message)}\n")
         except OSError:
             pass  # 日志不可写不能阻止扫码
 
@@ -2153,13 +2194,12 @@ class App:
         现在每次调用都换代 + 起新线程，旧线程下一秒发现代数对不上自行退出；
         排队中的旧代事件也会被丢弃，避免旧码盖住新码。
 
-        同时设 2 分钟保护窗（见 ``__init__`` 里 ``qr_hold_until`` 的注释）。
+        只在目标账号的新消息验证通过后停止监视，不能由旧连接或心跳提前关闭。
         """
         self.qr_gen += 1
         self.qr_shown_mtime = 0.0
         since = time.time() if since is None else since
         self.qr_started_at = since
-        self.qr_hold_until = time.time() + 120
         if not self.qr_watching:
             self.qr_watching = True
         self._trace_gui(f"监视启动 gen={self.qr_gen} fresh_only={fresh_only} since={since} dir={self.napcat_dir()}")
@@ -2277,11 +2317,13 @@ class App:
     def _tick_health(self) -> None:
         if not self.health_busy and self.proc is not None:
             self.health_busy = True
-            threading.Thread(target=self._fetch_health, daemon=True).start()
+            threading.Thread(target=self._fetch_health, args=(self.proc,), daemon=True).start()
             if not self._summary_days_busy and time.time() - self._summary_days_checked >= 30:
                 self.refresh_summary_days()
         elif self.proc is None:
-            self.v_peer.set("—")
+            self.v_service.set("未运行")
+            self.v_peer.set("消息服务未运行 · 协议端无法接入")
+            self.v_protocol_detail.set("请启动服务；强制重启也会先启动接收服务。此状态不表示 QQ 登录失效。")
             self.v_stored.set("—")
             self.v_cost.set("—")
             self.v_total.set("—")
@@ -2314,7 +2356,7 @@ class App:
                              args=(self._rt_limit, self.v_rt_filter.get() == "仅看图片"), daemon=True).start()
         self.root.after(3000, self._tick_realtime)
 
-    def _fetch_health(self) -> None:
+    def _fetch_health(self, proc) -> None:
         port = int(self.cfg["onebot"]["http_port"])
         data = None
         try:
@@ -2325,7 +2367,7 @@ class App:
             data = None
         finally:
             self.health_busy = False
-        self.events.put(("health", data))
+        self.events.put(("health", (proc, data)))
 
     # ---------------- 事件循环 ----------------
 
@@ -2350,7 +2392,7 @@ class App:
                     % (kind, traceback.format_exc(limit=3).replace("\n", " | "))
                 )
 
-            if kind == "exit" and self.closing:
+            if kind == "exit" and self.closing and self.proc is None:
                 self.root.destroy()
                 return
 
@@ -2364,6 +2406,10 @@ class App:
             self._log_ui(f"[界面] {value}\n")
             self.status.set(value)
         elif kind == "health":
+            if isinstance(value, tuple):
+                proc, value = value
+                if proc is not self.proc or proc is None:
+                    return
             self._apply_health(value)
         elif kind == "billing":
             self._apply_billing(value)
@@ -2403,6 +2449,12 @@ class App:
             if gen == self.qr_gen and self.qr_watching and not self.closing:
                 self._show_qrcode(path)
         elif kind == "exit":
+            if isinstance(value, tuple):
+                proc, code = value
+                if proc is not self.proc:
+                    return  # 旧进程的排队退出事件不能清掉新服务
+                value = code
+            self._trace_gui(f"消息服务已退出 code={value}")
             if self.proc is not None and self.proc.stdout:
                 try:
                     self.proc.stdout.close()
@@ -2410,6 +2462,8 @@ class App:
                     pass
             self.proc = None
             self.v_service.set("未运行")
+            self.v_peer.set("消息服务未运行 · 协议端无法接入")
+            self.v_protocol_detail.set("接收服务已停止，NapCat 的本机连接会被拒绝；不表示 QQ 掉线。")
             self.btn_start.configure(state="normal")
             self.btn_stop.configure(state="disabled")
             self._log_ui(f"\n[界面] 服务进程已退出（退出码 {value}）\n")
@@ -2418,10 +2472,12 @@ class App:
     def _apply_health(self, data: dict | None) -> None:
         self._verify_login_message(data or {})
         if data is None:
-            self.v_peer.set("未连接（服务响应超时）")
+            self.v_service.set("启动中或未响应")
+            self.v_peer.set("消息服务未响应 · QQ 状态未知")
             self.v_protocol_detail.set("服务未响应，暂时无法确认 QQ 登录状态")
             self.btn_relogin.grid_remove()
             return
+        self.v_service.set("运行中")
         peers = data.get("ws_peers") or []
         protocol = data.get("protocol") or {}
         self._protocol_state = protocol
@@ -2440,16 +2496,17 @@ class App:
             verified = (float(received.get("received_at") or 0) > max(float(data.get("ws_connected_at") or 0), self._login_verify_since)
                         and float(received.get("message_time") or 0) >= int(max(float(data.get("ws_connected_at") or 0), self._login_verify_since))
                         and (not self.prefs.get("qq_account") or str(received.get("self_id")) == self.prefs["qq_account"])
-                        and (not self._login_account or str(received.get("self_id")) == self._login_account))
+                        and (not self._login_account or str(received.get("self_id")) == self._login_account)
+                        and not self._login_busy and state == "connected")
             self.v_peer.set(f"已连接 · {'已验证消息接收' if verified else '等待新消息验证'} · {', '.join(peers)}")
-            # v0.5.7：保护的是重置前旧连接，扫码后的新连接不应再等待两分钟。
-            # 由服务记录连接建立时间，即使断开/重连都发生在两次轮询之间也能识别。
-            connected_at = float(data.get("ws_connected_at") or 0.0)
-            if connected_at >= self.qr_started_at > 0 or time.time() >= self.qr_hold_until:
+            if verified:
                 if self.qr_watching:
-                    self._trace_gui(f"协议端已连接，结束扫码监视 connected_at={connected_at}")
-                self.qr_watching = False  # 已连上，没必要再盯着二维码
+                    self._trace_gui("收到目标账号的新消息，结束扫码监视")
+                self.qr_watching = False
                 self._close_qrcode()
+        elif self._login_pending and self.qr_watching:
+            self.v_peer.set("等待扫码 · 消息接收未验证")
+            self.btn_relogin.grid()
         elif state == "disconnected":
             self.v_peer.set("连接中断 · 等待自动重连")
         elif self.napcat_script() or self.napcat_dir():

@@ -31,8 +31,10 @@ SUITES = [
     ("群列表属主", "test_groups.py"),
     ("无额外推理与过滤链路", "test_pipeline.py"),
     ("服务生命周期", "test_service.py"),
+    ("服务日志与脱敏", "test_service_logging.py"),
     ("断线原因与重连", "test_connection.py"),
     ("缓存凭证自动登录", "test_login.py"),
+    ("手动强制重启与进程隔离", "test_napcat_restart.py"),
     ("界面构建", "test_gui.py"),
 ]
 

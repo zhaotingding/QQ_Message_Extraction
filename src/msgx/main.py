@@ -4,18 +4,26 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from contextlib import suppress
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from aiohttp import web
 
-from .config import load
+from .config import abs_path, load
 from .onebot import build_app
 from .pipeline import Pipeline
 
 
-def setup_logging(level: str) -> None:
+class _ServiceLogHandler(RotatingFileHandler):
+    def handleError(self, record: logging.LogRecord) -> None:
+        # 日志目录失去写权限等情况不能中断收消息，也不向 stderr 回显原始记录。
+        pass
+
+
+def setup_logging(level: str, log_path: Path | None = None) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)-7s %(name)-16s %(message)s",
@@ -26,6 +34,25 @@ def setup_logging(level: str) -> None:
     from .security import SecretFilter
     for handler in logging.getLogger().handlers:
         handler.addFilter(SecretFilter())
+    if log_path is None:
+        return
+    log_path = log_path.resolve()
+    if any(isinstance(h, _ServiceLogHandler) and h.baseFilename == str(log_path)
+           for h in logging.getLogger().handlers):
+        return
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = _ServiceLogHandler(
+            log_path, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8",
+        )
+    except OSError as exc:
+        logging.getLogger("msgx").warning("服务日志无法写入（%s），继续运行", type(exc).__name__)
+        return
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(name)-16s %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    handler.addFilter(SecretFilter())
+    logging.getLogger().addHandler(handler)
 
 
 async def cmd_run(cfg: dict, stop_file: str | None = None) -> None:
@@ -240,7 +267,9 @@ def main(argv: list[str] | None = None) -> int:
         return gui_main(args.config)
 
     cfg = load(args.config)
-    setup_logging(cfg["app"]["log_level"])
+    is_service = args.cmd == "run"
+    setup_logging(cfg["app"]["log_level"],
+                  abs_path(cfg, "db_path").parent / "logs/service.log" if is_service else None)
 
     coro = {
         "run": lambda: cmd_run(cfg, args.stop_file),
@@ -250,8 +279,26 @@ def main(argv: list[str] | None = None) -> int:
         "prune": lambda: cmd_prune(cfg),
     }[args.cmd]
 
-    with suppress(KeyboardInterrupt):
+    log = logging.getLogger("msgx")
+    if is_service:
+        log.info("服务进程开始启动（PID %s）", os.getpid())
+    try:
         asyncio.run(coro())
+    except KeyboardInterrupt:
+        if is_service:
+            log.info("服务收到终端中断，已退出（退出码 0）")
+        return 0
+    except SystemExit as exc:
+        if is_service:
+            log.error("服务进程退出（退出码 %s）", exc.code)
+        raise
+    except Exception:
+        if not is_service:
+            raise
+        log.exception("服务进程异常退出（退出码 1）")
+        return 1
+    if is_service:
+        log.info("服务进程已正常退出（退出码 0）")
     return 0
 
 
