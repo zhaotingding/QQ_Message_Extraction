@@ -432,13 +432,12 @@ check("切回服务日志：内容还在（没有被清屏）",
 print("\n=== v0.5.0 新增开关的读写往返 ===")
 data2 = app._collect()
 check("保存内容含协议端隐藏开关", "napcat_hidden" in data2, str(sorted(data2)))
-check("保存内容含平台 token", "platform_token" in data2, str(sorted(data2)))
+check("旧账单凭据控件已移除", not hasattr(app, "txt_platform_token"))
 app.v_napcat_hidden.set(False)
-app.txt_platform_token.delete("1.0", "end")
-app.txt_platform_token.insert("1.0", "  tok-abc  ")
+_legacy_token = app.prefs.get("platform_token")
 d3 = app._collect()
 check("取消勾选后读到 False", d3["napcat_hidden"] is False, str(d3["napcat_hidden"]))
-check("token 两端空白被去掉", d3["platform_token"] == "tok-abc", repr(d3["platform_token"]))
+check("移除旧设置不改写既有凭据", d3.get("platform_token") == _legacy_token)
 
 # 偏好 → 配置的叠加（只覆盖界面明确管理的字段）
 from msgx import prefs as P  # noqa: E402
@@ -940,7 +939,25 @@ app._apply_health({"ws_peers": ["127.0.0.1"], "protocol": {"state": "connected"}
 check("重连后清除登录故障说明", "已连接" in app.v_peer.get() and not app.v_protocol_detail.get())
 
 print("\n=== 0.7.6 移除自动登录、保留手动恢复与消费排序 ===")
+with patch.object(app, "_save_report_notes", return_value=False), patch("msgx.gui.threading.Thread") as _thread:
+    app.summary_now()
+    check("心得保存失败不提交摘要请求", not _thread.called and not app._summary_busy
+          and "心得尚未保存" in app.v_summary.get())
 check("删除无用自动登录控件与方法", not hasattr(app, "btn_login") and not hasattr(app, "auto_login"))
+check("启停与强制重启均在服务状态栏", app.btn_start.master.master.cget("text") == "服务状态"
+      and app.btn_stop.master == app.btn_start.master and app.btn_restart.master == app.btn_start.master)
+check("刷新账单在服务状态栏余额旁", app.btn_billing.master.master.cget("text") == "服务状态")
+app._apply_billing({"source": "estimate", "balance": {"ok": False, "error": "未查询官方余额"}})
+check("无法查询的余额明确引导官方平台", app.v_balance.get() == "请到官方平台查看")
+with patch.dict(app.prefs, {"api": {"base_url": "https://api.openai.com/v1"}}), \
+        patch("msgx.gui.open_url") as _open_platform:
+    app._open_billing_platform()
+    check("OpenAI 平台入口不携带凭据", _open_platform.call_args.args == (
+        "https://platform.openai.com/settings/organization/billing/overview",))
+with patch.dict(app.prefs, {"api": {"base_url": "https://custom.invalid/v1"}}), \
+        patch("msgx.gui.open_url") as _open_platform:
+    app._open_billing_platform()
+    check("自定义接口不误开其他平台", not _open_platform.called and "自定义接口" in app.status.get())
 _before_billing_proc = app.proc
 app.proc = object()
 with patch("msgx.gui.threading.Thread") as _thread, patch("msgx.gui.urllib.request.build_opener") as _opener, \
@@ -1249,8 +1266,9 @@ with closing(sqlite3.connect(_history_db)) as _conn:
     _conn.execute("CREATE TABLE summaries(id INTEGER PRIMARY KEY,window_start INTEGER,window_end INTEGER,"
                   "kind TEXT,content TEXT,report_path TEXT,msg_count INTEGER,created_at INTEGER)")
     _conn.executemany("INSERT INTO summaries VALUES(?,?,?,?,?,?,?,?)", [
-        (1, 1790179200, 1790265600, "periodic", _older_text, "", 50, 100),
+        (1, 1790179200, 1790265600, "daily", _older_text, "", 50, 100),
         (2, 1790265600, 1790352000, "daily", _first_text, str(Path(_reader_temp.name) / "missing.html"), 120, 200),
+        (3, 1790179200, 1790265600, "periodic", "旧版摘要只隐藏", "", 50, 300),
     ])
     _conn.commit()
 _before_db = _history_db.read_bytes()
@@ -1272,7 +1290,8 @@ with patch("msgx.gui.threading.Thread") as _thread, patch("msgx.gui.urllib.reque
     check("摘要数据库连接明确只读", "?mode=ro" in _read_call.args[0] and _read_call.kwargs["uri"])
     check("启动默认最近生成的摘要", app.report_history.selection() == ("2",)
           and "假日报标题" in app.report_text.get("1.0", "end"))
-    check("历史列表显示标题、完整日期、类型和字数", app.report_history.item("2", "text") == "假日报标题"
+    check("旧版类型不显示且不影响最新日报选择", not app.report_history.exists("3"))
+    check("历史列表显示标题、完整日期、类型和字数", "假日报标题" in app.report_history.item("2", "text")
           and "2026-09-25 00:00 — 2026-09-26 00:00" in app.report_history.item("detail-2", "text")
           and "日报" in app.report_history.item("detail-2", "text") and "字" in app.report_history.item("detail-2", "text"))
     check("HTML缺失时数据库正文可读", "第二主题最后一句。" in app.report_text.get("1.0", "end")

@@ -5,6 +5,7 @@ import copy
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -22,6 +23,36 @@ def check(name, ok):
 def response(text="完整正文", finish="stop"):
     return {"choices": [{"message": {"content": text}, "finish_reason": finish}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 50, "prompt_cache_hit_tokens": 60}}
+
+
+def check_daily_costs():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(Path(tmp) / "trend.db")
+        beijing = timezone(timedelta(hours=8))
+        today = datetime.now(beijing).date()
+        midnight = datetime.combine(today, datetime.min.time(), beijing).timestamp()
+        rows = [(midnight + 1, "摘要总结", .01)] * 600
+        rows += [(midnight - 1, "摘要总结", 2), (midnight, "摘要分块", 1),
+                 (midnight + 2, "超上下文合并", 3), (midnight + 3, "摘要总结", None),
+                 (midnight + 4, "图片理解", None), (midnight + 5, "摘要合并", 99),
+                 (midnight + 86400, "摘要总结", 98),
+                 (midnight - 29 * 86400, "图片理解", .25),
+                 (midnight - 29 * 86400 - 1, "图片理解", 97)]
+        store.conn.executemany(
+            "INSERT INTO api_calls(ts,purpose,cost_cny,source_type,model,status) VALUES(?,?,?,'test','test','test')", rows)
+        store.conn.commit()
+        trend = store.api_usage_details(1, active_only=True)["daily_costs"]
+        check("消费趋势使用全账本且不受最近500条限制", trend == store.api_usage_details(500)["daily_costs"])
+        by_day = {(r["day"], r["purpose"]): r for r in trend}
+        summary = by_day[(today.isoformat(), "摘要总结")]
+        check("消费趋势按北京时间分日并合并现用摘要步骤",
+              abs(summary["cost_cny"] - 10) < 1e-8 and summary["calls"] == 603 and summary["unknown_calls"] == 1
+              and by_day[((today - timedelta(days=1)).isoformat(), "摘要总结")]["cost_cny"] == 2)
+        picture = by_day[(today.isoformat(), "图片理解")]
+        check("全未知金额保持None，不能画成免费", picture["cost_cny"] is None and picture["unknown_calls"] == 1)
+        check("消费趋势只含最近30个自然日和两种用途", len(trend) == 4
+              and by_day[((today - timedelta(days=29)).isoformat(), "图片理解")]["cost_cny"] == .25)
+        store.close()
 
 async def main():
     with tempfile.TemporaryDirectory() as tmp:
@@ -103,6 +134,7 @@ async def main():
               and abs(active["historical_unattributed_cny"] - .25) < 1e-8)
         reopened.close()
 
+check_daily_costs()
 asyncio.run(main())
 if fails:
     print(f"存在 {len(fails)} 项失败: {fails}")

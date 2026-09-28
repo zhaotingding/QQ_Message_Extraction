@@ -858,8 +858,15 @@ class Store:
             " FROM api_calls WHERE provider='OpenAI 官方' OR"
             " (json_valid(pricing) AND json_extract(pricing,'$.base_url')='https://api.openai.com/v1')"
             " GROUP BY 1 ORDER BY day DESC LIMIT 31")]
+        daily_costs = [dict(r) for r in self.conn.execute(
+            f"SELECT strftime('%Y-%m-%d',ts,'unixepoch','+8 hours') AS day,{purpose} AS purpose,"
+            " SUM(cost_cny) AS cost_cny,SUM(cost_cny IS NULL) AS unknown_calls,COUNT(*) AS calls"
+            " FROM api_calls WHERE ts>=? AND ts<?"
+            " AND purpose IN ('摘要总结','图片理解','摘要分块','超上下文合并')"
+            " GROUP BY 1,2 ORDER BY 1,2", (start - 29 * 86400, end))]
         return {"items": items, "groups": grouped, "recorded_cost_cny": known,
                 "openai_utc_days": utc_days, "today_timezone": "Asia/Shanghai",
+                "daily_costs": daily_costs,
                 "visible_cost_cny": sum(r["cost_cny"] for r in grouped),
                 "today_cost_cny": sum(r["today_cost_cny"] for r in grouped),
                 "historical_unattributed_cny": max(0.0, self.cost_totals()["cost_cny"] - known)}

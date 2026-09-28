@@ -28,14 +28,15 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from . import __version__, DISPLAY_VERSION
 from . import napcat as napcat_mod
 from . import prefs as prefs_mod
-from . import api_settings, credentials, security
+from . import api_settings, credentials, security, summary_review
 from .config import ROOT, abs_path, load
 from .summarize import BEIJING, DEFAULT_DIGEST_PROMPT, DIGEST_DEFAULT_CHARS, summary_chars
+from .usage_chart import daily_series, day_description, draw_daily_costs
 
 APP_TITLE = "消息萃取 msgx"
 FONT = "Microsoft YaHei UI"
@@ -188,8 +189,20 @@ class App:
     # ---- 标签页 1：运行状态 ----
 
     def _build_status_tab(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb, padding=14)
-        nb.add(tab, text="运行状态")
+        page = ttk.Frame(nb)
+        nb.add(page, text="运行状态")
+        canvas = tk.Canvas(page, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        tab = ttk.Frame(canvas, padding=14)
+        window = canvas.create_window((0, 0), window=tab, anchor="nw")
+        def resize_status(event) -> None:
+            canvas.itemconfigure(window, width=event.width, height=max(780, event.height))
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        canvas.bind("<Configure>", resize_status)
+        canvas.bind("<MouseWheel>", lambda event: canvas.yview_scroll(int(-event.delta / 120), "units"))
 
         card = ttk.LabelFrame(tab, text="服务状态", padding=14)
         card.pack(fill="x")
@@ -208,7 +221,8 @@ class App:
             [("服务进程", self.v_service), ("协议端(NapCat)", self.v_peer)],
             [("已入库消息", self.v_stored)],
             [("今日花费", self.v_cost), ("累计花费", self.v_total)],
-            [("账户余额", self.v_balance), ("模型状态", self.v_llm)],
+            [("账户余额", self.v_balance)],
+            [("模型状态", self.v_llm)],
         ]
         for r, pair in enumerate(rows):
             for c, (key, var) in enumerate(pair):
@@ -216,9 +230,18 @@ class App:
                 ttk.Label(card, text=key, style="CardKey.TLabel").grid(
                     row=r, column=col, sticky="w", padx=(0 if col == 0 else 28, 10), pady=3
                 )
-                ttk.Label(card, textvariable=var, style="Card.TLabel").grid(
-                    row=r, column=col + 1, sticky="w", pady=3
-                )
+                if key == "账户余额":
+                    balance_actions = ttk.Frame(card)
+                    balance_actions.grid(row=r, column=1, columnspan=3, sticky="w", pady=3)
+                    ttk.Label(balance_actions, textvariable=var, style="Card.TLabel").pack(side="left")
+                    self.btn_billing = ttk.Button(balance_actions, text="刷新账单", command=self.refresh_billing)
+                    self.btn_billing.pack(side="left", padx=8)
+                    ttk.Button(balance_actions, text="官方平台", command=self._open_billing_platform).pack(side="left")
+                else:
+                    ttk.Label(card, textvariable=var, style="Card.TLabel").grid(
+                        row=r, column=col + 1, columnspan=3 if key == "模型状态" else 1,
+                        sticky="w", pady=3
+                    )
         card.columnconfigure(1, weight=1)
         card.columnconfigure(3, weight=1)
 
@@ -227,19 +250,26 @@ class App:
             row=len(rows), column=0, columnspan=4, sticky="w", pady=(6, 0)
         )
         self.btn_relogin = ttk.Button(card, text="重新扫码", command=self.relogin_napcat)
-        self.btn_relogin.grid(row=len(rows) + 1, column=0, sticky="w")
+        self.btn_relogin.grid(row=len(rows) + 2, column=0, sticky="w")
         self.btn_relogin.grid_remove()
 
-        # ---- 按钮区（两行，避免一行挤成一坨）----
+        service_actions = ttk.Frame(card)
+        service_actions.grid(row=len(rows) + 1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.btn_start = ttk.Button(service_actions, text="启动服务", command=self.start_service)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(service_actions, text="停止服务", command=self.stop_service, state="disabled")
+        self.btn_stop.pack(side="left", padx=8)
+        self.btn_restart = None
+        if self.napcat_script() or self.napcat_dir():
+            self.btn_restart = ttk.Button(service_actions, text="强制重启", command=self.restart_napcat)
+            self.btn_restart.pack(side="left")
+
+        # ---- 摘要操作 ----
         buttons = ttk.Frame(tab)
         buttons.pack(fill="x", pady=(12, 4))
-        self.btn_start = ttk.Button(buttons, text="启动服务", command=self.start_service)
-        self.btn_start.pack(side="left")
-        self.btn_stop = ttk.Button(buttons, text="停止服务", command=self.stop_service, state="disabled")
-        self.btn_stop.pack(side="left", padx=8)
 
         yesterday = (datetime.now(BEIJING).date() - timedelta(days=1)).isoformat()
-        ttk.Label(buttons, text="摘要日期：").pack(side="left", padx=(16, 4))
+        ttk.Label(buttons, text="摘要日期：").pack(side="left", padx=(0, 4))
         self.v_summary_start = tk.StringVar(value=yesterday)
         self.v_summary_end = tk.StringVar(value=yesterday)
         start_entry = ttk.Entry(buttons, textvariable=self.v_summary_start, width=12)
@@ -257,13 +287,6 @@ class App:
 
         buttons2 = ttk.Frame(tab)
         buttons2.pack(fill="x")
-        # 强制重启和重新扫码保留为手动恢复入口。
-        self.btn_restart = None
-        if self.napcat_script() or self.napcat_dir():
-            self.btn_restart = ttk.Button(buttons2, text="强制重启", command=self.restart_napcat)
-            self.btn_restart.pack(side="right")
-        self.btn_billing = ttk.Button(buttons2, text="刷新账单", command=self.refresh_billing)
-        self.btn_billing.pack(side="right", padx=8)
         self.v_billing_feedback = tk.StringVar(value="账单金额为本地估算")
         ttk.Label(buttons2, textvariable=self.v_billing_feedback, wraplength=640).pack(side="left")
 
@@ -668,55 +691,6 @@ class App:
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(6, 0))
 
-        # --- 账单 ---
-        bl = ttk.LabelFrame(tab, text="旧版 DeepSeek 账单（新 API 配置不使用）", padding=12)
-        bl.pack(fill="x", pady=(12, 0))
-        # 这段原来是「余额用 API Key；消费必须用平台 token；留空 = 只显示本地估算」，
-        # 把两件事挤在一句里，读起来像「查账要两个钥匙」，而且「只能估算」说得太满
-        # （余额既然是官方实时数字，消费就能由它的下降量推出来）。v0.5.1 拆成两段。
-        ttk.Label(
-            bl,
-            text="余额：自动（用 [llm] 的 API Key 打官方接口，不需要你做什么）。",
-            style="Hint.TLabel",
-            wraplength=760,
-            justify="left",
-        ).pack(anchor="w")
-        ttk.Label(
-            bl,
-            text="今日/累计花费：默认已用「余额差值法」推算 —— 取相邻两次余额读数的下降量，"
-                 "是官方数字的减法，不需要额外凭据。",
-            style="Hint.TLabel",
-            wraplength=760,
-            justify="left",
-        ).pack(anchor="w", pady=(4, 0))
-        ttk.Label(
-            bl,
-            text="下面的 token 只用来多拿一份「消费明细」（哪个模型花了多少）。"
-                 "不需要明细可以完全留空，日/累计花费照样是真实的。",
-            style="Hint.TLabel",
-            wraplength=760,
-            justify="left",
-        ).pack(anchor="w", pady=(4, 6))
-        self.txt_platform_token = tk.Text(
-            bl, height=3, wrap="char", font=("Consolas", 9), relief="solid", borderwidth=1
-        )
-        self.txt_platform_token.pack(fill="x")
-        ttk.Label(
-            bl,
-            text="取法：浏览器登录 platform.deepseek.com → F12 → Application → Local Storage "
-                 "→ 复制 userToken 的值 → 粘到上面 → 保存设置 → 重启服务。\n"
-                 "它是短期凭证，会过期；过期后界面会提示重新复制。token 只存在本机 "
-                 ".ui/preferences.json 里，不会进 Git。",
-            style="Hint.TLabel",
-            wraplength=760,
-            justify="left",
-        ).pack(anchor="w", pady=(6, 0))
-        ttk.Button(
-            bl,
-            text="打开 DeepSeek 平台（用于取 token）",
-            command=lambda: open_url("https://platform.deepseek.com/usage"),
-        ).pack(anchor="w", pady=(8, 0))
-
         # --- 操作 ---
         ops = ttk.Frame(tab)
         ops.pack(fill="x", pady=(14, 0))
@@ -780,15 +754,6 @@ class App:
                 )
             )
         )
-        self.txt_platform_token.delete("1.0", "end")
-        # 偏好文件里留空 = 沿用 config.toml；这种情况下把配置值显示出来，
-        # 免得用户以为「token 没了」。
-        token = str(p.get("platform_token") or "").strip() or str(
-            (self.cfg.get("billing") or {}).get("platform_token") or ""
-        ).strip()
-        if token:
-            self.txt_platform_token.insert("1.0", token)
-
         saved = {str(g) for g in (p.get("groups") or [])}
         for i, gid in enumerate(self._group_ids):
             if gid in saved:
@@ -843,7 +808,6 @@ class App:
             },
             "napcat_hidden": bool(self.v_napcat_hidden.get()),
             "qq_account": account,
-            "platform_token": self.txt_platform_token.get("1.0", "end").strip(),
             "ui": self.prefs.get("ui", {}),
         }
 
@@ -1070,16 +1034,24 @@ class App:
     # ---------------- 消费明细与摘要全文（v0.6.0） ----------------
 
     def _build_usage_tab(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb, padding=12)
-        nb.add(tab, text="消费明细")
-        self.usage_tab = tab
+        self.usage_tab = ttk.Frame(nb, padding=12)
+        nb.add(self.usage_tab, text="消费明细")
+        self.usage_viewport = tk.Canvas(self.usage_tab, highlightthickness=0, yscrollincrement=24)
+        page_scroll = ttk.Scrollbar(self.usage_tab, command=self.usage_viewport.yview)
+        self.usage_viewport.configure(yscrollcommand=page_scroll.set)
+        page_scroll.pack(side="right", fill="y")
+        self.usage_viewport.pack(side="left", fill="both", expand=True)
+        tab = self.usage_content = ttk.Frame(self.usage_viewport)
+        self._usage_window = self.usage_viewport.create_window(0, 0, window=tab, anchor="nw")
         ttk.Button(tab, text="刷新消费明细", command=self.refresh_usage).pack(anchor="w")
         self.v_usage = tk.StringVar(value="Token 来自 API；金额为本地估算。今日按北京时间，OpenAI 平台按 UTC 日期统计。")
-        ttk.Label(tab, textvariable=self.v_usage, wraplength=880).pack(fill="x", pady=6)
+        self.usage_info_label = ttk.Label(tab, textvariable=self.v_usage, wraplength=880)
+        self.usage_info_label.pack(fill="x", pady=6)
         self.v_openai_utc = tk.StringVar(value="OpenAI UTC 日用量：启动服务后查看")
-        ttk.Label(tab, textvariable=self.v_openai_utc, wraplength=1040).pack(fill="x", pady=(0, 6))
+        self.usage_utc_label = ttk.Label(tab, textvariable=self.v_openai_utc, wraplength=1040)
+        self.usage_utc_label.pack(fill="x", pady=(0, 6))
         self.usage_groups = ttk.Treeview(tab, columns=("purpose", "type", "calls", "input", "output", "cost", "today", "api", "usd"),
-                                        show="headings", height=6)
+                                        show="headings", height=4)
         for key, label, width in (("purpose", "用途", 150), ("type", "消息类型", 120), ("calls", "请求数", 70),
                                   ("input", "输入 Token", 90), ("output", "输出 Token", 90), ("cost", "总金额（元·估算）", 130),
                                   ("today", "今日消费（北京·元）", 145), ("api", "平台 / 模型", 170), ("usd", "美元（估算）", 110)):
@@ -1091,11 +1063,12 @@ class App:
         group_xscroll = ttk.Scrollbar(tab, orient="horizontal", command=self.usage_groups.xview)
         self.usage_groups.configure(xscrollcommand=group_xscroll.set)
         group_xscroll.pack(fill="x", pady=(0, 6))
-        ttk.Label(tab, text="点击请求数、Token 或金额表头排序；最近 500 次请求，选中一行查看关联消息（上方汇总覆盖全部明细）").pack(anchor="w")
+        self.usage_hint_label = ttk.Label(tab, text="点击请求数、Token 或金额表头排序；最近 500 次请求，选中一行查看关联消息（上方汇总覆盖全部明细）")
+        self.usage_hint_label.pack(fill="x")
         frame = ttk.Frame(tab)
         frame.pack(fill="both", expand=True)
         columns = ("time", "purpose", "source", "input", "output", "cache", "cost", "state", "today", "api", "usd", "tier", "cache_write")
-        self.usage_table = ttk.Treeview(frame, columns=columns, show="headings", height=9)
+        self.usage_table = ttk.Treeview(frame, columns=columns, show="headings", height=7)
         for key, label, width in zip(columns, ("时间（北京）", "用途", "消息/任务", "输入", "输出", "缓存读命中", "总金额（元·估算）", "结果", "今日消费（北京·元）", "平台 / 模型", "美元（估算）", "服务层级", "缓存写入"),
                                    (125, 90, 100, 65, 65, 90, 125, 115, 145, 160, 105, 80, 80)):
             self.usage_table.heading(key, text=label)
@@ -1110,9 +1083,45 @@ class App:
         self.usage_table.configure(xscrollcommand=xscroll.set)
         xscroll.pack(fill="x")
         self.usage_table.bind("<<TreeviewSelect>>", self._usage_selected)
-        self.usage_detail = ScrolledText(tab, height=8, wrap="word", font=(FONT, 10), state="disabled")
-        self.usage_detail.pack(fill="both", pady=(8, 0))
-        nb.bind("<<NotebookTabChanged>>", lambda _e: self.refresh_usage() if nb.select() == str(tab) else None, add="+")
+        self.usage_bottom = ttk.Notebook(tab)
+        self.usage_bottom.pack(fill="both", pady=(8, 0))
+        chart_tab = ttk.Frame(self.usage_bottom, padding=4)
+        self.usage_detail_tab = ttk.Frame(self.usage_bottom)
+        self.usage_bottom.add(chart_tab, text="消费趋势")
+        self.usage_bottom.add(self.usage_detail_tab, text="关联消息")
+        self.usage_chart = tk.Canvas(chart_tab, height=180, background="white", highlightthickness=0)
+        self.usage_chart.pack(fill="both", expand=True)
+        self.v_usage_chart = tk.StringVar(value="最近 30 天 · 北京时间 · 鼠标移至曲线查看当日金额")
+        self.usage_chart_label = ttk.Label(chart_tab, textvariable=self.v_usage_chart, wraplength=1000)
+        self.usage_chart_label.pack(fill="x")
+        self._usage_daily_series = daily_series([], datetime.now(BEIJING).date())
+        self.usage_chart.bind("<Configure>", self._draw_usage_chart)
+        self.usage_chart.bind("<Motion>", self._usage_chart_hover)
+        self.usage_chart.bind("<Leave>", lambda _e: self.v_usage_chart.set(self._usage_chart_note()))
+        self.usage_detail = ScrolledText(self.usage_detail_tab, height=10, wrap="word", font=(FONT, 10), state="disabled")
+        self.usage_detail.pack(fill="both", expand=True)
+        self.usage_viewport.bind("<Configure>", self._layout_usage_content)
+        tab.bind("<Configure>", self._layout_usage_content)
+        for variable in (self.v_usage, self.v_openai_utc, self.v_usage_chart):
+            variable.trace_add("write", lambda *_args: self.usage_viewport.after_idle(self._layout_usage_content))
+        for widget in (self.usage_viewport, tab, chart_tab, self.usage_chart,
+                       self.usage_info_label, self.usage_utc_label, self.usage_hint_label, self.usage_chart_label):
+            widget.bind("<MouseWheel>", lambda event: self.usage_viewport.yview_scroll(int(-event.delta / 120), "units"))
+        nb.bind("<<NotebookTabChanged>>", lambda _e: self.refresh_usage() if nb.select() == str(self.usage_tab) else None, add="+")
+
+    def _layout_usage_content(self, _event=None) -> None:
+        width = max(1, self.usage_viewport.winfo_width())
+        for label in (self.usage_info_label, self.usage_utc_label, self.usage_hint_label, self.usage_chart_label):
+            label.configure(wraplength=max(240, width - 16))
+        self.usage_viewport.itemconfigure(self._usage_window, width=width)
+        # 换行后的自然高度需等 Tk 完成布局后读取，避免保留窄宽度时的虚高。
+        self.usage_viewport.after_idle(self._fit_usage_content)
+
+    def _fit_usage_content(self) -> None:
+        width = max(1, self.usage_viewport.winfo_width())
+        height = max(self.usage_viewport.winfo_height(), self.usage_content.winfo_reqheight())
+        self.usage_viewport.itemconfigure(self._usage_window, width=width, height=height)
+        self.usage_viewport.configure(scrollregion=(0, 0, width, height))
 
     def refresh_usage(self) -> None:
         if self._usage_busy:
@@ -1176,6 +1185,23 @@ class App:
                                                              cache_write=row.get("cache_write_tokens"))
         for tree, (key, descending) in self._usage_sort.items():
             self._sort_usage(tree, key, descending)
+        self._usage_daily_series = daily_series(data.get("daily_costs", []), datetime.now(BEIJING).date())
+        self.v_usage_chart.set(self._usage_chart_note())
+        self._draw_usage_chart()
+
+    def _usage_chart_note(self) -> str:
+        unknown = sum(row["unknown_calls"] for values in self._usage_daily_series.values() for row in values)
+        return ("最近 30 天 · 北京时间 · 鼠标移至曲线查看当日金额"
+                + (f"；{unknown} 次费用未知：未计入金额，全部未知的日期断线（橙色叉号）" if unknown else ""))
+
+    def _draw_usage_chart(self, _event=None) -> None:
+        self._usage_chart_range = draw_daily_costs(self.usage_chart, self._usage_daily_series)
+
+    def _usage_chart_hover(self, event) -> None:
+        left, right = self._usage_chart_range
+        count = len(next(iter(self._usage_daily_series.values())))
+        index = round(max(0, min(1, (event.x - left) / max(right - left, 1))) * (count - 1))
+        self.v_usage_chart.set(day_description(self._usage_daily_series, index))
 
     def _sort_usage(self, tree, key: str, descending: bool | None = None) -> None:
         if descending is None:
@@ -1197,6 +1223,7 @@ class App:
             return
         iid = selection[0]
         row = self._usage_items[iid]
+        self.usage_bottom.select(self.usage_detail_tab)
         self.usage_detail.configure(state="normal")
         self.usage_detail.delete("1.0", "end")
         self.usage_detail.insert("end", f"{row['purpose']} · {row['source_type']} · {row.get('provider') or '历史平台未记录'} · 模型 {row['model']}\n正在读取关联消息…")
@@ -1215,11 +1242,17 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _build_report_tab(self, nb: ttk.Notebook) -> None:
+        self._report_current = None
+        self._report_review = None
+        self._report_review_updates = {}
+        self._report_notes_saved = ""
+        self._report_query_filter = "全部"
+        self._report_choose_first = False
         self.report_tab = ttk.Frame(nb, padding=12)
         nb.add(self.report_tab, text="摘要全文")
         panes = ttk.Panedwindow(self.report_tab, orient="horizontal")
         panes.pack(fill="both", expand=True)
-        history = ttk.Frame(panes, width=260)
+        history = ttk.Frame(panes, width=300)
         history.pack_propagate(False)
         reader = ttk.Frame(panes, padding=(14, 0, 0, 0))
         panes.add(history, weight=1)
@@ -1229,13 +1262,27 @@ class App:
         ttk.Label(bar, text="最近摘要", font=(FONT, 11, "bold")).pack(side="left")
         self.btn_report_refresh = ttk.Button(bar, text="刷新", command=self.refresh_report_history)
         self.btn_report_refresh.pack(side="right")
+        self.v_report_filter = tk.StringVar(value="全部")
+        report_filter = ttk.Combobox(history, textvariable=self.v_report_filter, state="readonly",
+                                    values=("全部", "仅日报", "仅汇总"), width=12)
+        report_filter.pack(fill="x", pady=(6, 0))
+        report_filter.bind("<<ComboboxSelected>>", self._report_filter_changed)
         self.v_report_history = tk.StringVar(value="正在读取本地摘要…")
         ttk.Label(history, textvariable=self.v_report_history, style="Hint.TLabel").pack(anchor="w", pady=(3, 6))
         rows = ttk.Frame(history)
         rows.pack(fill="both", expand=True)
-        self.report_history = ttk.Treeview(rows, show="tree", selectmode="browse")
-        self.report_history.column("#0", width=460, stretch=False)
+        ttk.Style(history).map("Report.Treeview", background=[], foreground=[("selected", "#253342")])
+        self.report_history = ttk.Treeview(rows, columns=("reading",), show="tree headings", selectmode="browse",
+                                          style="Report.Treeview")
+        self.report_history.heading("#0", text="类型 / 日期 / 标题")
+        self.report_history.heading("reading", text="阅读状态")
+        self.report_history.column("#0", width=180, minwidth=100, stretch=False)
+        self.report_history.column("reading", width=65, minwidth=65, stretch=False, anchor="center")
+        self.report_history.bind("<Configure>", lambda event: self.report_history.column(
+            "#0", width=max(100, event.width - 69)))
         self.report_history.tag_configure("metadata", foreground=MUTED)
+        for state, color in (("unread", "#ffffff"), ("skimmed", "#fff2b2"), ("deep", "#d7f0d4")):
+            self.report_history.tag_configure(state, background=color)
         scroll = ttk.Scrollbar(rows, orient="vertical", command=self.report_history.yview)
         horizontal = ttk.Scrollbar(rows, orient="horizontal", command=self.report_history.xview)
         self.report_history.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
@@ -1250,24 +1297,43 @@ class App:
         self.report_meta_label.pack(fill="x")
         self.v_report_path = tk.StringVar(value="生成完成后在这里展示全文及完整文件路径。")
         self.report_path_label = ttk.Label(reader, textvariable=self.v_report_path, style="Hint.TLabel", wraplength=620)
-        self.report_path_label.pack(fill="x", pady=(3, 6))
+        self.report_path_label.pack(fill="x", pady=(3, 3))
         def wrap_labels(event) -> None:
-            for label in (self.report_meta_label, self.report_path_label):
+            for label in (self.report_meta_label, self.report_path_label, self.report_review_label):
                 label.configure(wraplength=max(180, event.width - 18))
         reader.bind("<Configure>", wrap_labels)
         actions = ttk.Frame(reader)
         actions.pack(fill="x")
-        self.btn_open_report = ttk.Button(actions, text="打开完整 HTML 文件", state="disabled",
+        self.btn_open_report = ttk.Button(actions, text="打开完整 HTML 文件", state="disabled", style="Reader.TButton",
                                          command=lambda: open_path(Path(self._summary_path)))
         self.btn_open_report.pack(side="left")
-        self.btn_copy_report = ttk.Button(actions, text="复制全文", command=self._copy_report, state="disabled")
+        self.btn_copy_report = ttk.Button(actions, text="复制全文", command=self._copy_report, state="disabled", style="Reader.TButton")
         self.btn_copy_report.pack(side="left", padx=6)
+        read_bar = ttk.Frame(reader)
+        read_bar.pack(fill="x", pady=(3, 0))
+        ttk.Label(read_bar, text="阅读状态：").pack(side="left")
+        self.v_report_read_state = tk.StringVar(value="unread")
+        self._report_review_buttons = []
+        for label, state in (("未读", "unread"), ("粗浅阅读", "skimmed"), ("深入阅读", "deep")):
+            button = ttk.Radiobutton(read_bar, text=label, value=state, variable=self.v_report_read_state,
+                                     command=self._set_report_read_state, state="disabled")
+            button.pack(side="left", padx=(0, 8))
+            self._report_review_buttons.append(button)
+        marks = ttk.Frame(reader)
+        marks.pack(fill="x", pady=(3, 4))
+        ttk.Label(marks, text="选中文字：").pack(side="left")
+        ttk.Style(reader).configure("Reader.TButton", padding=(5, 3))
+        for label, level in (("下划线", "underline"), ("蓝色重点", "blue"), ("红色重点", "red"), ("清除标注", "")):
+            button = ttk.Button(marks, text=label, style="Reader.TButton", state="disabled",
+                                command=lambda value=level: self._mark_report(value))
+            button.pack(side="left", padx=(0, 3))
+            self._report_review_buttons.append(button)
         outline = ttk.Frame(history)
-        outline.pack(fill="x", pady=(10, 0))
+        outline.pack(side="bottom", fill="x", pady=(8, 0), before=rows)
         ttk.Label(outline, text="主题目录 · 点击跳转", style="Hint.TLabel").pack(anchor="w")
         outline_rows = ttk.Frame(outline)
         outline_rows.pack(fill="x", pady=(5, 0))
-        self.report_outline = tk.Listbox(outline_rows, height=5, font=(FONT, 10), exportselection=False,
+        self.report_outline = tk.Listbox(outline_rows, height=3, font=(FONT, 10), exportselection=False,
                                          relief="flat", background="#f0f5fa", selectbackground="#d6e8fa")
         self.report_outline.grid(row=0, column=0, sticky="ew")
         outline_vertical = ttk.Scrollbar(outline_rows, orient="vertical", command=self.report_outline.yview)
@@ -1278,7 +1344,7 @@ class App:
         self.report_outline.configure(xscrollcommand=outline_scroll.set)
         outline_scroll.pack(fill="x")
         self.report_outline.bind("<<ListboxSelect>>", self._report_jump)
-        self.report_text = ScrolledText(reader, wrap="word", font=(FONT, 12), state="disabled",
+        self.report_text = ScrolledText(reader, wrap="word", font=(FONT, 12), state="disabled", exportselection=False,
                                        background="#ffffff", foreground="#253342", relief="flat",
                                        padx=18, pady=16, spacing1=4, spacing3=8, spacing2=5)
         self.report_text.tag_configure("title", font=(FONT, 18, "bold"), spacing3=20)
@@ -1287,14 +1353,36 @@ class App:
         self.report_text.tag_configure("bold", font=(FONT, 12, "bold"))
         for i, color in enumerate(("#f2f6fa", "#f7f5ef")):
             self.report_text.tag_configure(f"card{i}", background=color, lmargin1=12, lmargin2=12, rmargin=12)
+        self.report_text.tag_configure("review_blue", background="#cfe8ff")
+        self.report_text.tag_configure("review_red", background="#ffd5d5")
+        self.report_text.tag_configure("review_underline", underline=True)
         self.report_text.pack(fill="both", expand=True)
+        self.report_notes_frame = ttk.LabelFrame(reader, text="我的心得（个人观点；切换、刷新及关闭时自动保存）", padding=4)
+        ttk.Button(self.report_notes_frame, text="保存心得", style="Reader.TButton",
+                   command=self._save_report_notes).pack(side="right", anchor="n", padx=(6, 0))
+        self.report_notes = ScrolledText(self.report_notes_frame, wrap="word", height=2, font=(FONT, 10))
+        self.report_notes.pack(side="left", fill="x", expand=True)
+        self.v_report_review = tk.StringVar(value="标注与阅读状态保存在本地，不调用 API。")
+        self.report_review_label = ttk.Label(reader, textvariable=self.v_report_review, style="Hint.TLabel", wraplength=620)
+        self.report_review_label.pack(side="bottom", fill="x", pady=(4, 0), before=self.report_text)
         self.nb.bind("<<NotebookTabChanged>>", self._report_tab_changed, add="+")
 
     def _report_tab_changed(self, _event=None) -> None:
+        if self.nb.select() != str(self.report_tab):
+            self._save_report_notes()
         if self.nb.select() == str(self.report_tab) and time.time() - self._report_history_checked >= 30:
             self.refresh_report_history()
 
+    def _report_filter_changed(self, _event=None) -> None:
+        if not self._save_report_notes():
+            self.v_report_filter.set(self._report_query_filter)
+            return
+        self._report_choose_first = True
+        self.refresh_report_history()
+
     def refresh_report_history(self, preferred_path: str = "") -> None:
+        if not self._save_report_notes():
+            return
         if self._report_history_busy:
             if preferred_path:
                 self._report_pending_path = preferred_path
@@ -1305,6 +1393,9 @@ class App:
         self.btn_report_refresh.configure(state="disabled")
         self.v_report_history.set("正在读取本地摘要…")
         db = abs_path(self.cfg, "db_path")
+        self._report_query_filter = self.v_report_filter.get()
+        kinds = {"仅日报": ("daily", "daily_partial"), "仅汇总": ("multi", "multi_partial")}.get(
+            self._report_query_filter, ("daily", "daily_partial", "multi", "multi_partial"))
 
         def work() -> None:
             items, error = [], ""
@@ -1315,10 +1406,13 @@ class App:
                         conn.row_factory = sqlite3.Row
                         items = [dict(row) for row in conn.execute(
                             "SELECT id,window_start,window_end,kind,content,report_path,msg_count,created_at"
-                            " FROM summaries ORDER BY created_at DESC,id DESC LIMIT 50")]
+                            " FROM summaries WHERE kind IN (" + ",".join("?" for _ in kinds) + ")"
+                            " ORDER BY created_at DESC,id DESC LIMIT 50", kinds)]
+                        for item in items:
+                            item["review"] = summary_review.get_review(conn, item["id"], item["content"] or "")
                     finally:
                         conn.close()
-            except (OSError, sqlite3.Error) as exc:
+            except (OSError, sqlite3.Error, ValueError) as exc:
                 error = security.redact(str(exc))
             self.events.put(("report_history", (seq, items, error, preferred_path)))
         threading.Thread(target=work, daemon=True).start()
@@ -1329,16 +1423,23 @@ class App:
         self._report_history_busy = False
         self._report_history_checked = time.time()
         self.btn_report_refresh.configure(state="normal")
+        if self._report_query_filter != self.v_report_filter.get():
+            self.refresh_report_history(preferred_path or self._report_pending_path)
+            return
         if error:
             self.v_report_history.set(f"读取失败：{error}")
             if self._report_pending_path:
                 pending, self._report_pending_path = self._report_pending_path, ""
                 self.refresh_report_history(pending)
             return
+        if not self._save_report_notes():
+            return
         selected = self.report_history.selection()
         current = selected[0].removeprefix("detail-") if selected else ""
         shown_path = self._summary_path
-        self._report_items = {str(item["id"]): item for item in items}
+        kinds = {"仅日报": ("daily", "daily_partial"), "仅汇总": ("multi", "multi_partial")}.get(
+            self.v_report_filter.get(), ("daily", "daily_partial", "multi", "multi_partial"))
+        self._report_items = {str(item["id"]): item for item in items if item.get("kind") in kinds}
         self.report_history.delete(*self.report_history.get_children())
         chosen = ""
         for iid, item in self._report_items.items():
@@ -1347,10 +1448,19 @@ class App:
                           for line in content.splitlines() if line.strip()), "无标题摘要")
             start = datetime.fromtimestamp(item["window_start"], BEIJING)
             end = datetime.fromtimestamp(item["window_end"], BEIJING)
-            kind = {"daily": "日报", "daily_partial": "当天未结束", "multi": "多日归纳",
-                    "multi_partial": "多日归纳 · 含当天", "digest": "全量纪要", "full": "旧版全量摘要",
-                    "periodic": "旧版摘要", "hotspot": "旧版热点"}.get(item["kind"], item["kind"])
-            self.report_history.insert("", "end", iid=iid, text=title, open=True)
+            daily = item["kind"].startswith("daily")
+            partial = item["kind"].endswith("_partial")
+            kind = "日报" if daily else "汇总"
+            label_end = end if partial else end - timedelta(seconds=1)
+            dates = (f"{start:%m-%d}" if daily else f"{start:%m-%d}—{label_end:%m-%d}"
+                     if start.year == label_end.year else f"{start:%Y-%m-%d}—{label_end:%Y-%m-%d}")
+            suffix = f" · 截至 {end:%m-%d %H:%M}，未完成" if partial else ""
+            review = self._report_review_updates.get((item["id"], summary_review.content_hash(content)), item.get("review", {}))
+            item["review"] = review
+            state = review.get("read_state", "unread")
+            label = {"unread": "未读", "skimmed": "粗读", "deep": "深读"}.get(state, "未读")
+            self.report_history.insert("", "end", iid=iid, text=f"【{kind}】{dates}{suffix} · {title}",
+                                       values=(label,), tags=(state,), open=True)
             self.report_history.insert(iid, "end", iid=f"detail-{iid}", tags=("metadata",),
                                        text=f"{kind} · {summary_chars(content)} 字 · {start:%Y-%m-%d %H:%M} — {end:%Y-%m-%d %H:%M}")
             if preferred_path and shown_path == str(Path(preferred_path).resolve()) and item.get("report_path") == preferred_path:
@@ -1359,13 +1469,19 @@ class App:
         if not chosen and shown_path:
             chosen = next((iid for iid, item in self._report_items.items()
                            if item.get("report_path") == shown_path), "")
-        if not chosen and not self._report_content and items:
-            chosen = str(items[0]["id"])
+        if not chosen and not self._report_content and self._report_items:
+            chosen = next(iter(self._report_items))
+        if self._report_choose_first:
+            chosen = chosen or next(iter(self._report_items), "")
+            self._report_choose_first = False
+            if not chosen:
+                self._show_report({"content": ""})
         if chosen:
             self.report_history.selection_set(chosen)
             self.report_history.see(chosen)
             self._show_report(self._report_items[chosen])
-        self.v_report_history.set(f"最近 {len(items)} 份 · 本地读取" if items else "暂无摘要；生成后会显示在这里")
+        count = len(self._report_items)
+        self.v_report_history.set(f"最近 {count} 份 · 本地读取" if count else "暂无此类摘要；旧版摘要已隐藏")
         if self._report_pending_path:
             pending, self._report_pending_path = self._report_pending_path, ""
             self.refresh_report_history(pending)
@@ -1376,11 +1492,16 @@ class App:
         if iid in self._report_items:
             self._show_report(self._report_items[iid])
 
-    def _show_report(self, item: dict) -> None:
+    def _show_report(self, item: dict) -> bool:
         path = item.get("report_path") or item.get("path") or ""
         identity = (item.get("id"), path)
         content = item.get("content") or ""
         unchanged = identity == self._report_identity and content == self._report_content
+        if not unchanged and not self._save_report_notes():
+            old_id = str((self._report_current or {}).get("id", ""))
+            if self.report_history.exists(old_id):
+                self.report_history.selection_set(old_id)
+            return False
         selected = self.report_history.selection()
         selected_id = selected[0].removeprefix("detail-") if selected else ""
         selected_item = self._report_items.get(selected_id)
@@ -1399,7 +1520,11 @@ class App:
             dates = f"{start:%Y-%m-%d %H:%M} — {end:%Y-%m-%d %H:%M} · "
         self.v_report_meta.set(f"{dates}{summary_chars(self._report_content)} 字 · 完整正文")
         if unchanged:
-            return
+            if item.get("kind") and self._report_current and not self._report_current.get("kind"):
+                self._report_current = item
+                self._load_report_review(item)
+            return True
+        self._report_current = item
         self.report_outline.delete(0, "end")
         self._report_outline = []
         self.report_text.configure(state="normal")
@@ -1433,6 +1558,120 @@ class App:
             self.report_outline.insert("end", "正文未设置主题小标题")
         self.report_text.configure(state="disabled")
         self.report_text.yview_moveto(0)
+        self._load_report_review(item)
+        return True
+
+    def _load_report_review(self, item: dict) -> None:
+        self._report_review = None
+        self._report_notes_saved = ""
+        self.report_notes.delete("1.0", "end")
+        self.report_notes_frame.pack_forget()
+        self.v_report_read_state.set("unread")
+        for button in self._report_review_buttons:
+            button.configure(state="disabled")
+        self._draw_report_annotations([])
+        if item.get("id") is None:
+            self.v_report_review.set("正在等待本地摘要记录；保存记录后可标注。")
+            return
+        try:
+            db = abs_path(self.cfg, "db_path")
+            conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+            try:
+                review = summary_review.get_review(conn, item["id"], self._report_content)
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            self.v_report_review.set("批注读取失败：" + security.redact(str(exc)))
+            return
+        self._report_review = review
+        self.v_report_read_state.set(review["read_state"])
+        self._report_notes_saved = review["notes"]
+        self.report_notes.insert("1.0", review["notes"])
+        if item.get("kind", "").startswith("daily"):
+            self.report_notes_frame.pack(side="bottom", fill="x", pady=(5, 0), before=self.report_text)
+        for button in self._report_review_buttons:
+            button.configure(state="normal")
+        self._draw_report_annotations(review["annotations"])
+        self.v_report_review.set("标注与阅读状态立即保存；打开摘要不会改变阅读状态。")
+
+    def _draw_report_annotations(self, annotations: list[dict]) -> None:
+        for level in ("blue", "red", "underline"):
+            self.report_text.tag_remove("review_" + level, "1.0", "end")
+        for annotation in annotations:
+            start, end = f"1.0 + {annotation['start']} chars", f"1.0 + {annotation['end']} chars"
+            # 保存的是渲染后的文字位置；显示规则改变时不把标注贴到其它文字上。
+            if self.report_text.get(start, end) == annotation["text"]:
+                self.report_text.tag_add("review_" + annotation["level"], start, end)
+        for level in ("blue", "red", "underline"):
+            self.report_text.tag_raise("review_" + level)
+        self.report_text.tag_raise("sel")
+
+    def _save_report_review(self, **changes) -> bool:
+        if not self._report_current or self._report_review is None:
+            return False
+        try:
+            review = summary_review.save_review(
+                abs_path(self.cfg, "db_path"), self._report_current["id"],
+                self._report_review["content_hash"], **changes)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            self.v_report_review.set("保存失败，当前编辑已保留：" + security.redact(str(exc)))
+            return False
+        self._report_review = review
+        self._report_review_updates[(self._report_current["id"], review["content_hash"])] = review
+        self._report_current["review"] = review
+        iid = str(self._report_current["id"])
+        state = review["read_state"]
+        self.v_report_read_state.set(state)
+        if self.report_history.exists(iid):
+            self.report_history.item(iid, tags=(state,), values=({"unread": "未读", "skimmed": "粗读", "deep": "深读"}[state],))
+        self.v_report_review.set("已保存到本地；下次生成多日汇总将使用当前重点与心得。")
+        return True
+
+    def _save_report_notes(self) -> bool:
+        if self._report_review is None or not (self._report_current or {}).get("kind", "").startswith("daily"):
+            return True
+        notes = self.report_notes.get("1.0", "end-1c")
+        if notes == self._report_notes_saved:
+            return True
+        if not self._save_report_review(notes=notes):
+            return False
+        self._report_notes_saved = notes
+        return True
+
+    def _set_report_read_state(self) -> None:
+        if self._report_review is None:
+            return
+        old_state = self._report_review["read_state"]
+        if not self._save_report_review(read_state=self.v_report_read_state.get()):
+            self.v_report_read_state.set(old_state)
+
+    def _mark_report(self, level: str) -> None:
+        if self._report_review is None:
+            return
+        selection = self.report_text.tag_ranges("sel")
+        if not selection:
+            self.v_report_review.set("请先在正文中选中需要标注的文字。")
+            return
+        start, end = selection[0], selection[1]
+        remove = ("blue", "red", "underline") if not level else (("blue", "red") if level != "underline" else ("underline",))
+        for old_level in remove:
+            self.report_text.tag_remove("review_" + old_level, start, end)
+        if level:
+            self.report_text.tag_add("review_" + level, start, end)
+        annotations = []
+        for mark_level in ("blue", "red", "underline"):
+            ranges = self.report_text.tag_ranges("review_" + mark_level)
+            for mark_start, mark_end in zip(ranges[::2], ranges[1::2]):
+                annotations.append({
+                    # Tk count 在 Windows 将 emoji 计作两个单元，+N chars 却按字符前进。
+                    "start": len(self.report_text.get("1.0", mark_start)),
+                    "end": len(self.report_text.get("1.0", mark_end)),
+                    "text": self.report_text.get(mark_start, mark_end), "level": mark_level,
+                })
+        if self._save_report_review(annotations=annotations):
+            self._draw_report_annotations(annotations)
+        else:
+            self._draw_report_annotations(self._report_review["annotations"])
 
     def _report_jump(self, _event=None) -> None:
         selected = self.report_outline.curselection()
@@ -1456,7 +1695,10 @@ class App:
             note = "所选日期暂无可生成的摘要"
         else:
             item = data["created"][0]
-            self._show_report(item)
+            if not self._show_report(item):
+                self.v_summary.set("摘要已生成；当前心得保存失败，请保存后刷新摘要列表查看。")
+                self._summary_days_checked = 0.0
+                return
             self.refresh_report_history(preferred_path=item.get("path", ""))
             self.nb.select(self.report_tab)
             note = f"摘要已生成（{item.get('chars', 0)} 字），完整文件：{self._summary_path}"
@@ -1567,6 +1809,10 @@ class App:
                     start_date: str | None = None, end_date: str | None = None,
                     force: bool = False) -> None:
         if self._summary_busy:
+            return
+        if not self._save_report_notes():
+            self.v_summary.set("当前心得尚未保存，暂未生成摘要；请先保存成功后重试。")
+            self.status.set(self.v_summary.get())
             return
         if self.proc is None:
             self.v_summary.set("请先启动服务，再生成摘要。")
@@ -1892,6 +2138,16 @@ class App:
 
     # ---------------- 账单 ----------------
 
+    def _open_billing_platform(self) -> None:
+        profile = self.prefs.get("api") or self.cfg.get("api") or self.cfg.get("llm", {})
+        host = urlsplit(str(profile.get("base_url") or "")).hostname
+        if host == "api.openai.com":
+            open_url("https://platform.openai.com/settings/organization/billing/overview")
+        elif host == "api.deepseek.com":
+            open_url("https://platform.deepseek.com/usage")
+        else:
+            self.status.set("当前为自定义接口，请到该服务商的官方平台查看账单。")
+
     def refresh_billing(self) -> None:
         """刷新当前服务的费用统计；新 API 只使用本机请求估算。"""
         if self._billing_busy:
@@ -1992,7 +2248,10 @@ class App:
             self.v_balance.set(f"¥{float(bal.get('total') or 0):.2f}")
         else:
             err = str(bal.get("error") or "不可用")
-            self.v_balance.set(f"—（{err[:26]}{'…' if len(err) > 26 else ''}）")
+            if err == "未查询官方余额":
+                self.v_balance.set("请到官方平台查看")
+            else:
+                self.v_balance.set(f"—（{err[:26]}{'…' if len(err) > 26 else ''}）")
 
         err = str(b.get("platform_error") or "")
         if s_src == "estimate":
@@ -2542,7 +2801,7 @@ class App:
         if not b:
             self.v_cost.set(f"¥{est_today:.4f}（估算）/ 预算 ¥{budget:.2f}")
             self.v_total.set(f"¥{est_today:.4f}（估算）")
-            self.v_balance.set("（服务启动后自动抓取）")
+            self.v_balance.set("请到官方平台查看" if self.cfg.get("api") else "（服务启动后自动抓取）")
         else:
             self._apply_billing(b)
 
@@ -2573,6 +2832,8 @@ class App:
     # ---------------- 关闭 ----------------
 
     def on_close(self) -> None:
+        if not self._save_report_notes():
+            return
         self.qr_watching = False  # 先停掉二维码监视线程，再关界面
         self.v_rt_auto.set(False)  # 停掉实时消息轮询
         if self.proc is None:
