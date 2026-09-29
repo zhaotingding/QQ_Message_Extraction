@@ -147,13 +147,7 @@ async def _alerts(request: web.Request) -> web.Response:
 
 
 async def _summary_now(request: web.Request) -> web.Response:
-    try:
-        return await _summary_request(request)
-    except ValueError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=400)
-    except Exception as exc:
-        log.warning("摘要请求失败: %s", exc)
-        return web.json_response({"ok": False, "error": str(exc)}, status=502)
+    return await _summary_request(request)
 
 
 def _summary_dates(start: str, end: str) -> tuple[str, str]:
@@ -169,49 +163,9 @@ def _summary_dates(start: str, end: str) -> tuple[str, str]:
 
 
 async def _summary_request(request: web.Request) -> web.Response:
-    pipe = request.app["pipe"]
-    kind = request.query.get("kind", "digest")
-    if kind not in ("digest", "full", "range", "by_date"):
-        return web.json_response({"ok": False, "error": "不支持此摘要类型"}, status=400)
-    options = {}
-    data = {}
-    if request.can_read_body:
-        try:
-            data = await request.json()
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return web.json_response({"ok": False, "error": "摘要设置必须是 JSON 对象"}, status=400)
-        if not isinstance(data, dict):
-            return web.json_response({"ok": False, "error": "摘要设置必须是 JSON 对象"}, status=400)
-        if "prompt" in data:
-            if not isinstance(data["prompt"], str):
-                return web.json_response({"ok": False, "error": "prompt 必须是文本"}, status=400)
-            options["prompt"] = data["prompt"]
-        if "target_chars" in data:
-            value = data["target_chars"]
-            if type(value) is not int or not 1 <= value <= 100000:
-                return web.json_response({"ok": False, "error": "目标字数必须是 1 到 100000 的整数"}, status=400)
-            options["target_chars"] = value
-    if kind == "by_date":
-        start, end = _summary_dates(str(data.get("start_date") or ""),
-                                    str(data.get("end_date") or ""))
-        force = data.get("force", False)
-        if not isinstance(force, bool):
-            return web.json_response({"ok": False, "error": "force 必须是布尔值"}, status=400)
-        item = await pipe.summarizer.run_dates(start, end, force=force, **options)
-        return web.json_response({"ok": True, "created": [item] if item else []})
-    if kind == "range":
-        # 用户指定的统计窗口，不会创建定时摘要任务。
-        try:
-            hours = int(request.query.get("hours", 24))
-        except ValueError:
-            return web.json_response({"ok": False, "error": "hours 必须是整数"}, status=400)
-        if hours <= 0:
-            return web.json_response({"ok": False, "error": "hours 必须为正"}, status=400)
-        item = await pipe.summarizer.run_digest(full=True, hours=hours, **options)
-        return web.json_response({"ok": True, "created": [item] if item else []})
-    # digest（默认）= 接着上次已总结过的消息做增量纪要；full = 近 24h 全量重做
-    item = await pipe.summarizer.run_digest(full=(kind == "full"), **options)
-    return web.json_response({"ok": True, "created": [item] if item else []})
+    return web.json_response({
+        "ok": False, "error": "手动摘要入口已移除，日报、周报、月报由自动计划生成",
+    }, status=410)
 
 
 async def _summary_days(request: web.Request) -> web.Response:

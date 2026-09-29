@@ -76,6 +76,23 @@ CREATE TABLE IF NOT EXISTS daily_schedule (
   start_date TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS summary_schedule_baselines (
+  kind TEXT PRIMARY KEY,
+  start_date TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS summary_jobs (
+  kind TEXT NOT NULL,
+  start_date TEXT NOT NULL,
+  end_date TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at REAL NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT '',
+  summary_id INTEGER,
+  updated_at REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY(kind,start_date,end_date)
+);
+
 CREATE TABLE IF NOT EXISTS alerts (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   group_id   TEXT NOT NULL,
@@ -771,6 +788,47 @@ class Store:
     def set_auto_daily_start(self, day: str) -> None:
         self.conn.execute("INSERT OR IGNORE INTO daily_schedule(id,start_date) VALUES(1,?)", (day,))
         self.conn.commit()
+
+    def auto_period_start(self, kind: str) -> str | None:
+        row = self.conn.execute("SELECT start_date FROM summary_schedule_baselines WHERE kind=?", (kind,)).fetchone()
+        return str(row[0]) if row else None
+
+    def set_auto_period_start(self, kind: str, day: str) -> None:
+        self.conn.execute("INSERT OR IGNORE INTO summary_schedule_baselines(kind,start_date) VALUES(?,?)", (kind, day))
+        self.conn.commit()
+
+    def summary_job(self, kind: str, start: str, end: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM summary_jobs WHERE kind=? AND start_date=? AND end_date=?",
+                                (kind, start, end)).fetchone()
+        return dict(row) if row else None
+
+    def save_summary_job(self, kind: str, start: str, end: str, state: str, *,
+                         now: float, attempts: int | None = None, next_attempt_at: float = 0,
+                         error: str = "", summary_id: int | None = None) -> None:
+        self.conn.execute(
+            "INSERT INTO summary_jobs(kind,start_date,end_date,state,attempts,next_attempt_at,error,summary_id,updated_at)"
+            " VALUES(?,?,?,?,COALESCE(?,0),?,?,?,?) ON CONFLICT(kind,start_date,end_date) DO UPDATE SET"
+            " state=excluded.state,attempts=COALESCE(?,summary_jobs.attempts),next_attempt_at=excluded.next_attempt_at,"
+            " error=excluded.error,summary_id=excluded.summary_id,updated_at=excluded.updated_at",
+            (kind, start, end, state, attempts, next_attempt_at, error, summary_id, now, attempts))
+        self.conn.commit()
+
+    def claim_summary_job(self, kind: str, start: str, end: str, now: float) -> bool:
+        cur = self.conn.execute(
+            "UPDATE summary_jobs SET state='running',attempts=attempts+1,updated_at=?"
+            " WHERE kind=? AND start_date=? AND end_date=?"
+            " AND state IN ('pending','retry','waiting') AND attempts<3 AND next_attempt_at<=?",
+            (now, kind, start, end, now))
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def summary_jobs_in_state(self, *states: str) -> list[dict]:
+        marks = ",".join("?" for _ in states)
+        return [dict(row) for row in self.conn.execute(
+            f"SELECT * FROM summary_jobs WHERE state IN ({marks}) ORDER BY updated_at DESC", states)]
+
+    def latest_period_summary(self, kind: str):
+        return self.conn.execute("SELECT * FROM summaries WHERE kind=? ORDER BY window_end DESC,id DESC LIMIT 1", (kind,)).fetchone()
 
     # ---------- alerts ----------
 

@@ -122,9 +122,16 @@ class ServiceLoggingTests(unittest.TestCase):
 
     def test_non_service_command_does_not_create_service_log(self):
         with patch.object(app, "load", return_value=self.cfg), \
-                patch.object(app, "cmd_summary", new=AsyncMock()):
-            self.assertEqual(app.main(["summary"]), 0)
+                patch.object(app, "cmd_stats", new=AsyncMock()):
+            self.assertEqual(app.main(["stats"]), 0)
         self.assertFalse(self.path.exists())
+
+    def test_manual_summary_command_is_removed_before_loading_config(self):
+        with patch.object(app, "load") as load:
+            with self.assertRaises(SystemExit) as error:
+                app.main(["summary"])
+        self.assertEqual(error.exception.code, 2)
+        load.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -138,27 +138,6 @@ async def cmd_run(cfg: dict, stop_file: str | None = None) -> None:
             log.warning("管道收尾超时（15s），继续退出")
 
 
-async def cmd_summary(cfg: dict, kind: str, hours: int = 24) -> None:
-    pipe = Pipeline(cfg)
-    try:
-        if kind == "full":
-            # full = 按时间范围重做，目标字数与提示词沿用配置。
-            item = await pipe.summarizer.run_digest(full=True, hours=hours)
-            label = f"近 {hours} 小时" if hours < 24 else f"近 {hours // 24} 天"
-            if item:
-                print(
-                    f"{label}纪要已生成: {item['path']}"
-                    f"（{item['count']} 条消息 / {item['chars']} 字 / 目标 {item['target_chars']} 字）"
-                )
-            else:
-                print(f"{label}内没有可总结的消息")
-        elif kind == "digest":
-            item = await pipe.summarizer.run_digest()
-            print(f"群消息纪要已生成: {item['path']}" if item else "自上次纪要以来没有新消息")
-    finally:
-        await pipe.stop()
-
-
 async def cmd_inject(cfg: dict, payload: str) -> None:
     """把 OneBot 事件直接喂给管道（不经过 HTTP，便于离线调试）。"""
     pipe = Pipeline(cfg)
@@ -242,16 +221,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub.add_parser("gui", help="打开图形界面（配置 + 启停 + 实时日志）")
 
-    p_sum = sub.add_parser("summary", help="立即生成摘要")
-    p_sum.add_argument(
-        "--kind", choices=["digest", "full"], default="digest",
-        help="digest=增量纪要（默认）；full=按 --hours 范围重做",
-    )
-    p_sum.add_argument(
-        "--hours", type=int, default=24,
-        help="仅 kind=full 时生效：回看多少小时（24/72/168/720 分别对应界面上的 1 天~1 个月）",
-    )
-
     p_inj = sub.add_parser("inject", help="直接向管道注入 OneBot 事件（调试用）")
     p_inj.add_argument("json", help="事件 JSON 字符串")
 
@@ -273,7 +242,6 @@ def main(argv: list[str] | None = None) -> int:
 
     coro = {
         "run": lambda: cmd_run(cfg, args.stop_file),
-        "summary": lambda: cmd_summary(cfg, args.kind, args.hours),
         "inject": lambda: cmd_inject(cfg, args.json),
         "stats": lambda: cmd_stats(cfg),
         "prune": lambda: cmd_prune(cfg),

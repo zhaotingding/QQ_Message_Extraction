@@ -24,11 +24,11 @@ import time
 import tkinter as tk
 import urllib.request
 import urllib.error
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlsplit
 
 from . import __version__, DISPLAY_VERSION
 from . import napcat as napcat_mod
@@ -86,11 +86,8 @@ class App:
         self._rt_limit = 80
         self._rt_rows: dict[str, dict] = {}
         self._rt_actions: set[str] = set()
-        self._summary_busy = False
-        self._summary_started = 0.0
         self._summary_path = ""
-        self._summary_days_busy = False
-        self._summary_days_checked = 0.0
+        self._latest_report_ids = {}
         self._report_history_busy = False
         self._report_history_checked = 0.0
         self._report_history_seq = 0
@@ -145,30 +142,28 @@ class App:
         # 默认尺寸按屏幕算：写死 800 高在 768p 屏上会顶出屏幕，
         # 设置页底部的「保存设置」直接被切掉（用户得手动拉窗口才能看到）。
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        w = min(1040, max(900, sw - 80))
+        w = min(1280, max(820, sw - 80))
         h = min(940, max(680, sh - 90))
         self.root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
         self.root.minsize(820, 560)
 
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("TButton", padding=(12, 7), font=(FONT, 10))
+        self.root.option_add("*Font", (FONT, 10))
+        style.configure(".", font=(FONT, 10))
+        style.configure("TButton", padding=(8, 4), font=(FONT, 10))
         style.configure("TLabel", font=(FONT, 10))
         style.configure("TCheckbutton", font=(FONT, 10))
         style.configure("TLabelframe.Label", font=(FONT, 10, "bold"))
-        style.configure("Title.TLabel", font=(FONT, 20, "bold"))
-        style.configure("Hint.TLabel", font=(FONT, 9), foreground=MUTED)
-        style.configure("Card.TLabel", font=(FONT, 11))
+        style.configure("Hint.TLabel", font=(FONT, 10), foreground=MUTED)
+        style.configure("Card.TLabel", font=(FONT, 10))
         style.configure("CardKey.TLabel", font=(FONT, 10), foreground=MUTED)
-        style.configure("TNotebook.Tab", font=(FONT, 10), padding=(18, 8))
+        style.configure("Treeview", font=(FONT, 10), rowheight=24)
+        style.configure("Treeview.Heading", font=(FONT, 10))
+        style.configure("TNotebook.Tab", font=(FONT, 10), padding=(14, 5))
 
-        outer = ttk.Frame(self.root, padding=18)
+        outer = ttk.Frame(self.root, padding=8)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text=APP_TITLE, style="Title.TLabel").pack(anchor="w")
-        ttk.Label(
-            outer,
-            text="QQ 群消息萃取 · 只读不发言 · 配置与启停都在这里完成",
-        ).pack(anchor="w", pady=(2, 12))
 
         nb = ttk.Notebook(outer)
         nb.pack(fill="both", expand=True)
@@ -183,7 +178,7 @@ class App:
 
         self.status = tk.StringVar(value="就绪")
         ttk.Label(outer, textvariable=self.status, foreground="#245cc4").pack(
-            anchor="w", pady=(10, 0)
+            anchor="w", pady=(4, 0)
         )
 
     # ---- 标签页 1：运行状态 ----
@@ -196,16 +191,19 @@ class App:
         canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-        tab = ttk.Frame(canvas, padding=14)
+        tab = ttk.Frame(canvas, padding=8)
         window = canvas.create_window((0, 0), window=tab, anchor="nw")
-        def resize_status(event) -> None:
-            canvas.itemconfigure(window, width=event.width, height=max(780, event.height))
+        def resize_status(_event=None) -> None:
+            canvas.itemconfigure(window, width=canvas.winfo_width(),
+                                 height=max(tab.winfo_reqheight(), canvas.winfo_height()))
             canvas.configure(scrollregion=canvas.bbox("all"))
         canvas.bind("<Configure>", resize_status)
+        tab.bind("<Configure>", resize_status)
         canvas.bind("<MouseWheel>", lambda event: canvas.yview_scroll(int(-event.delta / 120), "units"))
 
-        card = ttk.LabelFrame(tab, text="服务状态", padding=14)
+        card = ttk.LabelFrame(tab, text="服务状态", padding=8)
         card.pack(fill="x")
+        card.bind("<Configure>", resize_status)
 
         self.v_service = tk.StringVar(value="未运行")
         self.v_peer = tk.StringVar(value="—")
@@ -214,104 +212,97 @@ class App:
         self.v_total = tk.StringVar(value="—")
         self.v_balance = tk.StringVar(value="—")
         self.v_llm = tk.StringVar(value="—")
+        self.v_billing_feedback = tk.StringVar(value="")
 
-        # 两列并排。用户的原话：「出了今日花费，总花费呢，不应该写在进入花费的右边吗」——
-        # 所以这两个必须是同一行的左右邻居，而不是上下两行。
-        rows = [
-            [("服务进程", self.v_service), ("协议端(NapCat)", self.v_peer)],
-            [("已入库消息", self.v_stored)],
-            [("今日花费", self.v_cost), ("累计花费", self.v_total)],
-            [("账户余额", self.v_balance)],
-            [("模型状态", self.v_llm)],
-        ]
-        for r, pair in enumerate(rows):
-            for c, (key, var) in enumerate(pair):
-                col = c * 2
-                ttk.Label(card, text=key, style="CardKey.TLabel").grid(
-                    row=r, column=col, sticky="w", padx=(0 if col == 0 else 28, 10), pady=3
-                )
-                if key == "账户余额":
-                    balance_actions = ttk.Frame(card)
-                    balance_actions.grid(row=r, column=1, columnspan=3, sticky="w", pady=3)
-                    ttk.Label(balance_actions, textvariable=var, style="Card.TLabel").pack(side="left")
-                    self.btn_billing = ttk.Button(balance_actions, text="刷新账单", command=self.refresh_billing)
-                    self.btn_billing.pack(side="left", padx=8)
-                    ttk.Button(balance_actions, text="官方平台", command=self._open_billing_platform).pack(side="left")
-                else:
-                    ttk.Label(card, textvariable=var, style="Card.TLabel").grid(
-                        row=r, column=col + 1, columnspan=3 if key == "模型状态" else 1,
-                        sticky="w", pady=3
-                    )
-        card.columnconfigure(1, weight=1)
-        card.columnconfigure(3, weight=1)
-
-        self.v_protocol_detail = tk.StringVar(value="")
-        ttk.Label(card, textvariable=self.v_protocol_detail, wraplength=900).grid(
-            row=len(rows), column=0, columnspan=4, sticky="w", pady=(6, 0)
-        )
-        self.btn_relogin = ttk.Button(card, text="重新扫码", command=self.relogin_napcat)
-        self.btn_relogin.grid(row=len(rows) + 2, column=0, sticky="w")
-        self.btn_relogin.grid_remove()
-
+        ttk.Label(card, text="服务进程", style="CardKey.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8))
         service_actions = ttk.Frame(card)
-        service_actions.grid(row=len(rows) + 1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        service_actions.grid(row=0, column=1, columnspan=3, sticky="ew", pady=(0, 4))
+        ttk.Label(service_actions, textvariable=self.v_service, style="Card.TLabel").pack(side="left", padx=(0, 12))
         self.btn_start = ttk.Button(service_actions, text="启动服务", command=self.start_service)
         self.btn_start.pack(side="left")
         self.btn_stop = ttk.Button(service_actions, text="停止服务", command=self.stop_service, state="disabled")
-        self.btn_stop.pack(side="left", padx=8)
+        self.btn_stop.pack(side="left", padx=6)
         self.btn_restart = None
         if self.napcat_script() or self.napcat_dir():
             self.btn_restart = ttk.Button(service_actions, text="强制重启", command=self.restart_napcat)
             self.btn_restart.pack(side="left")
+        ttk.Button(service_actions, text="打开数据目录", command=self.open_data_dir).pack(side="right")
 
-        # ---- 摘要操作 ----
-        buttons = ttk.Frame(tab)
-        buttons.pack(fill="x", pady=(12, 4))
+        # 两列并排。用户的原话：「出了今日花费，总花费呢，不应该写在进入花费的右边吗」——
+        # 所以这两个必须是同一行的左右邻居，而不是上下两行。
+        rows = [
+            [("协议端", self.v_peer), ("已入库消息", self.v_stored)],
+            [("今日花费", self.v_cost), ("累计花费", self.v_total)],
+            [("账户余额", self.v_balance)],
+            [("模型状态", self.v_llm)],
+        ]
+        for r, pair in enumerate(rows, 1):
+            for c, (key, var) in enumerate(pair):
+                col = c * 2
+                ttk.Label(card, text=key, style="CardKey.TLabel").grid(
+                    row=r, column=col, sticky="w", padx=(0 if col == 0 else 20, 8), pady=2
+                )
+                if key == "账户余额":
+                    balance_actions = ttk.Frame(card)
+                    balance_actions.grid(row=r, column=1, columnspan=3, sticky="ew", pady=2)
+                    ttk.Label(balance_actions, textvariable=var, style="Card.TLabel").pack(side="left")
+                    self.btn_billing = ttk.Button(balance_actions, text="刷新账单", command=self.refresh_billing)
+                    self.btn_billing.pack(side="left", padx=6)
+                    ttk.Button(balance_actions, text="官方平台", command=self._open_billing_platform).pack(side="left")
+                    feedback = ttk.Label(balance_actions, textvariable=self.v_billing_feedback, style="Hint.TLabel", width=1)
+                    feedback.pack(side="left", fill="x", expand=True, padx=(8, 0))
+                    feedback.bind("<Configure>", lambda event: event.widget.configure(wraplength=max(80, event.width)))
+                else:
+                    value_label = ttk.Label(card, textvariable=var, style="Card.TLabel", width=1)
+                    value_label.grid(
+                        row=r, column=col + 1, columnspan=3 if key == "模型状态" else 1,
+                        sticky="ew", pady=2
+                    )
+                    value_label.bind("<Configure>", lambda event: event.widget.configure(wraplength=max(80, event.width)))
+        card.columnconfigure(1, weight=1)
+        card.columnconfigure(3, weight=1)
 
-        yesterday = (datetime.now(BEIJING).date() - timedelta(days=1)).isoformat()
-        ttk.Label(buttons, text="摘要日期：").pack(side="left", padx=(0, 4))
-        self.v_summary_start = tk.StringVar(value=yesterday)
-        self.v_summary_end = tk.StringVar(value=yesterday)
-        start_entry = ttk.Entry(buttons, textvariable=self.v_summary_start, width=12)
-        start_entry.pack(side="left")
-        ttk.Label(buttons, text="至").pack(side="left", padx=5)
-        end_entry = ttk.Entry(buttons, textvariable=self.v_summary_end, width=12)
-        end_entry.pack(side="left")
-        for entry in (start_entry, end_entry):
-            entry.bind("<FocusOut>", self._on_summary_dates_change)
-            entry.bind("<Return>", self._on_summary_dates_change)
-        self.btn_summary = ttk.Button(buttons, text="生成摘要", command=self.summary_by_date)
-        self.btn_summary.pack(side="left", padx=6)
-        self.btn_regenerate = ttk.Button(buttons, text="重新生成", command=lambda: self.summary_by_date(force=True))
-        ttk.Button(buttons, text="打开数据目录", command=self.open_data_dir).pack(side="right")
+        self.v_protocol_detail = tk.StringVar(value="")
+        protocol_detail = ttk.Label(card, textvariable=self.v_protocol_detail, width=1)
+        protocol_detail.grid(
+            row=len(rows) + 1, column=0, columnspan=4, sticky="ew", pady=(2, 0)
+        )
+        protocol_detail.bind("<Configure>", lambda event: event.widget.configure(wraplength=max(80, event.width)))
+        self.v_protocol_detail.trace_add("write", lambda *_: protocol_detail.grid() if self.v_protocol_detail.get()
+                                        else protocol_detail.grid_remove())
+        protocol_detail.grid_remove()
+        self.btn_relogin = ttk.Button(card, text="重新扫码", command=self.relogin_napcat)
+        self.btn_relogin.grid(row=len(rows) + 2, column=0, sticky="w")
+        self.btn_relogin.grid_remove()
 
-        buttons2 = ttk.Frame(tab)
-        buttons2.pack(fill="x")
-        self.v_billing_feedback = tk.StringVar(value="账单金额为本地估算")
-        ttk.Label(buttons2, textvariable=self.v_billing_feedback, wraplength=640).pack(side="left")
-
-        self.v_range_desc = tk.StringVar(value=self._summary_date_desc())
-        ttk.Label(tab, textvariable=self.v_range_desc, style="Hint.TLabel").pack(anchor="w", pady=(3, 0))
-        self.v_daily_latest = tk.StringVar(value="最近日报：启动服务后查看")
-        ttk.Label(tab, textvariable=self.v_daily_latest, wraplength=940).pack(anchor="w", pady=(3, 0))
-        self.v_summary_days = tk.StringVar(value="所选日期：启动服务后查看")
-        ttk.Label(tab, textvariable=self.v_summary_days, wraplength=940).pack(anchor="w", pady=(3, 0))
-
-        progress = ttk.Frame(tab)
-        progress.pack(fill="x", pady=(6, 0))
-        self.summary_bar = ttk.Progressbar(progress, mode="indeterminate", length=110)
-        self.summary_bar.pack(side="left")
-        self.v_summary = tk.StringVar(value=f"摘要待生成，目标约 {self._summary_options()['target_chars']} 字")
-        ttk.Label(progress, textvariable=self.v_summary, wraplength=740).pack(side="left", padx=8)
+        # ---- 自动摘要状态 ----
+        automatic = ttk.LabelFrame(tab, text="自动日报 / 周报 / 月报", padding=6)
+        automatic.pack(fill="x", pady=(4, 0))
+        self.v_summary_schedule_desc = tk.StringVar(value=self._summary_schedule_desc())
+        ttk.Label(automatic, textvariable=self.v_summary_schedule_desc, style="Hint.TLabel", wraplength=900).pack(anchor="w")
+        self.v_latest_reports = {}
+        for kind, title in (("daily", "日报"), ("weekly", "周报"), ("monthly", "月报")):
+            self.v_latest_reports[kind] = tk.StringVar(value=f"最近{title}：启动服务后查看")
+            ttk.Label(automatic, textvariable=self.v_latest_reports[kind], wraplength=900).pack(anchor="w")
+        self.v_summary_schedule = tk.StringVar(value="自动摘要：服务未运行")
+        ttk.Label(automatic, textvariable=self.v_summary_schedule, wraplength=900).pack(anchor="w")
+        self.v_summary_next = tk.StringVar(value="")
+        ttk.Label(automatic, textvariable=self.v_summary_next, style="Hint.TLabel", wraplength=900).pack(anchor="w")
+        def resize_summary(event) -> None:
+            for label in automatic.winfo_children():
+                label.configure(wraplength=max(200, event.width - 20))
+            resize_status()
+        automatic.bind("<Configure>", resize_summary)
 
         # ---- 日志区（v0.5.5：服务日志 / 协议端日志在这里切换，不再弹独立窗口）----
         # 用户的原话：「我希望这个 UI 界面就是所有的程序载体，什么功能都能在上面，
         # 而不需要我去别的地方再找寻浪费时间。」弹窗式日志正好是反面教材 ——
         # 它把信息放到了一个用户不知道何时会出现、还得专门去点的另一个窗口里。
-        log_frame = ttk.LabelFrame(tab, text="日志", padding=8)
-        log_frame.pack(fill="both", expand=True, pady=(6, 0))
+        log_frame = ttk.LabelFrame(tab, text="日志", padding=6)
+        log_frame.pack(fill="both", expand=True, pady=(4, 0))
         bar = ttk.Frame(log_frame)
-        bar.pack(fill="x", pady=(0, 6))
+        bar.pack(fill="x", pady=(0, 4))
         ttk.Label(bar, text="看哪个").pack(side="left")
         self.v_log_src = tk.StringVar(value="服务日志")
         self.cb_log_src = ttk.Combobox(
@@ -337,18 +328,61 @@ class App:
         self.log.pack(fill="both", expand=True)
         self.alt_log = self._make_log_text(log_frame)  # 协议端日志（默认不显示）
 
-    def _summary_date_desc(self) -> str:
+    def _summary_schedule_desc(self) -> str:
         chars = self._summary_options()["target_chars"]
-        return f"北京时间自然日（YYYY-MM-DD）；单日目标约 {chars} 字，多日二次归纳会适当加长"
+        return (f"北京时间 00:00：日报每天 · 周报周一 · 月报每月1日；依次生成，"
+                f"字数：日报 {chars} / 周报 {2 * chars}（2D）/ 月报 {3 * chars}（3D）。")
+
+    def _apply_summary_schedule(self, data: dict) -> None:
+        reports = data.get("latest_reports")
+        if isinstance(reports, dict):
+            identities = {}
+            for kind, title in (("daily", "日报"), ("weekly", "周报"), ("monthly", "月报")):
+                item = reports.get(kind)
+                if not item:
+                    self.v_latest_reports[kind].set(f"最近{title}：暂无已完成记录")
+                    continue
+                start = datetime.fromtimestamp(item["window_start"], BEIJING)
+                end = datetime.fromtimestamp(item["window_end"], BEIJING)
+                created = datetime.fromtimestamp(item["created_at"], BEIJING)
+                self.v_latest_reports[kind].set(
+                    f"最近{title}：{start:%Y-%m-%d %H:%M} — {end:%Y-%m-%d %H:%M} · "
+                    f"已完成 {item.get('chars', 0)} 字 · 生成于 {created:%m-%d %H:%M}")
+                identities[kind] = (item.get("id"), item["created_at"])
+            if identities != self._latest_report_ids:
+                self._latest_report_ids = identities
+                self.refresh_report_history()
+        schedule = data.get("summary_schedule") or {}
+        labels = {"idle": "等待执行", "waiting": "等待前置摘要", "pending": "等待恢复", "settling": "等待消息入库",
+                  "running": "正在生成", "failed": "任务失败", "done": "已完成", "empty": "无内容",
+                  "blocked": "已停止重试，请检查", "retry": "等待重试", "disabled": "未启用", "unknown": "状态未知"}
+        state = schedule.get("state", "unknown")
+        title = {"daily": "日报", "weekly": "周报", "monthly": "月报"}.get(schedule.get("kind"), "自动摘要")
+        message = security.redact(str(schedule.get("message") or "服务尚未提供调度状态"))
+        progress = data.get("summary_progress") or {}
+        if state == "running" and progress.get("state") == "running" and progress.get("message"):
+            message += "；" + security.redact(str(progress["message"]))
+        self.v_summary_schedule.set(f"{title}：{labels.get(state, state)} · {message}")
+        next_runs = schedule.get("next_runs") or {}
+        times = []
+        for kind, title in (("daily", "日报"), ("weekly", "周报"), ("monthly", "月报")):
+            value = next_runs.get(kind)
+            if value:
+                try:
+                    when = datetime.fromisoformat(value).astimezone(BEIJING)
+                    times.append(f"{title} {when:%m-%d %H:%M}")
+                except (TypeError, ValueError):
+                    pass
+        self.v_summary_next.set("下次计划（北京时间）：" + "；".join(times) if times else "")
 
     @staticmethod
     def _make_log_text(parent) -> ScrolledText:
         w = ScrolledText(
             parent,
-            height=16,
+            height=8,
             wrap="word",
             state="disabled",
-            font=("Consolas", 9),
+            font=("Consolas", 10),
             background=LOG_BG,
             foreground=LOG_FG,
             insertbackground=LOG_FG,
@@ -426,12 +460,6 @@ class App:
         else:
             widget.insert("end", line + "\n")
 
-    def _on_summary_dates_change(self, _event=None) -> None:
-        self._summary_days_checked = 0.0
-        self.v_summary_days.set("所选日期：正在查询…")
-        self.btn_summary.configure(text="生成摘要")
-        self.btn_regenerate.pack_forget()
-        self.refresh_summary_days()
 
     # ---- 标签页 2：实时消息 ----
 
@@ -499,7 +527,7 @@ class App:
         ttk.Label(tab, text="点击「打开」查看原图；点「□ 识别」才调用图片 API。"
                          "默认只做 OCR；勾选「纳入摘要」即可使用 OCR，无需先做图片识别。",
                   style="Hint.TLabel").pack(anchor="w", pady=(8, 0))
-        self.rt_detail = ScrolledText(tab, height=6, wrap="word", font=(FONT, 9))
+        self.rt_detail = ScrolledText(tab, height=6, wrap="word", font=(FONT, 10))
         self.rt_detail.pack(fill="x", pady=(5, 0))
         self.rt_detail.configure(state="disabled")
 
@@ -573,18 +601,18 @@ class App:
                   style="Hint.TLabel", wraplength=730).grid(row=row+3, column=0, columnspan=2, sticky="w")
 
         # --- 摘要 ---
-        sm = ttk.LabelFrame(tab, text="手动摘要", padding=12)
+        sm = ttk.LabelFrame(tab, text="自动摘要", padding=12)
         sm.pack(fill="x")
         line = ttk.Frame(sm)
         line.pack(fill="x")
-        ttk.Label(line, text="目标字数").pack(side="left")
+        ttk.Label(line, text="日报目标字数 D").pack(side="left")
         self.v_summary_chars = tk.StringVar()
         ttk.Entry(line, textvariable=self.v_summary_chars, width=8).pack(side="left", padx=6)
         ttk.Button(line, text="恢复默认提示词", command=self.reset_summary_prompt).pack(side="right")
         ttk.Label(
             sm,
-            text="提示词中的 {{目标字数}} 会自动替换。保存后下一次生成即生效；"
-                 "在运行状态页选择统计时间范围后手动生成。",
+            text="只配置日报字数 D；周报自动使用 2D，月报自动使用 3D。\n"
+                 "提示词中的 {{目标字数}} 自动替换；保存后下一次自动任务生效，在途任务保持原设置。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(6, 0))
         self.txt_summary_prompt = ScrolledText(
@@ -737,9 +765,7 @@ class App:
         self.txt_summary_prompt.delete("1.0", "end")
         self.txt_summary_prompt.insert("1.0", options["prompt"])
         self.v_summary_chars.set(str(options["target_chars"]))
-        self.v_range_desc.set(self._summary_date_desc())
-        if not self._summary_busy:
-            self.v_summary.set(f"摘要待生成，目标约 {options['target_chars']} 字")
+        self.v_summary_schedule_desc.set(self._summary_schedule_desc())
 
         f = p.get("filters") or {}
         for key, var in self.v_filters.items():
@@ -835,9 +861,7 @@ class App:
         self.api_selector.configure(values=[p["provider"] for p in self._api_profiles.values()])
         self.api_selector.current(list(self._api_profiles).index(self._api_selected))
         self._api_key_status()
-        self.v_range_desc.set(self._summary_date_desc())
-        if not self._summary_busy:
-            self.v_summary.set(f"摘要待生成，目标约 {data['summary_target_chars']} 字")
+        self.v_summary_schedule_desc.set(self._summary_schedule_desc())
         n_groups = len(data["groups"]) or "全部"
         self.status.set(
             f"已保存 · 新任务使用 {data['api']['provider']} / {data['api']['model']} · 摘要约 {data['summary_target_chars']} 字 · 群 {n_groups}"
@@ -1259,12 +1283,12 @@ class App:
         panes.add(reader, weight=3)
         bar = ttk.Frame(history)
         bar.pack(fill="x")
-        ttk.Label(bar, text="最近摘要", font=(FONT, 11, "bold")).pack(side="left")
+        ttk.Label(bar, text="最近摘要", font=(FONT, 10, "bold")).pack(side="left")
         self.btn_report_refresh = ttk.Button(bar, text="刷新", command=self.refresh_report_history)
         self.btn_report_refresh.pack(side="right")
         self.v_report_filter = tk.StringVar(value="全部")
         report_filter = ttk.Combobox(history, textvariable=self.v_report_filter, state="readonly",
-                                    values=("全部", "仅日报", "仅汇总"), width=12)
+                                    values=("全部", "仅日报", "仅周报", "仅月报"), width=12)
         report_filter.pack(fill="x", pady=(6, 0))
         report_filter.bind("<<ComboboxSelected>>", self._report_filter_changed)
         self.v_report_history = tk.StringVar(value="正在读取本地摘要…")
@@ -1394,8 +1418,8 @@ class App:
         self.v_report_history.set("正在读取本地摘要…")
         db = abs_path(self.cfg, "db_path")
         self._report_query_filter = self.v_report_filter.get()
-        kinds = {"仅日报": ("daily", "daily_partial"), "仅汇总": ("multi", "multi_partial")}.get(
-            self._report_query_filter, ("daily", "daily_partial", "multi", "multi_partial"))
+        kinds = {"仅日报": ("daily",), "仅周报": ("weekly",), "仅月报": ("monthly",)}.get(
+            self._report_query_filter, ("daily", "weekly", "monthly"))
 
         def work() -> None:
             items, error = [], ""
@@ -1437,8 +1461,8 @@ class App:
         selected = self.report_history.selection()
         current = selected[0].removeprefix("detail-") if selected else ""
         shown_path = self._summary_path
-        kinds = {"仅日报": ("daily", "daily_partial"), "仅汇总": ("multi", "multi_partial")}.get(
-            self.v_report_filter.get(), ("daily", "daily_partial", "multi", "multi_partial"))
+        kinds = {"仅日报": ("daily",), "仅周报": ("weekly",), "仅月报": ("monthly",)}.get(
+            self.v_report_filter.get(), ("daily", "weekly", "monthly"))
         self._report_items = {str(item["id"]): item for item in items if item.get("kind") in kinds}
         self.report_history.delete(*self.report_history.get_children())
         chosen = ""
@@ -1448,18 +1472,16 @@ class App:
                           for line in content.splitlines() if line.strip()), "无标题摘要")
             start = datetime.fromtimestamp(item["window_start"], BEIJING)
             end = datetime.fromtimestamp(item["window_end"], BEIJING)
-            daily = item["kind"].startswith("daily")
-            partial = item["kind"].endswith("_partial")
-            kind = "日报" if daily else "汇总"
-            label_end = end if partial else end - timedelta(seconds=1)
+            daily = item["kind"] == "daily"
+            kind = {"daily": "日报", "weekly": "周报", "monthly": "月报"}[item["kind"]]
+            label_end = end - timedelta(seconds=1)
             dates = (f"{start:%m-%d}" if daily else f"{start:%m-%d}—{label_end:%m-%d}"
                      if start.year == label_end.year else f"{start:%Y-%m-%d}—{label_end:%Y-%m-%d}")
-            suffix = f" · 截至 {end:%m-%d %H:%M}，未完成" if partial else ""
             review = self._report_review_updates.get((item["id"], summary_review.content_hash(content)), item.get("review", {}))
             item["review"] = review
             state = review.get("read_state", "unread")
             label = {"unread": "未读", "skimmed": "粗读", "deep": "深读"}.get(state, "未读")
-            self.report_history.insert("", "end", iid=iid, text=f"【{kind}】{dates}{suffix} · {title}",
+            self.report_history.insert("", "end", iid=iid, text=f"【{kind}】{dates} · {title}",
                                        values=(label,), tags=(state,), open=True)
             self.report_history.insert(iid, "end", iid=f"detail-{iid}", tags=("metadata",),
                                        text=f"{kind} · {summary_chars(content)} 字 · {start:%Y-%m-%d %H:%M} — {end:%Y-%m-%d %H:%M}")
@@ -1587,7 +1609,7 @@ class App:
         self.v_report_read_state.set(review["read_state"])
         self._report_notes_saved = review["notes"]
         self.report_notes.insert("1.0", review["notes"])
-        if item.get("kind", "").startswith("daily"):
+        if item.get("kind") in ("daily", "weekly", "monthly"):
             self.report_notes_frame.pack(side="bottom", fill="x", pady=(5, 0), before=self.report_text)
         for button in self._report_review_buttons:
             button.configure(state="normal")
@@ -1624,11 +1646,12 @@ class App:
         self.v_report_read_state.set(state)
         if self.report_history.exists(iid):
             self.report_history.item(iid, tags=(state,), values=({"unread": "未读", "skimmed": "粗读", "deep": "深读"}[state],))
-        self.v_report_review.set("已保存到本地；下次生成多日汇总将使用当前重点与心得。")
+        self.v_report_review.set("已保存到本地。" if self._report_current.get("kind") == "monthly" else
+                                 "已保存到本地；后续自动汇总将使用来源报告中已保存的重点与心得。")
         return True
 
     def _save_report_notes(self) -> bool:
-        if self._report_review is None or not (self._report_current or {}).get("kind", "").startswith("daily"):
+        if self._report_review is None or (self._report_current or {}).get("kind") not in ("daily", "weekly", "monthly"):
             return True
         notes = self.report_notes.get("1.0", "end-1c")
         if notes == self._report_notes_saved:
@@ -1684,29 +1707,6 @@ class App:
             self.root.clipboard_append(self._report_content)
             self.status.set("已复制完整摘要")
 
-    def _summary_finished(self, data: dict) -> None:
-        self._summary_busy = False
-        self.summary_bar.stop()
-        self.btn_summary.configure(state="normal")
-        self.btn_regenerate.configure(state="normal")
-        if data.get("error"):
-            note = f"摘要生成失败：{data['error']}"
-        elif not data.get("created"):
-            note = "所选日期暂无可生成的摘要"
-        else:
-            item = data["created"][0]
-            if not self._show_report(item):
-                self.v_summary.set("摘要已生成；当前心得保存失败，请保存后刷新摘要列表查看。")
-                self._summary_days_checked = 0.0
-                return
-            self.refresh_report_history(preferred_path=item.get("path", ""))
-            self.nb.select(self.report_tab)
-            note = f"摘要已生成（{item.get('chars', 0)} 字），完整文件：{self._summary_path}"
-        self.v_summary.set(note)
-        self._log_ui(f"[界面] {note}\n")
-        self.status.set(note)
-        self._summary_days_checked = 0.0
-        self.refresh_summary_days()
 
     # ---------------- 服务进程 ----------------
 
@@ -1788,173 +1788,12 @@ class App:
         finally:
             self.events.put(("exit", (proc, proc.wait())))
 
-    def _chosen_summary_dates(self) -> tuple[date, date]:
-        raw_start = self.v_summary_start.get().strip()
-        raw_end = self.v_summary_end.get().strip()
-        if not all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) for value in (raw_start, raw_end)):
-            raise ValueError("摘要日期请按 YYYY-MM-DD 填写")
-        try:
-            start, end = date.fromisoformat(raw_start), date.fromisoformat(raw_end)
-        except ValueError as exc:
-            raise ValueError("摘要日期不是有效的日历日期") from exc
-        if end < start:
-            raise ValueError("结束日期不能早于起始日期")
-        if end > datetime.now(BEIJING).date():
-            raise ValueError("摘要日期不能晚于今天")
-        if (end - start).days >= 31:
-            raise ValueError("一次最多选择 31 天")
-        return start, end
 
-    def summary_now(self, kind: str = "by_date", hours: int | None = None,
-                    start_date: str | None = None, end_date: str | None = None,
-                    force: bool = False) -> None:
-        if self._summary_busy:
-            return
-        if not self._save_report_notes():
-            self.v_summary.set("当前心得尚未保存，暂未生成摘要；请先保存成功后重试。")
-            self.status.set(self.v_summary.get())
-            return
-        if self.proc is None:
-            self.v_summary.set("请先启动服务，再生成摘要。")
-            self.status.set(self.v_summary.get())
-            return
-        if kind == "by_date":
-            try:
-                start, end = self._chosen_summary_dates() if start_date is None or end_date is None else (
-                    date.fromisoformat(start_date), date.fromisoformat(end_date))
-            except ValueError as exc:
-                self.v_summary.set(str(exc))
-                self.status.set(str(exc))
-                return
-            start_date, end_date = start.isoformat(), end.isoformat()
-        self._summary_busy = True
-        self._summary_started = time.time()
-        self.btn_summary.configure(state="disabled")
-        self.btn_regenerate.configure(state="disabled")
-        self.summary_bar.start(12)
-        options = self._summary_options()
-        if kind == "by_date":
-            days = (end - start).days + 1
-            if days > 1:
-                extra, minimum = (1500, 4500) if days <= 3 else (3000, 6000) if days <= 7 else (7000, 10000)
-                options["target_chars"] = min(100000, max(options["target_chars"] + extra, minimum))
-            target = start_date if days == 1 else f"{start_date} 至 {end_date}"
-        else:
-            target = f"最近 {hours // 24} 天" if kind == "range" and hours else "增量"
-        note = f"开始生成{target}摘要，目标约 {options['target_chars']} 字；正在读取消息并调用已配置的模型…"
-        self.v_summary.set(note)
-        self.status.set(note)
-        self._log_ui(f"[界面] {note}\n")
-        port = int(self.cfg["onebot"]["http_port"])
 
-        def work() -> None:
-            try:
-                url = f"http://127.0.0.1:{port}/summary/now?kind={kind}"
-                if kind == "range" and hours:
-                    url += f"&hours={int(hours)}"
-                if kind == "by_date":
-                    options.update({"start_date": start_date, "end_date": end_date, "force": force})
-                req = urllib.request.Request(
-                    url, data=json.dumps(options, ensure_ascii=False).encode("utf-8"),
-                    headers={"Content-Type": "application/json"}, method="POST",
-                )
-                op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                with op.open(req, timeout=1800) as response:
-                    body = json.loads(response.read().decode("utf-8"))
-                self.events.put(("summary_done", body))
-            except urllib.error.HTTPError as exc:
-                try:
-                    detail = json.loads(exc.read().decode("utf-8")).get("error") or str(exc)
-                except (ValueError, UnicodeError):
-                    detail = str(exc)
-                self.events.put(("summary_done", {"error": detail}))
-            except Exception as exc:
-                self.events.put(("summary_done", {"error": str(exc)}))
 
-        threading.Thread(target=work, daemon=True).start()
 
-    def summary_by_date(self, force: bool = False) -> None:
-        """按北京时间的自然日生成日报，或复用日报生成多日摘要。"""
-        try:
-            start, end = self._chosen_summary_dates()
-        except ValueError as exc:
-            self.v_summary.set(str(exc))
-            self.status.set(str(exc))
-            return
-        self.summary_now("by_date", start_date=start.isoformat(), end_date=end.isoformat(), force=force)
 
-    def refresh_summary_days(self) -> None:
-        if self.proc is None or self._summary_days_busy:
-            return
-        try:
-            start, end = self._chosen_summary_dates()
-        except ValueError as exc:
-            self.v_summary_days.set(str(exc))
-            self.btn_regenerate.pack_forget()
-            return
-        self._summary_days_busy = True
-        self._summary_days_checked = time.time()
-        threading.Thread(target=self._fetch_summary_days,
-                         args=(start.isoformat(), end.isoformat()), daemon=True).start()
 
-    def _fetch_summary_days(self, start: str, end: str) -> None:
-        port = int(self.cfg["onebot"]["http_port"])
-        url = f"http://127.0.0.1:{port}/summary/days?{urlencode({'start_date': start, 'end_date': end})}"
-        try:
-            op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with op.open(url, timeout=5) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except (OSError, ValueError) as exc:
-            data = {"error": str(exc)}
-        finally:
-            self._summary_days_busy = False
-        self.events.put(("summary_days", (start, end, data)))
-
-    def _apply_summary_days(self, start: str, end: str, data: dict) -> None:
-        latest = data.get("latest_daily")
-        if latest is not None:
-            self._show_latest_daily(latest)
-        if (self.v_summary_start.get().strip(), self.v_summary_end.get().strip()) != (start, end):
-            return
-        if data.get("error"):
-            self.v_summary_days.set(f"所选日期状态读取失败：{data['error']}")
-            return
-        rows = {str(row.get("date")): row for row in data.get("days", [])}
-        first, last = date.fromisoformat(start), date.fromisoformat(end)
-        dates = [(first + timedelta(days=i)).isoformat() for i in range((last - first).days + 1)]
-        done = [day for day in dates if rows.get(day, {}).get("status") == "done"]
-        empty = [day for day in dates if rows.get(day, {}).get("status") == "empty"]
-        partial = [day for day in dates if rows.get(day, {}).get("status") == "partial"]
-        missing = [day for day in dates if day not in done and day not in empty and day not in partial]
-        if len(dates) == 1:
-            day = dates[0]
-            state = rows.get(day, {}).get("status")
-            labels = {"done": "已完成", "empty": "无消息", "partial": "截至当前的临时摘要"}
-            self.v_summary_days.set(f"所选日期 {day}：{labels.get(state, '待生成')}")
-            self.btn_summary.configure(text="查看摘要" if state == "done" else "生成摘要")
-            if state == "done":
-                self.btn_regenerate.pack(side="left", padx=(0, 6))
-            else:
-                self.btn_regenerate.pack_forget()
-        else:
-            detail = f"所选 {len(dates)} 天：已完成 {len(done)} 天，无消息 {len(empty)} 天"
-            if partial:
-                detail += f"，临时摘要 {len(partial)} 天"
-            if missing:
-                detail += f"；缺少 {len(missing)} 天（{', '.join(missing[:3])}{' 等' if len(missing) > 3 else ''}），点击生成会先补齐"
-            self.v_summary_days.set(detail)
-            self.btn_summary.configure(text="生成摘要")
-            self.btn_regenerate.pack_forget()
-
-    def _show_latest_daily(self, latest: dict | None) -> None:
-        yesterday = (datetime.now(BEIJING).date() - timedelta(days=1)).isoformat()
-        if latest and str(latest.get("date")) == yesterday and latest.get("status") == "done":
-            self.v_daily_latest.set(f"昨日日报 {yesterday}：已完成（{latest.get('chars', 0)} 字）")
-        elif latest:
-            status = "无消息" if latest.get("status") == "empty" else "待生成"
-            self.v_daily_latest.set(f"昨日日报 {yesterday}：{status}")
-        else:
-            self.v_daily_latest.set(f"昨日日报 {yesterday}：尚未完成")
 
     def open_data_dir(self) -> None:
         open_path(abs_path(self.cfg, "report_dir").parent)
@@ -2577,8 +2416,6 @@ class App:
         if not self.health_busy and self.proc is not None:
             self.health_busy = True
             threading.Thread(target=self._fetch_health, args=(self.proc,), daemon=True).start()
-            if not self._summary_days_busy and time.time() - self._summary_days_checked >= 30:
-                self.refresh_summary_days()
         elif self.proc is None:
             self.v_service.set("未运行")
             self.v_peer.set("消息服务未运行 · 协议端无法接入")
@@ -2588,8 +2425,8 @@ class App:
             self.v_total.set("—")
             self.v_balance.set("—")
             self.v_llm.set("—")
-            self.v_daily_latest.set("最近日报：启动服务后查看")
-            self.v_summary_days.set("所选日期：启动服务后查看")
+            self.v_summary_schedule.set("自动摘要：服务未运行，任务不会执行")
+            self.v_summary_next.set("")
         self.root.after(2000, self._tick_health)
         if self.nb.select() == str(self.report_tab) and time.time() - self._report_history_checked >= 30:
             self.refresh_report_history()
@@ -2685,13 +2522,8 @@ class App:
                 self.refresh_messages()
             else:
                 self.status.set(result.get("error") or "图片操作失败")
-        elif kind == "summary_done":
-            self._summary_finished(value)
         elif kind == "report_history":
             self._render_report_history(*value)
-        elif kind == "summary_days":
-            start, end, data = value
-            self._apply_summary_days(start, end, data)
         elif kind == "login_done":
             self._login_finished(value)
         elif kind == "usage":
@@ -2732,6 +2564,7 @@ class App:
         self._verify_login_message(data or {})
         if data is None:
             self.v_service.set("启动中或未响应")
+            self.v_summary_schedule.set("自动摘要：服务未响应，调度状态未知")
             self.v_peer.set("消息服务未响应 · QQ 状态未知")
             self.v_protocol_detail.set("服务未响应，暂时无法确认 QQ 登录状态")
             self.btn_relogin.grid_remove()
@@ -2780,19 +2613,7 @@ class App:
             f"（本次运行新收 {c.get('received', 0)}，"
             f"其中已过滤 {c.get('filtered', 0)}）"
         )
-        progress = data.get("summary_progress") or {}
-        if progress.get("state") == "running":
-            elapsed = int(time.time() - self._summary_started) if self._summary_busy else 0
-            self.v_summary.set(f"{progress.get('message', '正在生成')} · 已用 {elapsed} 秒" if self._summary_busy
-                               else f"每日摘要：{progress.get('message', '正在生成')}")
-        if "latest_daily" in data:
-            self._show_latest_daily(data.get("latest_daily"))
-            daily = data.get("daily_schedule") or {}
-            state = daily.get("state")
-            if state in ("settling", "running"):
-                self.v_daily_latest.set(f"{self.v_daily_latest.get()}；自动任务：{daily.get('message') or '正在生成'}")
-            elif state == "failed":
-                self.v_daily_latest.set(f"{self.v_daily_latest.get()}；自动任务失败：{daily.get('message') or '请查看日志'}")
+        self._apply_summary_schedule(data)
 
         # 账单：优先用服务抓到的真实数据；没抓到就退回本地估算，并标明是估算。
         budget = float(data.get("budget_cny") or 0)

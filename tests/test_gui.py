@@ -14,7 +14,6 @@ import json
 import time
 import sqlite3
 import tempfile
-from datetime import date, timedelta
 from contextlib import closing
 from pathlib import Path
 
@@ -94,7 +93,7 @@ check("滚动容器已设滚动区域", bool(canvases and canvases[0].cget("scro
 wheel_bound = [w for w in allw if w.bind("<MouseWheel>") and not isinstance(w, (tk.Text, tk.Listbox))]
 check("滚轮已绑到设置页控件上", len(wheel_bound) >= 5, f"{len(wheel_bound)} 个控件")
 buttons = [str(w.cget("text")) for w in allw if isinstance(w, ttk.Button)]
-check("只有一个摘要按钮", buttons.count("生成摘要") == 1 and "生成最新摘要" not in buttons, str(buttons))
+check("移除所有手动摘要按钮", not any(label in buttons for label in ("生成摘要", "生成最新摘要", "重新生成", "查看摘要")), str(buttons))
 # 手动摘要用自然日日期范围，已有日报可以查看或明确选择重新生成。
 check("不再有说不清范围的『全量重做』", not any("全量" in b for b in buttons), str(buttons))
 check("保留强制重启并移除自动登录入口", "强制重启" in buttons and "自动登录" not in buttons
@@ -102,10 +101,35 @@ check("保留强制重启并移除自动登录入口", "强制重启" in buttons
 # v0.5.4：群列表是历次登录的并集，换过账号就会混进别的账号的群，得有个清理入口。
 check("有「只保留当前账号的群」按钮",
       any("只保留当前账号" in b for b in buttons), str(buttons))
-yesterday = (date.today() - timedelta(days=1)).isoformat()
-check("日期范围默认选昨日单日", app.v_summary_start.get() == yesterday and app.v_summary_end.get() == yesterday)
-check("摘要日期格式与重新生成入口可见", "YYYY-MM-DD" in app.v_range_desc.get()
-      and app.btn_regenerate.cget("text") == "重新生成")
+check("手动日期与生成入口彻底移除", not any(hasattr(app, name) for name in (
+      "v_summary_start", "v_summary_end", "btn_summary", "btn_regenerate", "summary_now", "summary_by_date", "refresh_summary_days")))
+check("自动日报周报月报计划和倍数字数可见", all(text in app.v_summary_schedule_desc.get()
+      for text in ("00:00", "周一", "每月1日", "2D", "3D")))
+_schedule_reports = {
+    kind: {"id": index, "kind": kind, "window_start": 1790265600, "window_end": 1790352000,
+           "created_at": 1790352030, "chars": 2000 * index, "status": "done"}
+    for index, kind in enumerate(("daily", "weekly", "monthly"), 1)
+}
+_before_schedule_tab = app.nb.select()
+with patch.object(app, "refresh_report_history") as _refresh_reports:
+    app._apply_health({"latest_reports": _schedule_reports, "summary_schedule": {
+        "state": "running", "kind": "weekly", "message": "正在汇总上周日报",
+        "next_runs": {"daily": "2026-09-29T00:00:00+08:00", "weekly": "2026-10-05T00:00:00+08:00",
+                      "monthly": "2026-10-01T00:00:00+08:00"}},
+        "summary_progress": {"state": "running", "message": "正在接收结果"}})
+    check("三类最近报告均显示完整窗口和字数", all("2026-09-25 00:00 — 2026-09-26 00:00" in value.get()
+          and "已完成" in value.get() for value in app.v_latest_reports.values())
+          and "6000 字" in app.v_latest_reports["monthly"].get())
+    check("自动调度进度和下次北京时间可见", "周报：正在生成" in app.v_summary_schedule.get()
+          and "正在接收结果" in app.v_summary_schedule.get()
+          and "周报 10-05 00:00" in app.v_summary_next.get()
+          and "月报 10-01 00:00" in app.v_summary_next.get())
+    check("新自动报告只刷新列表不切换阅读页", _refresh_reports.call_count == 1
+          and app.nb.select() == _before_schedule_tab)
+    app._apply_health({"latest_reports": _schedule_reports, "summary_schedule": {
+        "state": "failed", "kind": "monthly", "message": "缺少来源日报，请查看日志"}})
+    check("相同报告不重复刷新且失败原因可见", _refresh_reports.call_count == 1
+          and "任务失败" in app.v_summary_schedule.get() and "缺少来源日报" in app.v_summary_schedule.get())
 
 print("\n=== 实时消息页（v0.5.0：替代 NapCat 的 CMD 黑框）===")
 nb = app.nb
@@ -651,7 +675,7 @@ with _tf.TemporaryDirectory() as _tmp:
             patch.object(_mb, "askyesno", return_value=True), \
             patch.object(app, "start_service", side_effect=_fake_start_receiver), \
             patch.object(app, "_wait_receiver_ready", return_value=True), \
-            patch.object(app, "_fetch_health"), patch.object(app, "refresh_summary_days"):
+            patch.object(app, "_fetch_health"):
         check("未填目录时 GUI 与启动器定位同一目录", app.napcat_dir() == N.resolve_dir(app.cfg) == _nc)
         app.restart_napcat()
         _deadline = time.monotonic() + 3
@@ -760,48 +784,20 @@ with patch("msgx.gui.prefs_mod.save") as _save:
     check("保存提示词与字数且下一次生成生效", app.save_prefs()
           and _save.call_args.args[0]["summary_target_chars"] == 4200
           and _save.call_args.args[0]["summary_prompt"] == "请按主题总结到 {{目标字数}} 字"
-          and "4200" in app.v_range_desc.get())
+          and all(text in app.v_summary_schedule_desc.get() for text in ("4200", "8400", "12600")))
     check("保存保留不归此页管理的偏好", _save.call_args.args[0]["unrelated_test_preference"] == "保持原样")
 app.txt_summary_prompt.delete("1.0", "end")
 app.txt_summary_prompt.insert("1.0", "尚未保存的内容")
 app.v_summary_chars.set("9000")
-_start = (date.today() - timedelta(days=3)).isoformat()
-_end = (date.today() - timedelta(days=1)).isoformat()
-app.v_summary_start.set(_start)
-app.v_summary_end.set(_end)
-with patch("msgx.gui.threading.Thread") as _thread:
-    app.summary_by_date()
-    app.summary_by_date()
-    check("点击立即标记忙碌并阻止重复请求", app._summary_busy and _thread.call_count == 1)
-    check("生成期间禁用摘要按钮", app.btn_summary.instate(["disabled"]))
-    check("无需等 API 即可看到开始日志", f"开始生成{_start} 至 {_end}摘要" in app.log.get("1.0", "end"))
-    check("多日归纳目标长于已保存单日字数", "目标约 5700 字" in app.v_summary.get())
-    with patch("msgx.gui.urllib.request.build_opener") as _opener:
-        _opener.return_value.open.return_value.__enter__.return_value.read.return_value = b'{"created": []}'
-        _thread.call_args.kwargs["target"]()
-        _request = _opener.return_value.open.call_args.args[0]
-        _payload = json.loads(_request.data.decode("utf-8"))
-        check("手动请求携带已保存提示词和字数，忽略未保存编辑", _payload == {
-            "prompt": "请按主题总结到 {{目标字数}} 字", "target_chars": 5700,
-            "start_date": _start, "end_date": _end, "force": False})
-        check("选定日期与提示词一并提交", "kind=by_date" in _request.full_url
-              and _request.get_header("Content-type") == "application/json")
-    app._apply_health({"summary_progress": {"state": "running", "message": "正在总结第 2/6 块"}})
-    check("阶段进度和耗时可见", "第 2/6 块" in app.v_summary.get() and "秒" in app.v_summary.get())
-    with patch.object(app, "refresh_summary_days"):
-        app._summary_finished({"error": "模型输出未完成"})
-    check("失败恢复按钮并明确原因", not app._summary_busy and app.btn_summary.instate(["!disabled"])
-          and "输出未完成" in app.v_summary.get())
-    _full_text = "# 本期讨论总览\n\n**工具进展**\n\n" + "完整保留的内容。" * 400 + "\n\n**后续事项**\n\n全文最后一句。"
-    _report_path = str((Path(_reader_temp.name) / "gui-test-full.html").resolve())
-    Path(_report_path).write_text("<html>本地假摘要</html>", encoding="utf-8")
-    with patch.object(app, "refresh_summary_days"):
-        app._summary_finished({"created": [{"path": _report_path, "content": _full_text, "chars": len(_full_text)}]})
-    check("生成后自动展示全文及末尾内容", app.nb.select() == str(app.report_tab)
-          and "全文最后一句。" in app.report_text.get("1.0", "end") and len(app.report_text.get("1.0", "end")) > 3000)
-    check("总标题和主题小标题使用加粗样式", bool(app.report_text.tag_ranges("title")) and bool(app.report_text.tag_ranges("heading")))
-    check("完整文件路径显示在页面和日志中", app.v_report_path.get() == _report_path
-          and _report_path in app.log.get("1.0", "end") and app.btn_open_report.instate(["!disabled"]))
+_full_text = "# 本期讨论总览\n\n**工具进展**\n\n" + "完整保留的内容。" * 400 + "\n\n**后续事项**\n\n全文最后一句。"
+_report_path = str((Path(_reader_temp.name) / "gui-test-full.html").resolve())
+Path(_report_path).write_text("<html>本地假摘要</html>", encoding="utf-8")
+app._show_report({"path": _report_path, "content": _full_text, "chars": len(_full_text)})
+check("本地阅读完整展示全文及末尾内容", "全文最后一句。" in app.report_text.get("1.0", "end")
+      and len(app.report_text.get("1.0", "end")) > 3000)
+check("总标题和主题小标题使用加粗样式", bool(app.report_text.tag_ranges("title")) and bool(app.report_text.tag_ranges("heading")))
+check("完整文件路径显示在页面且可打开", app.v_report_path.get() == _report_path and app.btn_open_report.instate(["!disabled"]))
+with patch("msgx.gui.threading.Thread"):
     app._render_usage({"recorded_cost_cny": 0.001, "historical_unattributed_cny": 0.25,
         "groups": [{"purpose": "图片理解", "source_type": "纯图片", "calls": 2,
                     "in_tokens": 100, "out_tokens": 20, "cost_cny": 0.001, "unknown_calls": 1}],
@@ -821,45 +817,6 @@ with patch("msgx.gui.threading.Thread") as _thread:
     app.usage_table.selection_remove("7")
 app.proc = _saved_proc
 
-print("\n=== 按日期生成与日报状态 ===")
-_old_start, _old_end = app.v_summary_start.get(), app.v_summary_end.get()
-app.v_summary_start.set("2026-02-30")
-app.v_summary_end.set(yesterday)
-with patch("msgx.gui.threading.Thread") as _thread:
-    app.summary_by_date()
-    check("无效日历日期在界面拒绝", "不是有效的日历日期" in app.v_summary.get() and not _thread.called)
-app.v_summary_start.set(yesterday)
-app.v_summary_end.set((date.today() + timedelta(days=1)).isoformat())
-with patch("msgx.gui.threading.Thread") as _thread:
-    app.summary_by_date()
-    check("未来日期在界面拒绝", "不能晚于今天" in app.v_summary.get() and not _thread.called)
-
-app.v_summary_end.set(yesterday)
-app._apply_summary_days(yesterday, yesterday, {"days": [{"date": yesterday, "status": "done", "chars": 2800}],
-                                               "latest_daily": {"date": yesterday, "status": "done", "chars": 2800}})
-check("已完成日报可查看并显示明确重新生成入口", app.btn_summary.cget("text") == "查看摘要"
-      and app.btn_regenerate.winfo_manager() == "pack" and "已完成" in app.v_summary_days.get())
-check("最近日报状态显示日期和字数", yesterday in app.v_daily_latest.get() and "2800" in app.v_daily_latest.get())
-with patch.object(app, "summary_now") as _summary:
-    app.btn_regenerate.invoke()
-    check("重新生成明确传 force", _summary.call_args.kwargs["force"] is True)
-app.v_summary_start.set(_start)
-app.v_summary_end.set(_end)
-app._apply_summary_days(_start, _end, {"days": [{"date": _start, "status": "missing"},
-                                                {"date": (date.fromisoformat(_start) + timedelta(days=1)).isoformat(),
-                                                 "status": "done"},
-                                                {"date": _end, "status": "done"}]})
-check("多日范围列出缺失日报", "缺少 1 天" in app.v_summary_days.get()
-      and _start in app.v_summary_days.get() and app.btn_regenerate.winfo_manager() == "")
-app.v_summary_start.set(date.today().isoformat())
-app.v_summary_end.set(date.today().isoformat())
-app._apply_summary_days(date.today().isoformat(), date.today().isoformat(),
-                        {"days": [{"date": date.today().isoformat(), "status": "partial"}]})
-check("今天的手动日报明确为临时摘要", "临时摘要" in app.v_summary_days.get()
-      and app.btn_summary.cget("text") == "生成摘要")
-app.v_summary_start.set(_old_start)
-app.v_summary_end.set(_old_end)
-
 app.reset_summary_prompt()
 from msgx.summarize import DEFAULT_DIGEST_PROMPT  # noqa: E402
 check("恢复默认仅修改编辑框，尚需保存", app.txt_summary_prompt.get("1.0", "end").strip() == DEFAULT_DIGEST_PROMPT.strip()
@@ -876,8 +833,6 @@ check("删除热点关键词和摘要频率设置", "热点关注词" not in _la
 check("图片规则明确本地 OCR 与手动 API 的边界", any("所有带链接的图片先做本地 OCR" in value for value in _labels)
       and "纯图片（消息未附带文字）" in _labels)
 with patch.object(_mb, "showinfo") as _info, patch.object(_mb, "showerror") as _error:
-    app.summary_now()
-    check("未启动时生成摘要仅显示页内说明", "先启动服务" in app.v_summary.get())
     app.refresh_billing()
     check("未启动时刷新账单仅显示状态栏", "先启动服务" in app.status.get())
     app.prune_groups()
@@ -939,10 +894,6 @@ app._apply_health({"ws_peers": ["127.0.0.1"], "protocol": {"state": "connected"}
 check("重连后清除登录故障说明", "已连接" in app.v_peer.get() and not app.v_protocol_detail.get())
 
 print("\n=== 0.7.6 移除自动登录、保留手动恢复与消费排序 ===")
-with patch.object(app, "_save_report_notes", return_value=False), patch("msgx.gui.threading.Thread") as _thread:
-    app.summary_now()
-    check("心得保存失败不提交摘要请求", not _thread.called and not app._summary_busy
-          and "心得尚未保存" in app.v_summary.get())
 check("删除无用自动登录控件与方法", not hasattr(app, "btn_login") and not hasattr(app, "auto_login"))
 check("启停与强制重启均在服务状态栏", app.btn_start.master.master.cget("text") == "服务状态"
       and app.btn_stop.master == app.btn_start.master and app.btn_restart.master == app.btn_start.master)
@@ -989,12 +940,6 @@ with patch("msgx.gui.threading.Thread") as _thread, patch("msgx.gui.urllib.reque
     check("账单服务错误也脱敏", "secret-auth-token" not in app.v_billing_feedback.get()
           and "已隐藏密钥" in app.v_billing_feedback.get())
 app.proc = _before_billing_proc
-with patch.object(app, "summary_now") as _summary:
-    app.v_summary_start.set(_start)
-    app.v_summary_end.set(_end)
-    app.btn_summary.invoke()
-    check("唯一生成按钮按选定日期提交", _summary.call_args.args == ("by_date",)
-          and _summary.call_args.kwargs == {"start_date": _start, "end_date": _end, "force": False})
 _before_restart_proc = app.proc
 app.proc = None
 _receiver = Mock(stdout=None)
@@ -1347,6 +1292,7 @@ with patch("msgx.gui.threading.Thread") as _thread, patch("msgx.gui.urllib.reque
           and app._report_history_busy and not app._report_pending_path)
     check("查看、切换、目录和复制不请求网络", not _network.called)
 check("本地查看不改写摘要数据库", _history_db.read_bytes() == _before_db)
+app.nb.select(app.report_tab)
 root.geometry("820x560")
 root.update_idletasks()
 check("最小窗口文件路径按正文宽度换行", int(app.report_path_label.cget("wraplength"))

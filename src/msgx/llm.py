@@ -24,6 +24,14 @@ class APIRequestRejected(RuntimeError):
     """服务端拒绝了请求；媒体后台也不能按临时网络故障自动重发。"""
 
 
+class RetryableRequestError(RuntimeError):
+    """连接未建立或服务端临时拒绝；单次请求重试耗尽，可由调度有限重试。"""
+
+
+class AmbiguousResponseError(RuntimeError):
+    """请求可能已被处理但未拿到完整结果；不自动整单重发。"""
+
+
 def _safe_request_id(value) -> str:
     value = security.redact(value) if isinstance(value, str) else ""
     return value if re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", value) else ""
@@ -66,7 +74,7 @@ class IncompleteResponse(RuntimeError):
 
 
 class _Transient(Exception):
-    """可重试的失败：连接被掐、超时、5xx、429。
+    """可重试的失败：连接未建立、服务端明确临时拒绝。
 
     单独分一类是为了让重试逻辑能明确区分「重试有意义」与「重试白费」：
     HTTP 400/401/403 属于后者 —— 重试只是浪费时间和钱。
@@ -465,7 +473,7 @@ class LLM:
                     attempt, n, dt, e,
                 )
                 await asyncio.sleep(min(0.6 * attempt, 3.0))
-        raise RuntimeError(f"请求失败（已重试 {n} 次）: {last}")
+        raise RetryableRequestError(f"请求失败（已重试 {n} 次）: {last}")
 
     async def _post_once(self, payload: dict) -> dict:
         if self.llm.get("credential_store"):
@@ -496,13 +504,11 @@ class LLM:
             "Content-Length": str(len(encoded)),
         }
         last = ""
-        stage = "连接或发送请求"
         queued = 0
         started = time.monotonic()
 
         async def upload():
-            nonlocal stage, queued
-            stage = "上传请求体"
+            nonlocal queued
             # 同一个 HTTP 请求分段写入，不拆消息、不增加模型调用。
             # 本机约 452 KiB 大包直接写出会在 15～20 秒断连；相同内容按此节奏
             # 上传已实测成功。保留 Content-Length，避免改成 chunked 传输编码。
@@ -511,7 +517,6 @@ class LLM:
                 chunk = encoded[offset:offset + 8192]
                 yield chunk
                 queued += len(chunk)
-            stage = "等待响应头"
             log.info("API 请求体已提交：%d 字节，耗时 %.2fs；等待响应", queued, time.monotonic() - started)
 
         try:
@@ -519,12 +524,11 @@ class LLM:
             if not responses and not base.endswith("/v1"):
                 urls.append(f"{base}/v1/chat/completions")
             for url in urls:
-                stage, queued, started = "连接或发送请求", 0, time.monotonic()
+                queued, started = 0, time.monotonic()
                 if paced:
                     log.info("API 开始上传：%.1f KiB，单次请求，每段 8 KiB", len(encoded) / 1024)
                 # 每次尝试都创建新的迭代器，404 路径回退和重试不能复用耗尽的正文。
                 async with s.post(url, headers=headers, data=upload() if paced else encoded, allow_redirects=False) as r:
-                    stage = "读取响应正文"
                     if paced:
                         log.info("API 响应头已收到：HTTP %d，耗时 %.2fs；正在接收结果", r.status, time.monotonic() - started)
                     if r.status == 200:
@@ -539,23 +543,19 @@ class LLM:
                             else:
                                 result.pop("request_id", None)
                             return result
-                        except json.JSONDecodeError as e:
-                            # 半截响应体：连接被掐断的另一种表现，同样值得重试
-                            raise _Transient(f"响应不是完整 JSON: {e}") from e
+                        except json.JSONDecodeError:
+                            raise AmbiguousResponseError("API 响应不是完整 JSON，用量未知；未自动重发") from None
                     last = _http_error(r.status, await r.text(), r.headers)
                     if r.status in RETRY_STATUS:
                         raise _Transient(last)
                     if r.status != 404:
                         break
         except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as e:
-            # 含 ServerDisconnectedError / ClientOSError(10053) / ClientConnectorError
-            if responses and stage == "读取响应正文":
-                raise RuntimeError("API 流式结果中断，用量未知；未自动重发") from None
-            raise _Transient(f"{type(e).__name__}（阶段：{stage}）") from None
-        except asyncio.TimeoutError as e:
-            if responses and stage == "读取响应正文":
-                raise RuntimeError("API 流式结果超时，用量未知；未自动重发") from None
-            raise _Transient(f"请求超时（阶段：{stage}）") from e
+            if isinstance(e, aiohttp.ClientConnectorError):
+                raise _Transient(f"{type(e).__name__}（阶段：连接未建立）") from None
+            raise AmbiguousResponseError("API 连接中断，处理结果及用量未知；未自动重发") from None
+        except asyncio.TimeoutError:
+            raise AmbiguousResponseError("API 请求超时，处理结果及用量未知；未自动重发") from None
         raise APIRequestRejected(last or "请求失败")
 
     def _responses_payload(self, payload: dict) -> dict:
@@ -593,10 +593,10 @@ class LLM:
                         data = event.get("response") or {}
                         break
                     if event.get("type") == "error":
-                        raise RuntimeError("API 流式响应报告失败，原始内容已隐藏")
+                        raise AmbiguousResponseError("API 流式响应报告失败，原始内容已隐藏；未自动重发")
             if data is None:
                 # 服务端可能已经计费，不能把缺终态的流自动整单重发。
-                raise RuntimeError("API 响应中断，未收到完成事件；用量未知，未自动重发")
+                raise AmbiguousResponseError("API 响应中断，未收到完成事件；用量未知，未自动重发")
         status = data.get("status")
         text = "\n".join(part.get("text", "") for item in data.get("output", [])
                          if item.get("type") == "message" for part in item.get("content", [])

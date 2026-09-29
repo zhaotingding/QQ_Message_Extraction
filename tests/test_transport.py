@@ -8,12 +8,14 @@ import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from aiohttp import web
+from aiohttp import web, ClientConnectorError, ServerDisconnectedError
+from unittest.mock import patch, AsyncMock
+from types import SimpleNamespace
 
 PROJ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJ / "src"))
 
-from msgx.llm import LLM  # noqa: E402
+from msgx.llm import LLM, RetryableRequestError, AmbiguousResponseError  # noqa: E402
 
 
 REPLY = {"choices": [{"message": {"content": "完整摘要"}, "finish_reason": "stop"}]}
@@ -88,6 +90,56 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         received = await self.collect([503, 200])
         self.assertEqual([row[0] for row in received],
                          ["/chat/completions", "/chat/completions"])
+
+    async def test_rejected_transient_request_has_finite_retries(self):
+        for status in (429, 503):
+            calls = []
+
+            async def handler(request):
+                calls.append(await request.read())
+                return web.json_response({"error": {"type": "tokens"}}, status=status)
+
+            async with local_llm(handler) as llm:
+                with self.assertRaises(RetryableRequestError):
+                    await llm._post(payload(False))
+            self.assertEqual(len(calls), 2)
+
+    async def test_success_status_with_partial_json_is_never_reposted(self):
+        calls = []
+
+        async def handler(request):
+            calls.append(await request.read())
+            return web.Response(text='{"choices": [')
+
+        async with local_llm(handler) as llm:
+            with self.assertRaises(AmbiguousResponseError):
+                await llm._post(payload(False))
+        self.assertEqual(len(calls), 1)
+
+    async def test_connection_failure_and_ambiguous_failure_are_distinct(self):
+        for error, expected, attempts in (
+            (ClientConnectorError(SimpleNamespace(host="local.invalid", port=80, ssl=False),
+                                  OSError("connection refused")), RetryableRequestError, 2),
+            (ServerDisconnectedError(), AmbiguousResponseError, 1),
+            (asyncio.TimeoutError(), AmbiguousResponseError, 1),
+        ):
+            calls = []
+
+            class Session:
+                closed = False
+
+                @asynccontextmanager
+                async def post(self, *args, **kwargs):
+                    calls.append(True)
+                    raise error
+                    yield  # pragma: no cover
+
+            llm = LLM({"llm": {"base_url": "http://local.invalid", "post_retries": 2}}, None)
+            llm._session = Session()
+            with patch("msgx.llm.asyncio.sleep", new=AsyncMock()):
+                with self.assertRaises(expected):
+                    await llm._post(payload(False))
+            self.assertEqual(len(calls), attempts)
 
     async def test_large_upload_yields_control_between_small_writes(self):
         """用受控 HTTP 客户端检查实际写出节奏，不依赖机器速度或时延阈值。"""

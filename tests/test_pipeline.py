@@ -45,11 +45,11 @@ async def main() -> None:
             await pipe.start()
             await asyncio.sleep(0)
             check("启动不发起模型探测", pipe.llm._post.await_count == 0)
-            check("启动只创建新的自动日摘要任务",
+            check("启动只创建统一自动周期摘要任务",
                   {task.get_name() for task in pipe._tasks} ==
-                  {"ingest", "media", "prune", "billing", "watchdog", "daily-summary"})
-            check("旧摘要定时循环已删除",
-                  not hasattr(pipe, "_summary_loop") and not hasattr(pipe, "_daily_loop"))
+                  {"ingest", "media", "prune", "billing", "watchdog", "summary-schedule"})
+            check("旧独立日报与通知循环已删除",
+                  not hasattr(pipe, "_daily_summary_loop") and not hasattr(pipe, "_daily_loop"))
             check("评分器和通知器已从管道移除", not hasattr(pipe, "scorer") and not hasattr(pipe, "notifier"))
             for mid, message in enumerate([
                 [{"type": "at", "data": {"qq": "all"}}, {"type": "text", "data": {"text": "紧急通知"}}],
@@ -102,40 +102,20 @@ async def main() -> None:
         finally:
             await pipe.stop()
 
-    print("\n=== 手动摘要接口 ===")
-    summarizer = SimpleNamespace(run_digest=AsyncMock(return_value={"content": "完整摘要"}))
-
-    class Request:
-        app = {"pipe": SimpleNamespace(summarizer=summarizer)}
-
-        def __init__(self, query, body=None):
-            self.query = query
-            self.body = body
-            self.can_read_body = body is not None
-
-        async def json(self):
-            return self.body
-
-    for kind in ("periodic", "daily", "typo"):
-        response = await _summary_now(Request({"kind": kind}))
-        check(f"拒绝旧入口或未知类型 {kind}，不调用模型",
-              response.status == 400 and summarizer.run_digest.await_count == 0)
-    for body in (["错误对象"], {"prompt": 1}, {"target_chars": True},
-                 {"target_chars": 0}, {"target_chars": 100001}, {"target_chars": "3000"}):
-        response = await _summary_now(Request({"kind": "range", "hours": "24"}, body))
-        check(f"非法摘要设置不发起请求 {body}",
-              response.status == 400 and summarizer.run_digest.await_count == 0)
-    response = await _summary_now(Request({"kind": "range", "hours": "72"},
-                                          {"prompt": "用户设定提示词", "target_chars": 4500}))
-    check("按范围摘要完整转交已保存提示词与目标字数",
-          response.status == 200 and summarizer.run_digest.call_args.kwargs == {
-              "full": True, "hours": 72, "prompt": "用户设定提示词", "target_chars": 4500})
-    response = await _summary_now(Request({"kind": "digest"}))
-    check("空请求使用服务配置，不以 3000 覆盖用户设置",
-          response.status == 200 and summarizer.run_digest.call_args.kwargs == {"full": False})
-    response = await _summary_now(Request({"kind": "full"}))
-    check("保留手动全量入口", response.status == 200
-          and summarizer.run_digest.call_args.kwargs == {"full": True})
+    print("\n=== 手动摘要入口已移除 ===")
+    summarizer = SimpleNamespace(run_digest=AsyncMock(), run_dates=AsyncMock())
+    for kind in ("digest", "full", "range", "by_date", "periodic", "daily", "typo"):
+        request = SimpleNamespace(
+            app={"pipe": SimpleNamespace(summarizer=summarizer)},
+            query={"kind": kind, "hours": "72"}, can_read_body=True,
+            json=AsyncMock(return_value={"force": True}),
+        )
+        response = await _summary_now(request)
+        check(f"入口 {kind} 返回 410，不能触发付费调用",
+              response.status == 410 and "自动计划" in json.loads(response.text)["error"])
+        request.json.assert_not_awaited()
+    summarizer.run_digest.assert_not_awaited()
+    summarizer.run_dates.assert_not_awaited()
 
 
 asyncio.run(main())

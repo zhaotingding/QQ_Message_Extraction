@@ -43,6 +43,10 @@ class ReaderReviewTests(unittest.TestCase):
         app._report_identity = None
         app._report_outline = []
         app._summary_path = ""
+        app._latest_report_ids = {}
+        app.v_latest_reports = {kind: tk.StringVar() for kind in ("daily", "weekly", "monthly")}
+        app.v_summary_schedule = tk.StringVar()
+        app.v_summary_next = tk.StringVar()
         app.status = tk.StringVar()
         app._build_report_tab(app.nb)
         self.root.update()
@@ -51,7 +55,8 @@ class ReaderReviewTests(unittest.TestCase):
             conn.execute("CREATE TABLE summaries (id INTEGER PRIMARY KEY,window_start INTEGER,window_end INTEGER,"
                          "kind TEXT,content TEXT,report_path TEXT,msg_count INTEGER,created_at INTEGER)")
             self.add_summary(conn, 1, "daily", self.content, 100)
-            self.add_summary(conn, 2, "multi", "# 多日结果\n## 主题\n汇总正文。", 101)
+            self.add_summary(conn, 2, "weekly", "# 多日结果\n## 主题\n汇总正文。", 101)
+            self.add_summary(conn, 3, "monthly", "# 月报\n月报正文。", 99)
 
     def tearDown(self):
         self.root.destroy()
@@ -100,9 +105,10 @@ class ReaderReviewTests(unittest.TestCase):
                 self.add_summary(conn, ident, "periodic", "旧版内容", ident + 200)
         before = self.db.read_bytes()
         self.refresh()
-        self.assertEqual(self.app.report_history.get_children(), ("2", "1"))
+        self.assertEqual(self.app.report_history.get_children(), ("2", "1", "3"))
         self.assertIn("【日报】09-25", self.app.report_history.item("1", "text"))
-        self.assertIn("【汇总】09-25—09-27", self.app.report_history.item("2", "text"))
+        self.assertIn("【周报】09-25—09-27", self.app.report_history.item("2", "text"))
+        self.assertIn("【月报】", self.app.report_history.item("3", "text"))
         self.assertEqual(self.app.report_history.item("1", "tags"), ("unread",))
         self.assertEqual(self.db.read_bytes(), before)
         self.app.v_report_filter.set("仅日报")
@@ -110,10 +116,14 @@ class ReaderReviewTests(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.app.report_history.get_children(), ("1",))
         self.assertEqual(self.app._report_current["id"], 1)
-        self.app.v_report_filter.set("仅汇总")
+        self.app.v_report_filter.set("仅周报")
         self.app._report_filter_changed()
         self.refresh()
         self.assertEqual(self.app.report_history.get_children(), ("2",))
+        self.app.v_report_filter.set("仅月报")
+        self.app._report_filter_changed()
+        self.refresh()
+        self.assertEqual(self.app.report_history.get_children(), ("3",))
 
     def test_read_state_persists_and_opening_does_not_mark_read(self):
         self.show_daily()
@@ -167,8 +177,13 @@ class ReaderReviewTests(unittest.TestCase):
         self.app.report_notes.insert("end", "继续思考。")
         self.app._show_report(self.app._report_items["2"])
         self.assertTrue(self.review()["notes"].endswith("继续思考。"))
-        self.assertFalse(self.app.report_notes_frame.winfo_manager())
+        self.assertEqual(self.app.report_notes_frame.winfo_manager(), "pack")
+        self.app.report_notes.insert("1.0", "周报心得")
+        self.app._show_report(self.app._report_items["3"])
+        self.assertEqual(self.review(2, "# 多日结果\n## 主题\n汇总正文。")["notes"], "周报心得")
+        self.app.report_notes.insert("1.0", "月报心得")
         self.app._show_report(self.app._report_items["1"])
+        self.assertEqual(self.review(3, "# 月报\n月报正文。")["notes"], "月报心得")
         self.assertEqual(self.app.report_notes.get("1.0", "end-1c"), self.review()["notes"])
 
     def test_save_failure_keeps_current_draft_and_rolls_back_state(self):
@@ -202,16 +217,17 @@ class ReaderReviewTests(unittest.TestCase):
         self.assertFalse(self.app.report_text.tag_ranges("review_red"))
         self.assertEqual(self.review()["read_state"], "deep")  # 旧版本元数据仍在。
 
-    def test_partial_date_labels_and_empty_filter(self):
+    def test_old_partial_and_multi_are_hidden_and_empty_filter_clears_reader(self):
         with closing(sqlite3.connect(self.db)) as conn, conn:
-            self.add_summary(conn, 3, "daily_partial", "# 今天", 103)
+            for ident, kind in enumerate(("daily_partial", "multi", "multi_partial"), 4):
+                self.add_summary(conn, ident, kind, "# 旧版内容", 100 + ident)
         self.refresh()
-        self.assertIn("截至 09-26 00:00，未完成", self.app.report_history.item("3", "text"))
-        self.assertIn("【汇总】09-25—09-27", self.app.report_history.item("2", "text"))
+        self.assertEqual(set(self.app.report_history.get_children()), {"1", "2", "3"})
+        self.assertIn("【周报】09-25—09-27", self.app.report_history.item("2", "text"))
         self.assertIn("2026-09-25 00:00 — 2026-09-28 00:00", self.app.report_history.item("detail-2", "text"))
         with closing(sqlite3.connect(self.db)) as conn, conn:
-            conn.execute("DELETE FROM summaries WHERE kind='multi'")
-        self.app.v_report_filter.set("仅汇总")
+            conn.execute("DELETE FROM summaries WHERE kind='weekly'")
+        self.app.v_report_filter.set("仅周报")
         self.app._report_filter_changed()
         self.refresh()
         self.assertFalse(self.app.report_history.get_children())
@@ -259,6 +275,30 @@ class ReaderReviewTests(unittest.TestCase):
         tree = self.app.report_history
         self.assertLessEqual(tree.column("#0", "width") + tree.column("reading", "width"), tree.winfo_width())
         self.root.withdraw()
+
+    def test_automatic_report_refresh_keeps_current_article_and_draft(self):
+        self.show_daily()
+        self.app.report_notes.insert("1.0", "自动报告到达时保留我的编辑")
+        self.app.report_outline.selection_set(1)
+        self.app._report_jump()
+        before_scroll = self.app.report_text.yview()
+        weekly = {**self.app._report_items["2"], "chars": 1200, "path": ""}
+        with patch.object(self.app, "refresh_report_history", wraps=self.app.refresh_report_history) as refresh:
+            self.app._apply_summary_schedule({
+                "latest_reports": {"daily": None, "weekly": weekly, "monthly": None},
+                "summary_schedule": {"state": "done", "kind": "weekly", "message": "周报已完成",
+                                     "next_runs": {"daily": "2026-09-29T00:00:00+08:00"}},
+            })
+            self.assertEqual(refresh.call_count, 1)
+            kind, value = self.app.events.get(timeout=5)
+            self.assertEqual(kind, "report_history")
+            self.app._render_report_history(*value)
+            self.assertEqual(self.app._report_current["id"], 1)
+            self.assertEqual(self.app.report_text.yview(), before_scroll)
+            self.assertEqual(self.app.report_notes.get("1.0", "end-1c"), "自动报告到达时保留我的编辑")
+            self.app._apply_summary_schedule({"latest_reports": {"weekly": weekly}})
+            self.assertEqual(refresh.call_count, 1)
+        self.assertIn("已完成 1200 字", self.app.v_latest_reports["weekly"].get())
 
 
 if __name__ == "__main__":

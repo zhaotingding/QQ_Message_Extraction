@@ -167,17 +167,10 @@ def main() -> int:
           and body.get("total_source") in ("platform", "balance_diff", "estimate"),
           f"{body.get('today_source')} / {body.get('total_source')}")
 
-    st, body = call("/summary/now?kind=range&hours=abc", post=True)
-    check("hours 非法时返回 400（不静默套默认值）", st == 400, f"{st} {str(body)[:80]}")
-    st, body = call("/summary/now?kind=range&hours=0", post=True)
-    check("hours=0 返回 400", st == 400, str(st))
-    st, body = call("/summary/now?kind=range&hours=72", post=True)
-    check("hours 合法但未配模型时明确说明原因",
-          st == 502 and "LLM 未配置" in body.get("error", ""), f"{st} {str(body)[:90]}")
-    for kind in ("periodic", "daily"):
+    for kind in ("range&hours=abc", "range&hours=72", "digest", "full", "by_date", "daily"):
         st, body = call(f"/summary/now?kind={kind}", post=True)
-        check(f"已删除 {kind} 摘要入口，不回退为付费增量请求",
-              st == 400 and body.get("ok") is False)
+        check(f"已移除手动入口 {kind}，提示自动计划",
+              st == 410 and "自动计划" in body.get("error", ""))
 
     print("\n=== WebSocket 端点契约 ===")
     try:
