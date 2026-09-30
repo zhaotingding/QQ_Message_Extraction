@@ -186,8 +186,11 @@ async def _messages_recent(request: web.Request) -> web.Response:
         limit = 60
     limit = max(1, min(limit, 300))
     images_only = request.query.get("images", "") == "1"
-    rows = request.app["pipe"].store.recent_messages(limit, images_only=images_only)
-    return web.json_response({"ok": True, "items": [dict(r) for r in rows]})
+    group_id = request.query.get("group_id", "")
+    store = request.app["pipe"].store
+    rows = store.recent_messages(limit, images_only=images_only, group_id=group_id)
+    return web.json_response({"ok": True, "items": [dict(r) for r in rows],
+                              "activity": store.group_activity()})
 
 
 def _local_edit_allowed(request: web.Request) -> bool:

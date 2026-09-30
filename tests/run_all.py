@@ -34,6 +34,8 @@ SUITES = [
     ("自动周期任务与失败恢复", "test_period_scheduler.py"),
     ("媒体校验", "test_media.py"),
     ("群列表属主", "test_groups.py"),
+    ("当日群活跃度与群筛选", "test_group_activity.py"),
+    ("实时消息详情与筛选界面", "test_realtime_gui.py"),
     ("无额外推理与过滤链路", "test_pipeline.py"),
     ("服务生命周期", "test_service.py"),
     ("服务日志与脱敏", "test_service_logging.py"),

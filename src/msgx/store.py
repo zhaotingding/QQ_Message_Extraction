@@ -626,7 +626,7 @@ class Store:
 
     # ---------- 给界面「实时消息」页 ----------
 
-    def recent_messages(self, limit: int = 60, images_only: bool = False) -> list:
+    def recent_messages(self, limit: int = 60, images_only: bool = False, group_id: str = "") -> list:
         """最近入库的消息（倒序）。带群名与图片处理状态，供界面直接展示。"""
         rows = list(
             self.conn.execute(
@@ -638,8 +638,9 @@ class Store:
                 " COALESCE(g.name, '') AS group_name"
                 " FROM messages m LEFT JOIN groups g ON g.id = m.group_id"
                 " WHERE (?=0 OR EXISTS (SELECT 1 FROM message_images i WHERE i.message_row=m.id))"
+                " AND (?='' OR m.group_id=?)"
                 " ORDER BY m.ts DESC, m.id DESC LIMIT ?",
-                (int(images_only), limit),
+                (int(images_only), group_id, group_id, limit),
             )
         )
         result = []
@@ -649,6 +650,29 @@ class Store:
                 "SELECT * FROM message_images WHERE message_row=? ORDER BY image_index", (row["id"],))]
             result.append(item)
         return result
+
+    def group_activity(self, now: datetime | None = None) -> dict:
+        """北京时间今日入库消息榜；按消息正文计数，不展开图片或接收账号。"""
+        beijing = timezone(timedelta(hours=8))
+        current = now or datetime.now(beijing)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=beijing)
+        start = current.astimezone(beijing).replace(hour=0, minute=0, second=0, microsecond=0)
+        window_start = int(start.timestamp())
+        window_end = int((start + timedelta(days=1)).timestamp())
+        rows = self.conn.execute(
+            "WITH known_groups AS (SELECT id AS group_id FROM groups UNION SELECT group_id FROM messages),"
+            " today AS (SELECT group_id, COUNT(*) AS count, MAX(ts) AS last_ts FROM messages"
+            " WHERE ts>=? AND ts<? GROUP BY group_id)"
+            " SELECT k.group_id, COALESCE(g.name, '') AS group_name,"
+            " COALESCE(t.count, 0) AS count, COALESCE(t.last_ts, 0) AS last_ts"
+            " FROM known_groups k LEFT JOIN groups g ON g.id=k.group_id"
+            " LEFT JOIN today t ON t.group_id=k.group_id"
+            " ORDER BY count DESC, last_ts DESC, k.group_id",
+            (window_start, window_end),
+        )
+        return {"date": start.date().isoformat(), "window_start": window_start,
+                "window_end": window_end, "groups": [dict(row) for row in rows]}
 
     def messages_between(self, group_id: str, start: int, end: int) -> list:
         return list(

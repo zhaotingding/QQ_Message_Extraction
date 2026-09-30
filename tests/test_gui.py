@@ -136,7 +136,7 @@ nb = app.nb
 check("有实时消息标签页", any(str(nb.tab(i, "text")) == "实时消息" for i in range(nb.index("end"))),
       str([str(nb.tab(i, "text")) for i in range(nb.index("end"))]))
 check("实时消息表格列齐全",
-      list(app.rt["columns"]) == ["time", "group", "who", "text", "state", "image", "ocr", "vision", "recognize", "include", "account"],
+      list(app.rt["columns"]) == ["time", "group", "who", "text", "state", "image", "recognize", "include", "account"],
       str(list(app.rt["columns"])))
 check("内容筛选默认显示全部消息", app.v_rt_filter.get() == "全部消息")
 old_proc = app.proc
@@ -144,7 +144,7 @@ app.proc = object()
 app.v_rt_filter.set("仅看图片")
 with patch("msgx.gui.threading.Thread") as thread:
     app.refresh_messages()
-    check("仅看图片筛选发送到服务端查询", thread.call_args.kwargs["args"] == (80, True))
+    check("仅看图片筛选发送到服务端查询", thread.call_args.kwargs["args"] == (80, True, "", app.proc))
 app._rt_busy = False
 app.proc = old_proc
 app.v_rt_filter.set("全部消息")
@@ -162,11 +162,14 @@ rows = app.rt.get_children()
 check("消息渲染成行", len(rows) == 2, str(len(rows)))
 vals = [app.rt.item(r, "values") for r in rows]
 check("按新的在前排序（列表顺序即服务返回顺序）", vals[0][3] == "第二条", str(vals[0]))
-check("空文本回落到 OCR 内容", vals[1][3] == "报错截图", str(vals[1]))
+check("图片占位不被 OCR 覆盖", vals[1][3] == "[图片]", str(vals[1]))
 check("被 @ 的行按普通消息呈现", "atme" not in app.rt.item(rows[0], "tags"), str(app.rt.item(rows[0], "tags")))
 check("语义失败的行有专属标记", "failed" in app.rt.item(rows[1], "tags"), str(app.rt.item(rows[1], "tags")))
-check("原图、OCR、语义、识别和纳入摘要分栏", vals[1][5] == "打开" and vals[1][6] == "报错截图"
-      and vals[1][7] == "—" and vals[1][8] == "□ 识别" and vals[1][9] == "☑", str(vals[1]))
+check("保留原图、识别和纳入摘要操作", vals[1][5] == "打开" and vals[1][6] == "□ 识别"
+      and vals[1][7] == "☑", str(vals[1]))
+app.rt.selection_set("2")
+app._on_rt_select()
+check("统一详情显示文字消息原文", "第二条" in app.rt_detail.get("1.0", "end"))
 app.rt.selection_set("1")
 app._on_rt_select()
 check("选中行显示完整 OCR 与语义", "报错截图" in app.rt_detail.get("1.0", "end"))
@@ -176,25 +179,30 @@ with patch.object(app.rt, "identify_row", return_value="1"), patch.object(app.rt
         patch("msgx.gui.open_path") as opened:
     app._on_rt_click(event)
     check("点击图片链接打开当前行文件", opened.call_count == 1)
-with patch.object(app.rt, "identify_row", return_value="1"), patch.object(app.rt, "identify_column", return_value="#9"), \
+with patch.object(app.rt, "identify_row", return_value="1"), patch.object(app.rt, "identify_column", return_value="#7"), \
         patch.object(app, "_start_rt_action") as action:
     app._on_rt_click(event)
     check("点击识别勾选提交当前行", action.call_args.args == ("1", "vision", {}))
-with patch.object(app.rt, "identify_row", return_value="1"), patch.object(app.rt, "identify_column", return_value="#10"), \
+with patch.object(app.rt, "identify_row", return_value="1"), patch.object(app.rt, "identify_column", return_value="#8"), \
         patch.object(app, "_start_rt_action") as action:
     app._on_rt_click(event)
     check("纳入摘要单独切换", action.call_args.args == ("1", "summary-include", {"include": False}))
 app._render_messages([{"id": 3, "ts": 1700000000, "text": "[图片]", "media_state": "filtered",
                        "ocr_text": "报错截图", "vision_text": "", "has_media": 1, "include_vision": 0,
                        "media_path": str(PROJ / "README.md")}])
-check("过滤图片正文显示 OCR 前缀", app.rt.item("3", "values")[3] == "OCR:报错截图")
+check("过滤图片 OCR 只在详情显示", app.rt.item("3", "values")[3] == "[图片]")
 app._render_messages([{"id": 4, "ts": 1700000000, "text": "两张图[图片][图片]", "media_state": "done",
                        "images": [{"id": 41, "image_index": 0, "ocr_text": "第一张", "vision_text": "语义甲",
                                    "media_path": str(PROJ / "README.md"), "include_vision": 1, "media_state": "done"},
                                   {"id": 42, "image_index": 1, "ocr_text": "第二张", "vision_text": "语义乙",
                                    "media_path": str(PROJ / "README.md"), "include_vision": 0, "media_state": "done"}]}])
+app.rt.selection_set("4:41")
+app._on_rt_select()
+first_detail = app.rt_detail.get("1.0", "end")
+app.rt.selection_set("4:42")
+app._on_rt_select()
 check("同条消息的两张图片独立展示", app.rt.exists("4:41") and app.rt.exists("4:42")
-      and app.rt.item("4:41", "values")[7] == "语义甲" and app.rt.item("4:42", "values")[7] == "语义乙")
+      and "语义甲" in first_detail and "语义乙" in app.rt_detail.get("1.0", "end"))
 
 print("\n=== 图片状态标注 ===")
 labels = {

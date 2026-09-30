@@ -28,7 +28,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 from . import __version__, DISPLAY_VERSION
 from . import napcat as napcat_mod
@@ -472,63 +472,97 @@ class App:
         """
         tab = ttk.Frame(nb, padding=14)
         nb.add(tab, text="实时消息")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=3)
+        tab.rowconfigure(4, weight=1)
+        self._rt_group_id = ""
+        self._rt_group_labels = {"全部群": ""}
 
         bar = ttk.Frame(tab)
-        bar.pack(fill="x", pady=(0, 8))
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        bar.columnconfigure(7, weight=1)
         self.v_rt_auto = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             bar, text="自动刷新（每 3 秒）", variable=self.v_rt_auto
-        ).pack(side="left")
-        ttk.Button(bar, text="立即刷新", command=self.refresh_messages).pack(side="left", padx=8)
+        ).grid(row=0, column=0)
+        ttk.Button(bar, text="立即刷新", width=9, command=self.refresh_messages).grid(row=0, column=1, padx=6)
         self.v_rt_limit = tk.StringVar(value="80")
-        ttk.Label(bar, text="显示条数").pack(side="left", padx=(16, 4))
-        ttk.Entry(bar, textvariable=self.v_rt_limit, width=6).pack(side="left")
+        ttk.Label(bar, text="显示条数").grid(row=0, column=2, padx=(6, 4))
+        ttk.Entry(bar, textvariable=self.v_rt_limit, width=4).grid(row=0, column=3)
         self.v_rt_filter = tk.StringVar(value="全部消息")
-        ttk.Label(bar, text="内容筛选").pack(side="left", padx=(16, 4))
-        image_filter = ttk.Combobox(bar, textvariable=self.v_rt_filter, state="readonly", width=10,
+        image_filter = ttk.Combobox(bar, textvariable=self.v_rt_filter, state="readonly", width=9,
                                     values=("全部消息", "仅看图片"))
-        image_filter.pack(side="left")
-        image_filter.bind("<<ComboboxSelected>>", lambda _event: self.refresh_messages())
+        image_filter.grid(row=0, column=4, padx=(12, 6))
+        image_filter.bind("<<ComboboxSelected>>", self._on_rt_filter_changed)
+        ttk.Label(bar, text="群筛选").grid(row=0, column=6, padx=(6, 4))
+        self.v_rt_group = tk.StringVar(value="全部群")
+        self.cb_rt_group = ttk.Combobox(bar, textvariable=self.v_rt_group, state="readonly",
+                                        width=22, values=("全部群",))
+        self.cb_rt_group.grid(row=0, column=7, sticky="ew")
+        self.cb_rt_group.bind("<<ComboboxSelected>>", self._on_rt_group_changed)
         self.v_rt_status = tk.StringVar(value="尚未加载")
-        ttk.Label(bar, textvariable=self.v_rt_status, style="Hint.TLabel").pack(side="right")
 
         wrap = ttk.Frame(tab)
-        wrap.pack(fill="both", expand=True)
-        cols = ("time", "group", "who", "text", "state", "image", "ocr", "vision", "recognize", "include", "account")
-        self.rt = ttk.Treeview(wrap, columns=cols, show="headings", height=18)
+        wrap.grid(row=1, column=0, sticky="nsew")
+        cols = ("time", "group", "who", "text", "state", "image", "recognize", "include", "account")
+        self.rt = ttk.Treeview(wrap, columns=cols, show="headings", height=8)
         headings = {
-            "time": ("时间", 78, "center"),
+            "time": ("时间", 130, "center"),
             "group": ("群", 130, "w"),
             "who": ("发言人", 110, "w"),
             "text": ("内容", 300, "w"),
             "state": ("图片", 70, "center"),
             "image": ("原图链接", 80, "center"),
-            "ocr": ("OCR 文字", 180, "w"),
-            "vision": ("图片语义", 200, "w"),
             "recognize": ("手动识别", 95, "center"),
             "include": ("纳入摘要", 82, "center"),
             "account": ("接收账号", 125, "w"),
         }
         for key, (title, width, anchor) in headings.items():
             self.rt.heading(key, text=title)
-            self.rt.column(key, width=width, anchor=anchor, stretch=(key == "text"))
+            self.rt.column(key, width=width, minwidth=180 if key == "text" else width,
+                           anchor=anchor, stretch=(key == "text"))
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.rt.yview)
         xsb = ttk.Scrollbar(tab, orient="horizontal", command=self.rt.xview)
         self.rt.configure(yscrollcommand=sb.set, xscrollcommand=xsb.set)
         self.rt.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        xsb.pack(fill="x")
+        xsb.grid(row=2, column=0, sticky="ew")
         self.rt.bind("<ButtonRelease-1>", self._on_rt_click)
         self.rt.bind("<<TreeviewSelect>>", self._on_rt_select)
         # 交替行色便于阅读；被 @ 的消息按普通消息呈现。
         self.rt.tag_configure("odd", background="#f5f7fa")
         self.rt.tag_configure("failed", foreground="#a15c00")
 
-        ttk.Label(tab, text="点击「打开」查看原图；点「□ 识别」才调用图片 API。"
-                         "默认只做 OCR；勾选「纳入摘要」即可使用 OCR，无需先做图片识别。",
-                  style="Hint.TLabel").pack(anchor="w", pady=(8, 0))
-        self.rt_detail = ScrolledText(tab, height=6, wrap="word", font=(FONT, 10))
-        self.rt_detail.pack(fill="x", pady=(5, 0))
+        hint = ttk.Frame(tab)
+        hint.grid(row=3, column=0, sticky="ew", pady=(5, 4))
+        ttk.Label(hint, text="点击消息查看详情；图片默认仅 OCR，手动识别才调用 API。",
+                  style="Hint.TLabel").pack(side="left")
+        ttk.Label(hint, textvariable=self.v_rt_status, style="Hint.TLabel").pack(side="right")
+        self.rt_bottom = ttk.Notebook(tab)
+        self.rt_bottom.grid(row=4, column=0, sticky="nsew")
+        self.rt_activity_tab = ttk.Frame(self.rt_bottom)
+        self.rt_details_tab = ttk.Frame(self.rt_bottom)
+        self.rt_bottom.add(self.rt_activity_tab, text="群活跃度")
+        self.rt_bottom.add(self.rt_details_tab, text="消息详情")
+        self.v_rt_activity_status = tk.StringVar(value="今日入库消息累计 · 点击群可筛选消息")
+        ttk.Label(self.rt_activity_tab, textvariable=self.v_rt_activity_status,
+                  style="Hint.TLabel").pack(anchor="w", pady=3)
+        activity_wrap = ttk.Frame(self.rt_activity_tab)
+        activity_wrap.pack(fill="both", expand=True)
+        self.rt_activity = ttk.Treeview(activity_wrap, columns=("group", "count", "last"),
+                                        show="headings", height=5)
+        for key, title, width in (("group", "群 / 群号", 380), ("count", "今日消息数", 110),
+                                  ("last", "最近消息（北京时间）", 180)):
+            self.rt_activity.heading(key, text=title)
+            self.rt_activity.column(key, width=width, stretch=key == "group",
+                                    anchor="w" if key == "group" else "center")
+        activity_sb = ttk.Scrollbar(activity_wrap, orient="vertical", command=self.rt_activity.yview)
+        self.rt_activity.configure(yscrollcommand=activity_sb.set)
+        activity_sb.pack(side="right", fill="y")
+        self.rt_activity.pack(side="left", fill="both", expand=True)
+        self.rt_activity.bind("<ButtonRelease-1>", self._on_rt_activity_click)
+        self.rt_detail = ScrolledText(self.rt_details_tab, height=5, wrap="word", font=(FONT, 10))
+        self.rt_detail.pack(fill="both", expand=True)
         self.rt_detail.configure(state="disabled")
 
     # ---- 标签页 3：设置 ----
@@ -1831,7 +1865,31 @@ class App:
         self._rt_busy = True
         self._rt_limit = self._read_rt_limit()
         threading.Thread(target=self._fetch_messages,
-                         args=(self._rt_limit, self.v_rt_filter.get() == "仅看图片"), daemon=True).start()
+                         args=(*self._rt_request_key(), self.proc), daemon=True).start()
+
+    def _rt_request_key(self) -> tuple:
+        return self._read_rt_limit(), self.v_rt_filter.get() == "仅看图片", self._rt_group_id
+
+    def _on_rt_filter_changed(self, _event=None) -> None:
+        self._render_messages([])
+        self.v_rt_status.set("正在读取筛选结果…")
+        self.refresh_messages()
+
+    def _on_rt_group_changed(self, _event=None) -> None:
+        self._rt_group_id = self._rt_group_labels.get(self.v_rt_group.get(), "")
+        self._on_rt_filter_changed()
+
+    def _on_rt_activity_click(self, event=None) -> None:
+        selected = self.rt_activity.selection()
+        group_id = self.rt_activity.identify_row(event.y) if event else (selected[0] if selected else "")
+        if not group_id:
+            return
+        self._rt_group_id = group_id
+        for label, value in self._rt_group_labels.items():
+            if value == group_id:
+                self.v_rt_group.set(label)
+                break
+        self._on_rt_filter_changed()
 
     def _read_rt_limit(self) -> int:
         """在主线程里读控件（Tkinter 变量不能在子线程碰）。"""
@@ -1840,18 +1898,56 @@ class App:
         except ValueError:
             return 80
 
-    def _fetch_messages(self, limit: int, images_only: bool = False) -> None:
+    def _fetch_messages(self, limit: int, images_only: bool = False, group_id: str = "", proc=None) -> None:
         port = int(self.cfg["onebot"]["http_port"])
-        rows = None
+        payload = None
         try:
             op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with op.open(f"http://127.0.0.1:{port}/messages/recent?limit={limit}&images={int(images_only)}", timeout=5) as r:
-                rows = json.loads(r.read().decode("utf-8")).get("items")
+            query = urlencode({"limit": limit, "images": int(images_only), "group_id": group_id})
+            with op.open(f"http://127.0.0.1:{port}/messages/recent?{query}", timeout=5) as r:
+                payload = json.loads(r.read().decode("utf-8"))
         except Exception:  # noqa: BLE001
-            rows = None
-        finally:
-            self._rt_busy = False
-        self.events.put(("messages", rows))
+            payload = None
+        self.events.put(("messages", ((limit, images_only, group_id), proc, payload)))
+
+    def _accept_messages(self, key: tuple, proc, payload) -> None:
+        self._rt_busy = False
+        if proc is not self.proc or key != self._rt_request_key():
+            if self.proc is not None:
+                self.refresh_messages()
+            return
+        if payload is not None:
+            self._render_activity(payload.get("activity") or {})
+        self._render_messages(payload.get("items") if payload else None)
+
+    def _render_activity(self, activity: dict) -> None:
+        groups = activity.get("groups") or []
+        labels = {"全部群": ""}
+        for group in groups:
+            group_id = str(group["group_id"])
+            labels[f"{group.get('group_name') or group_id} ({group_id})"] = group_id
+        if self._rt_group_id and self._rt_group_id not in labels.values():
+            labels[self.v_rt_group.get()] = self._rt_group_id
+        self._rt_group_labels = labels
+        self.cb_rt_group.configure(values=tuple(labels))
+        self.v_rt_group.set(next(label for label, value in labels.items() if value == self._rt_group_id))
+        selection = self.rt_activity.selection()
+        scroll = self.rt_activity.yview()[0]
+        self.rt_activity.delete(*self.rt_activity.get_children())
+        total = 0
+        for group in groups:
+            group_id = str(group["group_id"])
+            count = int(group["count"])
+            total += count
+            ts = group.get("last_ts") or 0
+            self.rt_activity.insert("", "end", iid=group_id, values=(
+                f"{group.get('group_name') or group_id} ({group_id})", count,
+                datetime.fromtimestamp(ts, BEIJING).strftime("%H:%M:%S") if ts else "—"))
+        if selection and self.rt_activity.exists(selection[0]):
+            self.rt_activity.selection_set(selection[0])
+        self.rt_activity.yview_moveto(scroll)
+        self.v_rt_activity_status.set(
+            f"{activity.get('date') or '今日'} · 北京时间当天入库 {total} 条 · 点击群筛选（不受上方筛选及显示条数限制）")
 
     def _render_messages(self, rows) -> None:
         if rows is None:
@@ -1865,9 +1961,10 @@ class App:
         for parent in rows:
             images = parent.get("images") or []
             if images:
-                for image in images:
+                for index, image in enumerate(images, 1):
                     item = {**parent, **image, "id": f"{parent['id']}:{image['id']}",
                             "image_id": image["id"], "has_media": 1,
+                            "image_index": index, "image_count": len(images),
                             "media_state": "filtered" if parent.get("media_state") == "filtered"
                             else image["media_state"]}
                     display_rows.append(item)
@@ -1877,17 +1974,8 @@ class App:
         for i, r in enumerate(display_rows):
             ts = int(r.get("ts") or 0)
             raw = r.get("text") or ""
-            # 剥掉 [图片]/[表情] 这类占位符后如果没剩下东西，就把图片的语义/OCR
-            # 内容顶上来 —— 纯图片消息的正文是占位符，真正有信息的是识别结果。
-            body = prefs_mod.plain_text(raw)
-            ocr = (r.get("ocr_text") or "").strip()
+            body = prefs_mod.plain_text(raw) or raw.strip() or ("[图片]" if r.get("has_media") else "（无文本）")
             vision = (r.get("vision_text") or "").strip()
-            if r.get("media_state") == "filtered" and ocr:
-                body = "OCR:" + ocr
-            elif not body:
-                body = (vision or ocr).strip()
-            if not body:
-                body = raw.strip() or "（无文本）"
             body = " ".join(body.split())[:300]
             state = self._media_label(r)
             tags: list[str] = []
@@ -1906,8 +1994,6 @@ class App:
                     body,
                     state,
                     "打开" if r.get("media_path") else "—",
-                    " ".join(ocr.split())[:100] or "—",
-                    " ".join(vision.split())[:100] or "—",
                     ("☑ 已识别" if vision else "□ 识别") if r.get("media_path") else "—",
                     ("☑" if r.get("include_vision") else "□") if r.get("has_media") else "—",
                     r.get("receiver_accounts") or r.get("received_by") or "历史未知",
@@ -1922,8 +2008,15 @@ class App:
     def _on_rt_select(self, _event=None) -> None:
         selection = self.rt.selection()
         row = self._rt_rows.get(str(selection[0])) if selection else None
-        detail = (f"OCR:\n{row.get('ocr_text') or '（无文字）'}\n\n"
-                  f"图片语义：\n{row.get('vision_text') or '（尚未手动识别）'}") if row else ""
+        detail = ""
+        if row:
+            detail = f"消息正文：\n{row.get('text') or '（无文本）'}"
+            if row.get("has_media"):
+                detail += (f"\n\n图片 {row.get('image_index', 1)} / {row.get('image_count', 1)}"
+                           f"\nOCR:\n{row.get('ocr_text') or '（无文字）'}\n\n"
+                           f"图片语义：\n{row.get('vision_text') or '（尚未手动识别）'}")
+        if self.rt_detail.get("1.0", "end-1c") == detail:
+            return
         self.rt_detail.configure(state="normal")
         self.rt_detail.delete("1.0", "end")
         self.rt_detail.insert("end", detail)
@@ -1933,17 +2026,19 @@ class App:
         row_id = self.rt.identify_row(event.y)
         column = self.rt.identify_column(event.x)
         row = self._rt_rows.get(row_id)
-        if not row:
+        if not row or not column or column == "#0":
             return
-        if column == "#6" and row.get("media_path"):
+        column = self.rt.column(column, "id")
+        self.rt_bottom.select(self.rt_details_tab)
+        if column == "image" and row.get("media_path"):
             path = Path(row["media_path"])
             if path.is_file():
                 open_path(path)
             else:
                 self.status.set("本地图片已不存在")
-        elif column == "#9" and row.get("image_id") and row.get("media_path") and not row.get("vision_text"):
+        elif column == "recognize" and row.get("image_id") and row.get("media_path") and not row.get("vision_text"):
             self._start_rt_action(str(row["image_id"]), "vision", {})
-        elif column == "#10" and row.get("image_id"):
+        elif column == "include" and row.get("image_id"):
             self._start_rt_action(str(row["image_id"]), "summary-include", {"include": not bool(row.get("include_vision"))})
 
     def _start_rt_action(self, row_id: str, action: str, payload: dict) -> None:
@@ -2446,10 +2541,7 @@ class App:
         except Exception:  # noqa: BLE001  窗口销毁过程中可能取不到
             visible = False
         if visible and self.v_rt_auto.get() and self.proc is not None and not self._rt_busy:
-            self._rt_busy = True
-            self._rt_limit = self._read_rt_limit()
-            threading.Thread(target=self._fetch_messages,
-                             args=(self._rt_limit, self.v_rt_filter.get() == "仅看图片"), daemon=True).start()
+            self.refresh_messages()
         self.root.after(3000, self._tick_realtime)
 
     def _fetch_health(self, proc) -> None:
@@ -2512,7 +2604,7 @@ class App:
         elif kind == "billing_done":
             self._billing_finished(value)
         elif kind == "messages":
-            self._render_messages(value)
+            self._accept_messages(*value)
         elif kind == "message_action":
             key, action, result = value
             self._rt_actions.discard(key)
