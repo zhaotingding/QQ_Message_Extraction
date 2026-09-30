@@ -162,7 +162,7 @@ rows = app.rt.get_children()
 check("消息渲染成行", len(rows) == 2, str(len(rows)))
 vals = [app.rt.item(r, "values") for r in rows]
 check("按新的在前排序（列表顺序即服务返回顺序）", vals[0][3] == "第二条", str(vals[0]))
-check("图片占位不被 OCR 覆盖", vals[1][3] == "[图片]", str(vals[1]))
+check("图片占位后显示已有 OCR 预览", vals[1][3] == "[图片] OCR:报错截图", str(vals[1]))
 check("被 @ 的行按普通消息呈现", "atme" not in app.rt.item(rows[0], "tags"), str(app.rt.item(rows[0], "tags")))
 check("语义失败的行有专属标记", "failed" in app.rt.item(rows[1], "tags"), str(app.rt.item(rows[1], "tags")))
 check("保留原图、识别和纳入摘要操作", vals[1][5] == "打开" and vals[1][6] == "□ 识别"
@@ -190,7 +190,7 @@ with patch.object(app.rt, "identify_row", return_value="1"), patch.object(app.rt
 app._render_messages([{"id": 3, "ts": 1700000000, "text": "[图片]", "media_state": "filtered",
                        "ocr_text": "报错截图", "vision_text": "", "has_media": 1, "include_vision": 0,
                        "media_path": str(PROJ / "README.md")}])
-check("过滤图片 OCR 只在详情显示", app.rt.item("3", "values")[3] == "[图片]")
+check("过滤图片直接显示 OCR 预览", app.rt.item("3", "values")[3] == "[图片] OCR:报错截图")
 app._render_messages([{"id": 4, "ts": 1700000000, "text": "两张图[图片][图片]", "media_state": "done",
                        "images": [{"id": 41, "image_index": 0, "ocr_text": "第一张", "vision_text": "语义甲",
                                    "media_path": str(PROJ / "README.md"), "include_vision": 1, "media_state": "done"},

@@ -1977,6 +1977,14 @@ class App:
             body = prefs_mod.plain_text(raw) or raw.strip() or ("[图片]" if r.get("has_media") else "（无文本）")
             vision = (r.get("vision_text") or "").strip()
             body = " ".join(body.split())[:300]
+            ocr = " ".join((r.get("ocr_text") or "").split())
+            if r.get("has_media") and ocr:
+                # 给 OCR 留出预览空间；完整正文与逐图识别结果仍保留在消息详情。
+                caption = " ".join(prefs_mod.plain_text(raw).split())
+                if len(caption) > 100:
+                    caption = caption[:100] + "…"
+                preview = ocr[:180] + ("…" if len(ocr) > 180 else "")
+                body = f"{caption} [图片] OCR:{preview}".strip()
             state = self._media_label(r)
             tags: list[str] = []
             if i % 2:

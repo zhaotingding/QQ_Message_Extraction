@@ -99,18 +99,62 @@ class RealtimeGuiTests(unittest.TestCase):
     def detail(self):
         return self.app.rt_detail.get("1.0", "end-1c")
 
-    def test_table_keeps_only_original_body_and_image_placeholders(self):
+    def test_table_previews_each_images_ocr_without_semantics_or_extra_columns(self):
         self.render()
         app = self.app
         self.assertNotIn("ocr", app.rt.cget("columns"))
         self.assertNotIn("vision", app.rt.cget("columns"))
         self.assertEqual(app.rt.get_children(), ("3", "2:201", "2:202", "1"))
         self.assertIn("今天比较两组实验结果", app.rt.set("3", "text"))
-        self.assertIn("[图片]", app.rt.set("2:201", "text"))
-        self.assertNotIn("控制实验条件", app.rt.set("2:201", "text"))
+        self.assertEqual(app.rt.set("2:201", "text"), "[图片] OCR:第一张图片：控制实验条件后再比较结果。")
+        self.assertEqual(app.rt.set("2:202", "text"), "[图片] OCR:第二张图片：学习计划与记录。")
         self.assertNotIn("学习进度表", app.rt.set("2:202", "text"))
         self.assertEqual(app.rt.set("2:201", "image"), "打开")
         self.assertIn("识别", app.rt.set("2:201", "recognize"))
+
+    def test_caption_and_saved_ocr_preview_are_single_line_and_do_not_change_source(self):
+        payload = sample_payload()
+        message = payload["items"][1]
+        message["text"] = "看看这个\n实验结果[图片][图片]"
+        message["images"][0]["ocr_text"] = "甲行\n乙行\t结论"
+        before = json.dumps(payload, ensure_ascii=False)
+        with patch.object(self.app, "_start_rt_action") as action:
+            self.render(payload)
+            self.assertEqual(self.app.rt.set("2:201", "text"), "看看这个 实验结果 [图片] OCR:甲行 乙行 结论")
+            action.assert_not_called()
+        self.assertEqual(json.dumps(payload, ensure_ascii=False), before)
+        self.select("2:201")
+        self.assertIn(message["text"], self.detail())
+        self.assertIn("甲行\n乙行\t结论", self.detail())
+
+    def test_long_image_preview_retains_ocr_and_full_detail(self):
+        payload = sample_payload()
+        message = payload["items"][1]
+        message["text"] = "长正文" * 150 + "[图片]"
+        message["images"][0]["ocr_text"] = "识别文字" * 150 + "末尾信息"
+        self.render(payload)
+        preview = self.app.rt.set("2:201", "text")
+        self.assertIn("[图片] OCR:识别文字", preview)
+        self.assertTrue(preview.endswith("…"))
+        self.assertLessEqual(len(preview), 300)
+        self.select("2:201")
+        self.assertIn(message["text"], self.detail())
+        self.assertIn(message["images"][0]["ocr_text"], self.detail())
+
+    def test_image_without_ocr_keeps_placeholder_until_result_arrives(self):
+        payload = sample_payload()
+        message = payload["items"][1]
+        message["text"] = "[图片]"
+        message["images"] = message["images"][:1]
+        message["images"][0]["ocr_text"] = " \n\t"
+        self.render(payload)
+        self.assertEqual(self.app.rt.set("2:201", "text"), "[图片]")
+        self.select("2:201")
+        message["images"][0]["ocr_text"] = "稍后完成的 OCR"
+        self.render(payload)
+        self.assertEqual(self.app.rt.selection(), ("2:201",))
+        self.assertEqual(self.app.rt.set("2:201", "text"), "[图片] OCR:稍后完成的 OCR")
+        self.assertIn("稍后完成的 OCR", self.detail())
 
     def test_shared_details_show_complete_text_and_each_image_recognition(self):
         self.render()
