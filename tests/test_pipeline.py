@@ -72,6 +72,16 @@ async def main() -> None:
             check("同时点名和全体提醒仍不生成告警", not pipe.store.recent_alerts())
             check("收消息没有产生任何 API 消费记录", not pipe.store.api_usage_details()["items"])
 
+            for mid, name, user_id in ((100, "改名的群管家", 2854196310), (101, "Q群管家", 999)):
+                bot_event = event(mid, [{"type": "image", "data": {"url": "https://invalid.test/bot.png"}},
+                                        {"type": "text", "data": {"text": "签到广告"}}])
+                bot_event.update(user_id=user_id, sender={"nickname": name})
+                result = await pipe.handle_event(bot_event)
+                check("管家消息接收后直接过滤", "Q群管家" in result.get("reason", ""))
+            check("管家不入库、不进入 OCR 队列、不调用模型", pipe.store.conn.execute(
+                "SELECT COUNT(*) FROM messages").fetchone()[0] == 6
+                and not pipe.store.pending_images() and pipe.llm._post.await_count == 0)
+
             cfg["filters"].update(skip_face_only=True, skip_image_only=True)
             cases = [
                 {"type": "face", "data": {"id": "1"}},

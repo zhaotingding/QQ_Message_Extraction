@@ -38,6 +38,23 @@ class ActivityFixture:
 
 
 class GroupActivityTests(ActivityFixture, unittest.TestCase):
+    def test_legacy_manager_hidden_before_limits_without_deleting_records(self):
+        normal = self.add_message("1", START + 10, images=("normal-image",))
+        for mid, sender_id, name, ts in (("bot1", "2854196310", "改名管家", START + 1),
+                                        ("bot2", "other", " Q群管家 ", START + 20)):
+            self.store.insert_message(Msg(msg_id=mid, group_id="1", sender_id=sender_id,
+                sender_name=name, ts=ts, text="广告[图片]", image_urls=["bot-image"]))
+        before = list(self.store.conn.execute("SELECT * FROM messages ORDER BY id"))
+        self.assertEqual([r["id"] for r in self.store.recent_messages(1)], [normal])
+        self.assertEqual([r["id"] for r in self.store.recent_messages(1, True, "1")], [normal])
+        self.assertEqual([r["id"] for r in self.store.messages_between_all(START - 1, END, 1)], [normal])
+        self.assertEqual([r["id"] for r in self.store.messages_between("1", START - 1, END)], [normal])
+        self.assertEqual(self.store.first_ts("1"), START + 10)
+        self.assertEqual(self.store.first_ts_all(), START + 10)
+        self.assertEqual(self.activity()["groups"][0]["count"], 1)
+        self.assertEqual(self.activity()["groups"][0]["last_ts"], START + 10)
+        self.assertEqual(list(self.store.conn.execute("SELECT * FROM messages ORDER BY id")), before)
+
     def test_beijing_midnight_is_left_closed_right_open_and_rolls_over(self):
         for ts in (START - 1, START, END - 1, END):
             self.add_message(ts=ts)

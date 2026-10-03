@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import Msg
+from .prefs import QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS groups (
@@ -639,8 +640,9 @@ class Store:
                 " FROM messages m LEFT JOIN groups g ON g.id = m.group_id"
                 " WHERE (?=0 OR EXISTS (SELECT 1 FROM message_images i WHERE i.message_row=m.id))"
                 " AND (?='' OR m.group_id=?)"
+                " AND COALESCE(m.sender_id,'')<>? AND TRIM(COALESCE(m.sender_name,''))<>?"
                 " ORDER BY m.ts DESC, m.id DESC LIMIT ?",
-                (int(images_only), group_id, group_id, limit),
+                (int(images_only), group_id, group_id, QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME, limit),
             )
         )
         result = []
@@ -663,13 +665,14 @@ class Store:
         rows = self.conn.execute(
             "WITH known_groups AS (SELECT id AS group_id FROM groups UNION SELECT group_id FROM messages),"
             " today AS (SELECT group_id, COUNT(*) AS count, MAX(ts) AS last_ts FROM messages"
-            " WHERE ts>=? AND ts<? GROUP BY group_id)"
+            " WHERE ts>=? AND ts<?"
+            " AND COALESCE(sender_id,'')<>? AND TRIM(COALESCE(sender_name,''))<>? GROUP BY group_id)"
             " SELECT k.group_id, COALESCE(g.name, '') AS group_name,"
             " COALESCE(t.count, 0) AS count, COALESCE(t.last_ts, 0) AS last_ts"
             " FROM known_groups k LEFT JOIN groups g ON g.id=k.group_id"
             " LEFT JOIN today t ON t.group_id=k.group_id"
             " ORDER BY count DESC, last_ts DESC, k.group_id",
-            (window_start, window_end),
+            (window_start, window_end, QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME),
         )
         return {"date": start.date().isoformat(), "window_start": window_start,
                 "window_end": window_end, "groups": [dict(row) for row in rows]}
@@ -678,8 +681,9 @@ class Store:
         return list(
             self.conn.execute(
                 "SELECT * FROM messages WHERE group_id=? AND ts>? AND ts<=?"
+                " AND COALESCE(sender_id,'')<>? AND TRIM(COALESCE(sender_name,''))<>?"
                 " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>''))) ORDER BY ts ASC",
-                (group_id, start, end),
+                (group_id, start, end, QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME),
             )
         )
 
@@ -692,7 +696,9 @@ class Store:
     def first_ts(self, group_id: str) -> int:
         row = self.conn.execute(
             "SELECT MIN(ts) AS t FROM messages WHERE group_id=?"
-            " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>'')))", (group_id,)
+            " AND COALESCE(sender_id,'')<>? AND TRIM(COALESCE(sender_name,''))<>?"
+            " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>'')))",
+            (group_id, QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME),
         ).fetchone()
         return int(row["t"]) if row and row["t"] else 0
 
@@ -700,7 +706,9 @@ class Store:
 
     def first_ts_all(self) -> int:
         row = self.conn.execute("SELECT MIN(ts) AS t FROM messages WHERE"
-                                " media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>''))").fetchone()
+                                " COALESCE(sender_id,'')<>? AND TRIM(COALESCE(sender_name,''))<>?"
+                                " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>'')))",
+                                (QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME)).fetchone()
         return int(row["t"]) if row and row["t"] else 0
 
     def window_end_by_kind(self, kind: str) -> int:
@@ -722,8 +730,9 @@ class Store:
         """窗口内消息按时间升序；逐张图片选择已勾选的语义或 OCR。"""
         rows = self.conn.execute(
             "SELECT * FROM messages WHERE ts>? AND ts<=?"
+            " AND COALESCE(sender_id,'')<>? AND TRIM(COALESCE(sender_name,''))<>?"
             " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>'')))"
-            " ORDER BY ts ASC,id ASC LIMIT ?", (start, end, limit),
+            " ORDER BY ts ASC,id ASC LIMIT ?", (start, end, QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME, limit),
         )
         result = []
         for row in rows:

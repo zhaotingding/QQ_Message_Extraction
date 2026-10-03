@@ -18,8 +18,11 @@ from pathlib import Path
 PREFS_REL = Path(".ui") / "preferences.json"
 ENV_PREFS = "MSGX_PREFS"
 
-# 界面可调项的默认值。注意「默认不过滤任何东西」——
-# 过滤是 0.2.0 才引入的能力，默认值必须保持与 0.1.0 完全一致的行为。
+# 本地 OneBot 事件已核对的 Q群管家账号；精确名称用于兼容缺少账号的旧记录。
+QGROUP_MANAGER_ID = "2854196310"
+QGROUP_MANAGER_NAME = "Q群管家"
+
+# 界面可调过滤默认关闭；Q群管家始终过滤。
 DEFAULTS: dict = {
     "summary_prompt": "",    # 空 = 沿用 config.toml 或内置提示词
     "summary_target_chars": 3000,
@@ -194,6 +197,8 @@ def skip_reason(msg, filters: dict) -> str:
 
     msg 是 models.Msg 实例。判定全部基于已归一化的字段，不依赖原始事件。
     """
+    if str(msg.sender_id) == QGROUP_MANAGER_ID or (msg.sender_name or "").strip() == QGROUP_MANAGER_NAME:
+        return QGROUP_MANAGER_NAME
     if not filters:
         return ""
 

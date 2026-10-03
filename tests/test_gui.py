@@ -1241,7 +1241,7 @@ with patch("msgx.gui.threading.Thread") as _thread, patch("msgx.gui.urllib.reque
             if _kind == "report_history":
                 app._dispatch_event(_kind, _value)
     check("摘要数据库连接明确只读", "?mode=ro" in _read_call.args[0] and _read_call.kwargs["uri"])
-    check("启动默认最近生成的摘要", app.report_history.selection() == ("2",)
+    check("启动默认内容日期最新的摘要", app.report_history.selection() == ("2",)
           and "假日报标题" in app.report_text.get("1.0", "end"))
     check("旧版类型不显示且不影响最新日报选择", not app.report_history.exists("3"))
     check("历史列表显示标题、完整日期、类型和字数", "假日报标题" in app.report_history.item("2", "text")

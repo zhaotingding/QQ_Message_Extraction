@@ -1465,7 +1465,7 @@ class App:
                         items = [dict(row) for row in conn.execute(
                             "SELECT id,window_start,window_end,kind,content,report_path,msg_count,created_at"
                             " FROM summaries WHERE kind IN (" + ",".join("?" for _ in kinds) + ")"
-                            " ORDER BY created_at DESC,id DESC LIMIT 50", kinds)]
+                            " ORDER BY window_end DESC,window_start DESC,created_at DESC,id DESC LIMIT 50", kinds)]
                         for item in items:
                             item["review"] = summary_review.get_review(conn, item["id"], item["content"] or "")
                     finally:
@@ -1537,7 +1537,7 @@ class App:
             self.report_history.see(chosen)
             self._show_report(self._report_items[chosen])
         count = len(self._report_items)
-        self.v_report_history.set(f"最近 {count} 份 · 本地读取" if count else "暂无此类摘要；旧版摘要已隐藏")
+        self.v_report_history.set(f"最近 {count} 份 · 按内容日期倒序" if count else "暂无此类摘要；旧版摘要已隐藏")
         if self._report_pending_path:
             pending, self._report_pending_path = self._report_pending_path, ""
             self.refresh_report_history(pending)

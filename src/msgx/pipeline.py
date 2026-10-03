@@ -353,8 +353,7 @@ class Pipeline:
             self.counters["skipped"] += 1
             return {"ok": False, "reason": f"群 {msg.group_id} 不在监听列表"}
 
-        # 过滤的图片仍下载并本地 OCR，供用户在实时页查看和手动选择语义解析。
-        # 默认全部关闭，因此默认行为与不启用过滤时完全一致。
+        # Q群管家直接丢弃；普通纯图片过滤仍保留图片供本地 OCR 和手动选择。
         reason = skip_reason(msg, self.cfg.get("filters") or {})
         if reason:
             self.counters["filtered"] += 1

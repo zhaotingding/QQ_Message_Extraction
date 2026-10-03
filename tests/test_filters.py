@@ -34,6 +34,13 @@ short = Msg(msg_id="7", group_id="g", text="好的")
 normal = Msg(msg_id="8", group_id="g", text="正常的技术讨论内容")
 
 print("=== 过滤规则 ===")
+for sender_id, sender_name in (("2854196310", "改过群名片"), ("other", "Q群管家"), ("", " Q群管家 ")):
+    bot = Msg(msg_id="bot", group_id="g", sender_id=sender_id, sender_name=sender_name,
+              text="签到广告[图片]", image_urls=["https://invalid.test/bot.png"])
+    check("管家按账号或精确名称过滤，无需开启其它过滤", skip_reason(bot, {}) == "Q群管家")
+    check("管家图片不走普通纯图保留规则", skip_reason(bot, {"skip_image_only": True}) == "Q群管家")
+check("正文提及管家或相似昵称不误过滤", skip_reason(
+    Msg(msg_id="person", group_id="g", sender_name="我不是Q群管家", text="Q群管家怎么关闭"), {}) == "")
 check("纯表情 命中", skip_reason(face, {"skip_face_only": True}) == "纯表情")
 check("表情包 命中（它也带图片 URL）", skip_reason(mface, {"skip_face_only": True}) == "纯表情")
 check("纯图片 命中", skip_reason(img, {"skip_image_only": True}) == "纯图片")

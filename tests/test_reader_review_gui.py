@@ -99,13 +99,40 @@ class ReaderReviewTests(unittest.TestCase):
         self.assertEqual(widget.get(index, end), text)
         return index, end
 
+    def test_content_dates_sort_before_limit_even_when_old_reports_generated_later(self):
+        def stamp(month, day):
+            return int(datetime(2026, month, day, tzinfo=BEIJING).timestamp())
+        reports = [
+            (101, "daily", 10, 2, 10, 3, 10),
+            (102, "daily", 10, 1, 10, 2, 9),
+            (103, "daily", 9, 30, 10, 1, 8),
+            (104, "monthly", 9, 1, 10, 1, 900),
+            (105, "weekly", 9, 21, 9, 28, 999),
+            (106, "daily", 9, 28, 9, 29, 1),
+            (107, "daily", 10, 2, 10, 3, 11),
+        ]
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM summaries")
+            for ident, kind, sm, sd, em, ed, created in reports:
+                conn.execute("INSERT INTO summaries VALUES (?,?,?,?,?,?,?,?)",
+                             (ident, stamp(sm, sd), stamp(em, ed), kind, "# 合成报告", "", 1, created))
+            for ident in range(200, 260):
+                conn.execute("INSERT INTO summaries VALUES (?,?,?,?,?,?,?,?)",
+                             (ident, stamp(9, 1), stamp(9, 2), "daily", "# 后补旧日报", "", 1, 10000 + ident))
+        before = self.db.read_bytes()
+        self.refresh()
+        self.assertEqual(self.app.report_history.get_children()[:7], ("107", "101", "102", "103", "104", "106", "105"))
+        self.assertEqual(len(self.app.report_history.get_children()), 50)
+        self.assertEqual(self.app.report_history.selection(), ("107",))
+        self.assertEqual(self.db.read_bytes(), before)
+
     def test_filter_before_limit_and_no_read_side_effects(self):
         with closing(sqlite3.connect(self.db)) as conn, conn:
             for ident in range(10, 75):
                 self.add_summary(conn, ident, "periodic", "旧版内容", ident + 200)
         before = self.db.read_bytes()
         self.refresh()
-        self.assertEqual(self.app.report_history.get_children(), ("2", "1", "3"))
+        self.assertEqual(self.app.report_history.get_children(), ("2", "3", "1"))
         self.assertIn("【日报】09-25", self.app.report_history.item("1", "text"))
         self.assertIn("【周报】09-25—09-27", self.app.report_history.item("2", "text"))
         self.assertIn("【月报】", self.app.report_history.item("3", "text"))
