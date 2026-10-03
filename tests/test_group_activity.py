@@ -74,16 +74,41 @@ class GroupActivityTests(ActivityFixture, unittest.TestCase):
         self.assertEqual(self.activity(datetime(2026, 9, 30, 0))["window_start"], START)
         self.assertEqual(self.activity(utc - timedelta(seconds=1))["date"], "2026-09-29")
 
-    def test_filtered_images_multi_image_and_receipts_count_as_one_message(self):
+    def test_unfiltered_multi_image_and_receipts_count_as_one_message(self):
         msg = Msg(msg_id="shared", group_id="1", sender_id="sender", ts=START,
-                  text="[图片][图片]", image_urls=["image-a", "image-b"])
-        row_id = self.store.insert_message(msg, bot_uin="account-a", filtered=True)
+                  text="[图片][图片]", image_urls=["image-a", "image-b"],
+                  raw={"message": [{"type": "image", "data": {"file": "image-a"}},
+                                   {"type": "image", "data": {"file": "image-b"}}]})
+        row_id = self.store.insert_message(msg, bot_uin="account-a")
         self.assertIsNotNone(row_id)
-        self.assertIsNone(self.store.insert_message(msg, bot_uin="account-b", filtered=True))
+        self.assertIsNone(self.store.insert_message(msg, bot_uin="account-b"))
         self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM message_images").fetchone()[0], 2)
         self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM message_receipts").fetchone()[0], 2)
         self.assertEqual(self.activity()["groups"][0]["count"], 1)
-        self.assertEqual(self.store.recent_messages()[0]["media_state"], "filtered")
+        self.assertEqual(self.store.recent_messages()[0]["media_state"], "pending")
+
+    def test_filtered_image_stays_visible_but_never_counts_even_when_included_in_summary(self):
+        row_id = self.add_message(images=("filtered-image",), filtered=True)
+        image_id = self.store.recent_messages()[0]["images"][0]["id"]
+        self.store.set_image_result(image_id, ocr_text="需要保留的 OCR", media_state="done")
+        self.store.set_image_include(image_id, True)
+        row = self.store.recent_messages()[0]
+        self.assertEqual((row["id"], row["media_state"], row["ocr_text"], row["include_vision"]),
+                         (row_id, "filtered", "需要保留的 OCR", 1))
+        self.assertEqual(self.store.messages_between_all(START - 1, END)[0]["summary_picture"], "需要保留的 OCR")
+        group = self.activity()["groups"][0]
+        self.assertEqual((group["count"], group["last_ts"]), (0, 0))
+
+    def test_filtered_messages_do_not_raise_rank_or_latest_timestamp(self):
+        self.add_message("a", START + 1)
+        self.add_message("a", START + 2)
+        self.add_message("b", START + 3)
+        for offset in range(3):
+            self.add_message("b", START + 10 + offset, filtered=True)
+            self.add_message("only-filtered", START + 20 + offset, filtered=True)
+        groups = self.activity()["groups"]
+        self.assertEqual([(g["group_id"], g["count"], g["last_ts"]) for g in groups],
+                         [("a", 2, START + 2), ("b", 1, START + 3), ("only-filtered", 0, 0)])
 
     def test_zero_message_historical_and_missing_group_metadata_remain_available(self):
         self.store.upsert_group("empty", "已知空群")
@@ -144,7 +169,7 @@ class GroupActivityTests(ActivityFixture, unittest.TestCase):
 
 class GroupActivityRouteTests(ActivityFixture, unittest.IsolatedAsyncioTestCase):
     async def test_endpoint_preserves_items_and_activity_ignores_message_filters(self):
-        wanted = self.add_message("1", images=["image-a"])
+        wanted = self.add_message("1", images=["image-a"], filtered=True)
         self.add_message("1", ts=START + 2)
         self.add_message("2", ts=START + 3)
         self.store.upsert_group("empty", "零消息群")
@@ -159,7 +184,7 @@ class GroupActivityRouteTests(ActivityFixture, unittest.IsolatedAsyncioTestCase)
         self.assertEqual([row["id"] for row in data["items"]], [wanted])
         self.assertEqual(data["activity"]["date"], "2026-09-30")
         self.assertEqual({row["group_id"]: row["count"] for row in data["activity"]["groups"]},
-                         {"1": 2, "2": 1, "empty": 0})
+                         {"1": 1, "2": 1, "empty": 0})
         self.store.group_activity.assert_called_once_with()
         for service in (pipe.llm, pipe.media, pipe.bot):
             self.assertEqual(service.mock_calls, [])

@@ -181,6 +181,7 @@ class RealtimeGuiTests(unittest.TestCase):
         self.assertIn("358", values[0])
         self.assertIn("206", values[1])
         self.assertIn("41", values[2])
+        self.assertIn("未过滤", self.app.v_rt_activity_status.get())
 
     def test_refresh_preserves_selected_message_details_scroll_and_activity_tab(self):
         self.root.deiconify()

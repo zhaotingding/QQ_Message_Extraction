@@ -544,7 +544,7 @@ class App:
         self.rt_details_tab = ttk.Frame(self.rt_bottom)
         self.rt_bottom.add(self.rt_activity_tab, text="群活跃度")
         self.rt_bottom.add(self.rt_details_tab, text="消息详情")
-        self.v_rt_activity_status = tk.StringVar(value="今日入库消息累计 · 点击群可筛选消息")
+        self.v_rt_activity_status = tk.StringVar(value="今日未过滤消息累计 · 点击群可筛选消息")
         ttk.Label(self.rt_activity_tab, textvariable=self.v_rt_activity_status,
                   style="Hint.TLabel").pack(anchor="w", pady=3)
         activity_wrap = ttk.Frame(self.rt_activity_tab)
@@ -552,7 +552,7 @@ class App:
         self.rt_activity = ttk.Treeview(activity_wrap, columns=("group", "count", "last"),
                                         show="headings", height=5)
         for key, title, width in (("group", "群 / 群号", 380), ("count", "今日消息数", 110),
-                                  ("last", "最近消息（北京时间）", 180)):
+                                  ("last", "最近未过滤消息", 180)):
             self.rt_activity.heading(key, text=title)
             self.rt_activity.column(key, width=width, stretch=key == "group",
                                     anchor="w" if key == "group" else "center")
@@ -1947,7 +1947,7 @@ class App:
             self.rt_activity.selection_set(selection[0])
         self.rt_activity.yview_moveto(scroll)
         self.v_rt_activity_status.set(
-            f"{activity.get('date') or '今日'} · 北京时间当天入库 {total} 条 · 点击群筛选（不受上方筛选及显示条数限制）")
+            f"{activity.get('date') or '今日'} · 北京时间当天未过滤消息 {total} 条 · 点击群筛选（不受上方筛选及显示条数限制）")
 
     def _render_messages(self, rows) -> None:
         if rows is None:

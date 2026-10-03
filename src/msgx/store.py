@@ -654,7 +654,7 @@ class Store:
         return result
 
     def group_activity(self, now: datetime | None = None) -> dict:
-        """北京时间今日入库消息榜；按消息正文计数，不展开图片或接收账号。"""
+        """北京时间今日未过滤消息榜；按消息正文计数，不展开图片或接收账号。"""
         beijing = timezone(timedelta(hours=8))
         current = now or datetime.now(beijing)
         if current.tzinfo is None:
@@ -665,7 +665,7 @@ class Store:
         rows = self.conn.execute(
             "WITH known_groups AS (SELECT id AS group_id FROM groups UNION SELECT group_id FROM messages),"
             " today AS (SELECT group_id, COUNT(*) AS count, MAX(ts) AS last_ts FROM messages"
-            " WHERE ts>=? AND ts<?"
+            " WHERE ts>=? AND ts<? AND media_state<>'filtered'"
             " AND COALESCE(sender_id,'')<>? AND TRIM(COALESCE(sender_name,''))<>? GROUP BY group_id)"
             " SELECT k.group_id, COALESCE(g.name, '') AS group_name,"
             " COALESCE(t.count, 0) AS count, COALESCE(t.last_ts, 0) AS last_ts"
