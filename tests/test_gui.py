@@ -69,11 +69,25 @@ check("_collect 可执行", isinstance(data, dict))
 check(
     "filters 键完整",
     set(data.get("filters", {})) == {
-        "skip_face_only", "skip_image_only", "skip_forward", "skip_record", "min_text_length"
+        "skip_face_only", "skip_image_only", "skip_forward", "skip_record", "min_text_length", "blocked_senders"
     },
     str(sorted(data.get("filters", {}))),
 )
 check("保存内容不含辅助键", "skip_min" not in data.get("filters", {}))
+
+check("默认发言人名单", data["filters"]["blocked_senders"] == ["Q群管家", "智能客服"])
+app.v_blocked_sender.set(" 自定义客服 ")
+app._add_blocked_sender()
+app.v_blocked_sender.set("自定义客服")
+app._add_blocked_sender()
+app.v_blocked_sender.set("   ")
+app._add_blocked_sender()
+check("新增发言人去空白并避免重复", app._collect()["filters"]["blocked_senders"] == ["Q群管家", "智能客服", "自定义客服"])
+app.lst_blocked_senders.selection_set(0, "end")
+app._remove_blocked_senders()
+check("允许删除全部发言人", app._collect()["filters"]["blocked_senders"] == [])
+app._load_into_widgets()
+check("重新加载恢复保存的名单", app.lst_blocked_senders.get(0, "end") == ("Q群管家", "智能客服"))
 
 print("\n=== 设置页可滚动（窗口矮时「保存设置」不再被切掉）===")
 allw: list = []

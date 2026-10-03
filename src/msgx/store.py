@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import Msg
-from .prefs import QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME
+from .prefs import QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME, blocked_senders
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS groups (
@@ -188,7 +188,8 @@ VISION_MAX_TRIES = 3
 
 
 class Store:
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, filters: dict | None = None):
+        self.filters = filters if filters is not None else {}
         p = Path(db_path)
         p.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(p), check_same_thread=False)
@@ -202,6 +203,18 @@ class Store:
         self.conn.executescript(SCHEMA)
         self._migrate()
         self.conn.commit()
+
+    def _sender_condition(self, prefix: str = "") -> tuple[str, tuple]:
+        """接收与历史查询共用名单；名称只通过 SQL 参数传入。"""
+        names = blocked_senders(self.filters)
+        if not names:
+            return "1=1", ()
+        sql = f"TRIM(COALESCE({prefix}sender_name,'')) NOT IN ({','.join('?' for _ in names)})"
+        params = tuple(names)
+        if QGROUP_MANAGER_NAME in names:
+            sql += f" AND COALESCE({prefix}sender_id,'')<>?"
+            params += (QGROUP_MANAGER_ID,)
+        return sql, params
 
     def _migrate(self) -> None:
         """幂等补齐老库缺失的列。"""
@@ -518,9 +531,11 @@ class Store:
         return self.conn.execute("SELECT * FROM message_images WHERE id=?", (image_id,)).fetchone()
 
     def pending_images(self, limit: int = 200) -> list:
+        sender_sql, sender_params = self._sender_condition("m.")
         return list(self.conn.execute(
-            "SELECT * FROM message_images WHERE media_state='pending' AND image_url<>''"
-            " ORDER BY id LIMIT ?", (limit,),
+            "SELECT i.* FROM message_images i JOIN messages m ON m.id=i.message_row"
+            " WHERE i.media_state='pending' AND i.image_url<>''"
+            f" AND {sender_sql} ORDER BY i.id LIMIT ?", (*sender_params, limit),
         ))
 
     def find_image_by_hash(self, media_hash: str):
@@ -629,6 +644,7 @@ class Store:
 
     def recent_messages(self, limit: int = 60, images_only: bool = False, group_id: str = "") -> list:
         """最近入库的消息（倒序）。带群名与图片处理状态，供界面直接展示。"""
+        sender_sql, sender_params = self._sender_condition("m.")
         rows = list(
             self.conn.execute(
                 "SELECT m.id, m.group_id, m.sender_name, m.ts, m.text, m.msg_type,"
@@ -640,9 +656,9 @@ class Store:
                 " FROM messages m LEFT JOIN groups g ON g.id = m.group_id"
                 " WHERE (?=0 OR EXISTS (SELECT 1 FROM message_images i WHERE i.message_row=m.id))"
                 " AND (?='' OR m.group_id=?)"
-                " AND COALESCE(m.sender_id,'')<>? AND TRIM(COALESCE(m.sender_name,''))<>?"
+                f" AND {sender_sql}"
                 " ORDER BY m.ts DESC, m.id DESC LIMIT ?",
-                (int(images_only), group_id, group_id, QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME, limit),
+                (int(images_only), group_id, group_id, *sender_params, limit),
             )
         )
         result = []
@@ -662,28 +678,30 @@ class Store:
         start = current.astimezone(beijing).replace(hour=0, minute=0, second=0, microsecond=0)
         window_start = int(start.timestamp())
         window_end = int((start + timedelta(days=1)).timestamp())
+        sender_sql, sender_params = self._sender_condition()
         rows = self.conn.execute(
             "WITH known_groups AS (SELECT id AS group_id FROM groups UNION SELECT group_id FROM messages),"
             " today AS (SELECT group_id, COUNT(*) AS count, MAX(ts) AS last_ts FROM messages"
             " WHERE ts>=? AND ts<? AND media_state<>'filtered'"
-            " AND COALESCE(sender_id,'')<>? AND TRIM(COALESCE(sender_name,''))<>? GROUP BY group_id)"
+            f" AND {sender_sql} GROUP BY group_id)"
             " SELECT k.group_id, COALESCE(g.name, '') AS group_name,"
             " COALESCE(t.count, 0) AS count, COALESCE(t.last_ts, 0) AS last_ts"
             " FROM known_groups k LEFT JOIN groups g ON g.id=k.group_id"
             " LEFT JOIN today t ON t.group_id=k.group_id"
             " ORDER BY count DESC, last_ts DESC, k.group_id",
-            (window_start, window_end, QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME),
+            (window_start, window_end, *sender_params),
         )
         return {"date": start.date().isoformat(), "window_start": window_start,
                 "window_end": window_end, "groups": [dict(row) for row in rows]}
 
     def messages_between(self, group_id: str, start: int, end: int) -> list:
+        sender_sql, sender_params = self._sender_condition()
         return list(
             self.conn.execute(
                 "SELECT * FROM messages WHERE group_id=? AND ts>? AND ts<=?"
-                " AND COALESCE(sender_id,'')<>? AND TRIM(COALESCE(sender_name,''))<>?"
+                f" AND {sender_sql}"
                 " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>''))) ORDER BY ts ASC",
-                (group_id, start, end, QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME),
+                (group_id, start, end, *sender_params),
             )
         )
 
@@ -694,21 +712,23 @@ class Store:
         return int(row["e"]) if row and row["e"] else 0
 
     def first_ts(self, group_id: str) -> int:
+        sender_sql, sender_params = self._sender_condition()
         row = self.conn.execute(
             "SELECT MIN(ts) AS t FROM messages WHERE group_id=?"
-            " AND COALESCE(sender_id,'')<>? AND TRIM(COALESCE(sender_name,''))<>?"
+            f" AND {sender_sql}"
             " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>'')))",
-            (group_id, QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME),
+            (group_id, *sender_params),
         ).fetchone()
         return int(row["t"]) if row and row["t"] else 0
 
     # ---------- 跨群（热点统计用） ----------
 
     def first_ts_all(self) -> int:
+        sender_sql, sender_params = self._sender_condition()
         row = self.conn.execute("SELECT MIN(ts) AS t FROM messages WHERE"
-                                " COALESCE(sender_id,'')<>? AND TRIM(COALESCE(sender_name,''))<>?"
+                                f" {sender_sql}"
                                 " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>'')))",
-                                (QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME)).fetchone()
+                                sender_params).fetchone()
         return int(row["t"]) if row and row["t"] else 0
 
     def window_end_by_kind(self, kind: str) -> int:
@@ -728,11 +748,12 @@ class Store:
 
     def messages_between_all(self, start: int, end: int, limit: int = -1) -> list:
         """窗口内消息按时间升序；逐张图片选择已勾选的语义或 OCR。"""
+        sender_sql, sender_params = self._sender_condition()
         rows = self.conn.execute(
             "SELECT * FROM messages WHERE ts>? AND ts<=?"
-            " AND COALESCE(sender_id,'')<>? AND TRIM(COALESCE(sender_name,''))<>?"
+            f" AND {sender_sql}"
             " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>'')))"
-            " ORDER BY ts ASC,id ASC LIMIT ?", (start, end, QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME, limit),
+            " ORDER BY ts ASC,id ASC LIMIT ?", (start, end, *sender_params, limit),
         )
         result = []
         for row in rows:
@@ -802,15 +823,17 @@ class Store:
         ).fetchone()
 
     def count_messages_window(self, start: int, end: int) -> int:
+        sender_sql, sender_params = self._sender_condition()
         body = "COALESCE(text,'')"
         for marker in ("[图片]", "[表情]", "[表情包]", "[语音]", "[视频]", "[合并转发]"):
             body = f"REPLACE({body},'{marker}','')"
         row = self.conn.execute(
             "SELECT COUNT(*) FROM messages WHERE ts>=? AND ts<?"
+            f" AND {sender_sql}"
             " AND (media_state<>'filtered' OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>'')))"
             f" AND (TRIM({body}, char(9)||char(10)||char(13)||' ')<>''"
             " OR (include_vision=1 AND (vision_text<>'' OR ocr_text<>'')))",
-            (start, end),
+            (start, end, *sender_params),
         ).fetchone()
         return int(row[0])
 

@@ -4,6 +4,8 @@ import os
 import tomllib
 from pathlib import Path
 
+from .prefs import DEFAULT_BLOCKED_SENDERS
+
 PACKAGE_DIR = Path(__file__).resolve().parent      # <项目根>/src/msgx
 SRC_DIR = PACKAGE_DIR.parent                       # <项目根>/src
 # 项目根 = src 的上一层。用 src 布局后这里是三级上溯，不是两级 —— 少写一层
@@ -106,6 +108,7 @@ DEFAULTS: dict = {
     # 消息类型过滤。默认全部为 false —— 过滤是界面（0.2.0）引入的能力，
     # 默认值必须保持「与 0.1.0 行为完全一致」：什么都不丢。
     "filters": {
+        "blocked_senders": list(DEFAULT_BLOCKED_SENDERS),
         "skip_face_only": False,
         "skip_image_only": False,
         "skip_forward": False,

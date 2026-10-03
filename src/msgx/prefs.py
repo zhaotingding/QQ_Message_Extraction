@@ -21,13 +21,15 @@ ENV_PREFS = "MSGX_PREFS"
 # 本地 OneBot 事件已核对的 Q群管家账号；精确名称用于兼容缺少账号的旧记录。
 QGROUP_MANAGER_ID = "2854196310"
 QGROUP_MANAGER_NAME = "Q群管家"
+DEFAULT_BLOCKED_SENDERS = (QGROUP_MANAGER_NAME, "智能客服")
 
-# 界面可调过滤默认关闭；Q群管家始终过滤。
+# 消息类型过滤默认关闭；发言人名单可在界面增删，空列表表示不过滤发言人。
 DEFAULTS: dict = {
     "summary_prompt": "",    # 空 = 沿用 config.toml 或内置提示词
     "summary_target_chars": 3000,
     "groups": [],             # 空 = 关注全部群（群列表是「全选/多选」语义，空即全部）
     "filters": {
+        "blocked_senders": list(DEFAULT_BLOCKED_SENDERS),
         "skip_face_only": False,    # 纯表情 / 表情包
         "skip_image_only": False,   # 纯图片（无任何文字）
         "skip_forward": False,      # 合并转发
@@ -156,6 +158,7 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
 
     filters = prefs.get("filters") or {}
     out.setdefault("filters", {})
+    out["filters"]["blocked_senders"] = blocked_senders(filters)
     for key in ("skip_face_only", "skip_image_only", "skip_forward", "skip_record"):
         out["filters"][key] = bool(filters.get(key, False))
     try:
@@ -187,6 +190,12 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
 
 # ---------- 过滤判定 ----------
 
+def blocked_senders(filters: dict) -> list[str]:
+    """缺失名单用默认值，显式空名单保留；去空白、空项和重复名称。"""
+    names = filters.get("blocked_senders", DEFAULT_BLOCKED_SENDERS)
+    return list(dict.fromkeys(name.strip() for name in names if isinstance(name, str) and name.strip()))
+
+
 def plain_text(text: str) -> str:
     """去掉所有占位符与 @全体成员后的实际文本。"""
     return _PLACEHOLDER_RE.sub("", text or "").strip()
@@ -197,8 +206,12 @@ def skip_reason(msg, filters: dict) -> str:
 
     msg 是 models.Msg 实例。判定全部基于已归一化的字段，不依赖原始事件。
     """
-    if str(msg.sender_id) == QGROUP_MANAGER_ID or (msg.sender_name or "").strip() == QGROUP_MANAGER_NAME:
-        return QGROUP_MANAGER_NAME
+    names = blocked_senders(filters)
+    name = (msg.sender_name or "").strip()
+    if QGROUP_MANAGER_NAME in names and str(msg.sender_id) == QGROUP_MANAGER_ID:
+        return f"过滤发言人: {QGROUP_MANAGER_NAME}"
+    if name in names:
+        return f"过滤发言人: {name}"
     if not filters:
         return ""
 

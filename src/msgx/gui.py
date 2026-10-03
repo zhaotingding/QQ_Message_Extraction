@@ -729,6 +729,29 @@ class App:
         ttk.Entry(minline, textvariable=self.v_minlen, width=6).pack(side="left", padx=6)
         ttk.Label(minline, text="字的消息（0 = 不过滤，不计占位符）").pack(side="left")
 
+        senders = ttk.LabelFrame(tab, text="过滤发言人（所有群）", padding=12)
+        senders.pack(fill="x", pady=(12, 0))
+        entry_row = ttk.Frame(senders)
+        entry_row.pack(fill="x")
+        self.v_blocked_sender = tk.StringVar()
+        sender_entry = ttk.Entry(entry_row, textvariable=self.v_blocked_sender, width=24)
+        sender_entry.pack(side="left", fill="x", expand=True)
+        sender_entry.bind("<Return>", self._add_blocked_sender)
+        ttk.Button(entry_row, text="添加", command=self._add_blocked_sender).pack(side="left", padx=6)
+        ttk.Button(entry_row, text="删除选中", command=self._remove_blocked_senders).pack(side="left")
+        ttk.Button(entry_row, text="保存设置", command=self.save_prefs).pack(side="left", padx=(6, 0))
+        sender_list = ttk.Frame(senders)
+        sender_list.pack(fill="x", pady=6)
+        self.lst_blocked_senders = tk.Listbox(sender_list, height=4, selectmode="extended",
+                                             exportselection=False, font=(FONT, 10))
+        sender_scroll = ttk.Scrollbar(sender_list, orient="vertical", command=self.lst_blocked_senders.yview)
+        self.lst_blocked_senders.configure(yscrollcommand=sender_scroll.set)
+        self.lst_blocked_senders.pack(side="left", fill="x", expand=True)
+        sender_scroll.pack(side="right", fill="y")
+        ttk.Label(senders, text="按发言人完整名称匹配；Q群管家同时匹配已知账号，删除该项即取消。保存后重启消息服务生效。\n"
+                  "命中后不入库、不做 OCR / LLM；历史消息隐藏且不计数、不进新摘要，移出名单可恢复已有记录。",
+                  style="Hint.TLabel").pack(anchor="w")
+
         # --- 协议端 ---
         nc = ttk.LabelFrame(tab, text="协议端（NapCat）", padding=12)
         nc.pack(fill="x", pady=(12, 0))
@@ -789,6 +812,18 @@ class App:
 
     # ---------------- 偏好读写 ----------------
 
+    def _add_blocked_sender(self, _event=None) -> str:
+        name = self.v_blocked_sender.get().strip()
+        names = self.lst_blocked_senders.get(0, "end")
+        if name and name not in names:
+            self.lst_blocked_senders.insert("end", name)
+        self.v_blocked_sender.set("")
+        return "break"
+
+    def _remove_blocked_senders(self) -> None:
+        for index in reversed(self.lst_blocked_senders.curselection()):
+            self.lst_blocked_senders.delete(index)
+
     def _load_into_widgets(self) -> None:
         p = self.prefs
         self._api_profiles, active = api_settings.catalog(self.cfg, p)
@@ -802,6 +837,10 @@ class App:
         self.v_summary_schedule_desc.set(self._summary_schedule_desc())
 
         f = p.get("filters") or {}
+        self.lst_blocked_senders.delete(0, "end")
+        for name in prefs_mod.blocked_senders(f):
+            self.lst_blocked_senders.insert("end", name)
+        self.v_blocked_sender.set("")
         for key, var in self.v_filters.items():
             var.set(bool(f.get(key, False)))
         self.v_minlen.set(str(int(f.get("min_text_length") or 0)))
@@ -860,6 +899,7 @@ class App:
             "summary_target_chars": target_chars,
             "groups": groups,
             "filters": {
+                "blocked_senders": list(self.lst_blocked_senders.get(0, "end")),
                 "skip_face_only": bool(self.v_filters["skip_face_only"].get()),
                 "skip_image_only": bool(self.v_filters["skip_image_only"].get()),
                 "skip_forward": bool(self.v_filters["skip_forward"].get()),

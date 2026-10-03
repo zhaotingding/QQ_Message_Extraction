@@ -32,7 +32,7 @@ class Pipeline:
 
     def __init__(self, cfg: dict | None = None):
         self.cfg = cfg or load()
-        self.store = Store(self._db_path())
+        self.store = Store(self._db_path(), filters=self.cfg.get("filters"))
         self.llm = LLM(self.cfg, self.store)
         self.llm.configure(api_key(self.cfg))
         self.media = MediaWorker(self.cfg, self.store, self.llm)
@@ -353,7 +353,7 @@ class Pipeline:
             self.counters["skipped"] += 1
             return {"ok": False, "reason": f"群 {msg.group_id} 不在监听列表"}
 
-        # Q群管家直接丢弃；普通纯图片过滤仍保留图片供本地 OCR 和手动选择。
+        # 名单中的发言人直接丢弃；普通纯图片过滤仍保留图片供本地 OCR 和手动选择。
         reason = skip_reason(msg, self.cfg.get("filters") or {})
         if reason:
             self.counters["filtered"] += 1
