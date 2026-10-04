@@ -289,9 +289,18 @@ class App:
         ttk.Label(automatic, textvariable=self.v_summary_schedule, wraplength=900).pack(anchor="w")
         self.v_summary_next = tk.StringVar(value="")
         ttk.Label(automatic, textvariable=self.v_summary_next, style="Hint.TLabel", wraplength=900).pack(anchor="w")
+        self._summary_retry_jobs = []
+        self._summary_retry_busy = False
+        self.summary_retry_row = ttk.Frame(automatic)
+        ttk.Label(self.summary_retry_row, text="待确认补生成").pack(side="left")
+        self.cb_summary_retry = ttk.Combobox(self.summary_retry_row, state="readonly", width=43)
+        self.cb_summary_retry.pack(side="left", fill="x", expand=True, padx=6)
+        self.btn_summary_retry = ttk.Button(self.summary_retry_row, text="确认补生成", command=self.retry_summary)
+        self.btn_summary_retry.pack(side="right")
         def resize_summary(event) -> None:
             for label in automatic.winfo_children():
-                label.configure(wraplength=max(200, event.width - 20))
+                if isinstance(label, ttk.Label):
+                    label.configure(wraplength=max(200, event.width - 20))
             resize_status()
         automatic.bind("<Configure>", resize_summary)
 
@@ -331,7 +340,56 @@ class App:
     def _summary_schedule_desc(self) -> str:
         chars = self._summary_options()["target_chars"]
         return (f"北京时间 00:00：日报每天 · 周报周一 · 月报每月1日；依次生成，"
-                f"字数：日报 {chars} / 周报 {2 * chars}（2D）/ 月报 {3 * chars}（3D）。")
+                 f"字数：日报 {chars} / 周报 {2 * chars}（2D）/ 月报 {3 * chars}（3D）。")
+
+    def _apply_summary_retry_jobs(self, jobs: list) -> None:
+        index = self.cb_summary_retry.current()
+        selected = self._summary_retry_jobs[index] if 0 <= index < len(self._summary_retry_jobs) else None
+        self._summary_retry_jobs = [dict(job) for job in jobs if job.get("state") == "blocked"]
+        titles = {"daily": "日报", "weekly": "周报", "monthly": "月报"}
+        self.cb_summary_retry.configure(values=[f"{titles.get(j['kind'], j['kind'])} {j['start_date']} — {j['end_date']}"
+                                                for j in self._summary_retry_jobs])
+        if self._summary_retry_jobs:
+            self.cb_summary_retry.current(self._summary_retry_jobs.index(selected) if selected in self._summary_retry_jobs else 0)
+            self.summary_retry_row.pack(fill="x", pady=(4, 0))
+        else:
+            self.cb_summary_retry.set("")
+            self.summary_retry_row.pack_forget()
+        self.btn_summary_retry.configure(state="disabled" if self._summary_retry_busy else "normal")
+
+    def retry_summary(self) -> None:
+        index = self.cb_summary_retry.current()
+        if self._summary_retry_busy or self.proc is None or not 0 <= index < len(self._summary_retry_jobs):
+            return
+        job = dict(self._summary_retry_jobs[index])
+        if not messagebox.askyesno("确认补生成", f"补生成 {job['start_date']} — {job['end_date']} 的摘要？\n\n"
+                "此前请求可能已经计费，重新生成可能重复收费。程序会先检查已有成稿；缺失时才重新请求模型。\n"
+                "完成后将自动继续依赖它的周报、月报。", parent=self.root):
+            return
+        self._summary_retry_busy = True
+        self.btn_summary_retry.configure(state="disabled")
+        self.status.set("正在提交补生成确认…")
+        proc = self.proc
+        def work() -> None:
+            port = int(self.cfg["onebot"]["http_port"])
+            headers = {"Content-Type": "application/json"}
+            token = self.cfg["onebot"].get("access_token")
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            payload = {key: job[key] for key in ("kind", "start_date", "end_date", "updated_at")}
+            payload["confirmed"] = True
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/summary/retry",
+                data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+            try:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(req, timeout=10) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                result = {"ok": False, "error": f"HTTP {exc.code}，请等待状态刷新后重新确认"}
+            except (OSError, ValueError):
+                result = {"ok": False, "error": "未能确认提交结果，请等待状态刷新，勿连续重发"}
+            self.events.put(("summary_retry_done", (proc, result)))
+        threading.Thread(target=work, daemon=True).start()
 
     def _apply_summary_schedule(self, data: dict) -> None:
         reports = data.get("latest_reports")
@@ -353,6 +411,7 @@ class App:
                 self._latest_report_ids = identities
                 self.refresh_report_history()
         schedule = data.get("summary_schedule") or {}
+        self._apply_summary_retry_jobs(schedule.get("failures") or [])
         labels = {"idle": "等待执行", "waiting": "等待前置摘要", "pending": "等待恢复", "settling": "等待消息入库",
                   "running": "正在生成", "failed": "任务失败", "done": "已完成", "empty": "无内容",
                   "blocked": "已停止重试，请检查", "retry": "等待重试", "disabled": "未启用", "unknown": "状态未知"}
@@ -362,7 +421,8 @@ class App:
         progress = data.get("summary_progress") or {}
         if state == "running" and progress.get("state") == "running" and progress.get("message"):
             message += "；" + security.redact(str(progress["message"]))
-        self.v_summary_schedule.set(f"{title}：{labels.get(state, state)} · {message}")
+        period = f" {schedule['start_date']} — {schedule['end_date']}" if schedule.get("start_date") and schedule.get("end_date") else ""
+        self.v_summary_schedule.set(f"{title}{period}：{labels.get(state, state)} · {message}")
         next_runs = schedule.get("next_runs") or {}
         times = []
         for kind, title in (("daily", "日报"), ("weekly", "周报"), ("monthly", "月报")):
@@ -2651,6 +2711,15 @@ class App:
             self._apply_billing(value)
         elif kind == "billing_done":
             self._billing_finished(value)
+        elif kind == "summary_retry_done":
+            self._summary_retry_busy = False
+            self.btn_summary_retry.configure(state="normal")
+            proc, result = value
+            if proc is not self.proc:
+                return
+            note = ("已找到成稿，直接复用" if result.get("state") == "done" else "已加入自动摘要队列") if result.get("ok") else result.get("error", "补生成提交失败")
+            self.status.set(note)
+            self._log_ui(f"[界面] {note}\n")
         elif kind == "messages":
             self._accept_messages(*value)
         elif kind == "message_action":

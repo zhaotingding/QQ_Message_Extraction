@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, main
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from msgx.llm import AmbiguousResponseError, BudgetExceeded, IncompleteResponse, RetryableRequestError
@@ -35,6 +36,7 @@ class PeriodSchedulerTests(IsolatedAsyncioTestCase):
         pipe.llm = SimpleNamespace(available=True, budget_ok=lambda: True)
         pipe.llm.snapshot = lambda: pipe.llm
         pipe._stop = asyncio.Event()
+        pipe._summary_wake = asyncio.Event()
         pipe._summary_recovered = False
         pipe.summary_schedule = {"state": "idle", "message": "", "kind": "", "start_date": "", "end_date": ""}
         pipe.daily_schedule = {}
@@ -89,6 +91,23 @@ class PeriodSchedulerTests(IsolatedAsyncioTestCase):
         await pipe._catch_up_summaries(self.clock("2026-10-05", 30))
         self.assertEqual(len(self.calls), 2)
         self.assertEqual(pipe.latest_reports()["weekly"]["status"], "done")
+
+    async def test_confirmed_daily_recovery_unblocks_weekly_without_duplicate_requests(self):
+        self.pipe._ensure_summary_baselines(date(2026, 9, 29))
+        self.add("2026-10-04")
+        key = ("daily", date(2026, 10, 4))
+        self.failure[key] = AmbiguousResponseError("结果未知")
+        await self.pipe._catch_up_summaries(self.clock("2026-10-05"))
+        job = self.job("daily", "2026-10-04", "2026-10-05")
+        self.assertEqual(job["state"], "blocked")
+        self.assertEqual(self.job("weekly", "2026-09-28", "2026-10-05")["state"], "waiting")
+        self.failure.clear()
+        self.pipe.retry_summary_job("daily", "2026-10-04", "2026-10-05", confirmed=True, revision=job["updated_at"])
+        await self.pipe._catch_up_summaries(self.clock("2026-10-05", 5))
+        self.assertEqual(self.job("weekly", "2026-09-28", "2026-10-05")["state"], "done")
+        calls = len(self.calls)
+        await self.pipe._catch_up_summaries(self.clock("2026-10-05", 10))
+        self.assertEqual(len(self.calls), calls)
 
     async def test_month_uses_in_month_weeks_and_edge_days_without_older_month(self):
         self.pipe._ensure_summary_baselines(date(2026, 9, 29))
@@ -243,6 +262,25 @@ class PeriodSchedulerTests(IsolatedAsyncioTestCase):
         self.assertEqual(self.pipe.latest_reports(), {"daily": None, "weekly": None, "monthly": None})
         self.assertEqual(self.store.conn.total_changes, changes)
         self.assertEqual(self.calls, [])
+
+    async def test_confirmed_retry_wakes_sleeping_scheduler(self):
+        visited = asyncio.Event()
+        async def check():
+            visited.set()
+        self.pipe._catch_up_summaries = AsyncMock(side_effect=check)
+        self.store.save_summary_job("daily", "2026-10-03", "2026-10-04", "blocked", now=100)
+        with patch("msgx.pipeline.asyncio.sleep", new=AsyncMock()), patch("msgx.pipeline.datetime", wraps=datetime) as clock:
+            clock.now.return_value = self.clock("2026-10-05", 10)
+            loop = asyncio.create_task(self.pipe._summary_loop())
+            try:
+                await asyncio.wait_for(visited.wait(), 2)
+                visited.clear()
+                self.pipe.retry_summary_job("daily", "2026-10-03", "2026-10-04", confirmed=True, revision=100)
+                await asyncio.wait_for(visited.wait(), 2)
+                self.assertEqual(self.pipe._catch_up_summaries.await_count, 2)
+            finally:
+                loop.cancel()
+                await asyncio.gather(loop, return_exceptions=True)
 
 
 if __name__ == "__main__":

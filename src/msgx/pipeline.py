@@ -78,6 +78,7 @@ class Pipeline:
         self._peer_watch: asyncio.Task | None = None
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
+        self._summary_wake = asyncio.Event()
         # 账单快照缓存。界面每 2 秒轮询 /health，绝不能每次都打网络（1 次余额 + N 次
         # 逐月消费）。所以：/health 只读缓存，真正的抓取由 _billing_loop 与 /billing 触发。
         self._billing_ts = 0.0
@@ -897,6 +898,26 @@ class Pipeline:
             self._set_summary_schedule("idle", "自动摘要已检查，等待下个完整周期")
         return any(job["state"] != "blocked" for job in pending)
 
+    def retry_summary_job(self, kind: str, start: str, end: str, *, confirmed: bool, revision: float) -> dict:
+        """只重置用户确认的最新失败；由单一调度循环接管，不另起生成任务。"""
+        if confirmed is not True:
+            raise ValueError("补生成可能重复计费，需要明确确认")
+        job = self.store.summary_job(kind, start, end)
+        if not job or job["state"] != "blocked" or job["updated_at"] != revision:
+            raise ValueError("任务状态已变化，请刷新后重新确认")
+        saved = self.store.summary_for_window(kind, *self._period_bounds(date.fromisoformat(start), date.fromisoformat(end)))
+        if saved:
+            self.store.save_summary_job(kind, start, end, "done", now=time.time(), summary_id=saved["id"])
+            state = "done"
+        elif self.store.retry_summary_job(kind, start, end, revision, time.time()):
+            state = "pending"
+        else:
+            raise ValueError("任务状态已变化，请刷新后重新确认")
+        log.info("用户确认恢复%s：%s 至 %s；原尝试 %s 次；状态 %s",
+                 PERIOD_NAMES[kind], start, end, job["attempts"], state)
+        self._summary_wake.set()
+        return {"ok": True, "state": state}
+
     async def _summary_loop(self) -> None:
         """按北京时间检查完整日、周、月；同一到期点先日再周再月。"""
         await asyncio.sleep(5)
@@ -910,6 +931,7 @@ class Pipeline:
                 except asyncio.TimeoutError:
                     pass
             checked_day = datetime.now(SHANGHAI).date()
+            self._summary_wake.clear()
             try:
                 await self._catch_up_summaries()
             except asyncio.CancelledError:
@@ -923,7 +945,7 @@ class Pipeline:
             midnight = datetime.combine(now.date() + timedelta(days=1), datetime_time.min, SHANGHAI)
             wait = min(30 * 60, max(0.01, (midnight - now).total_seconds()))
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=wait)
+                await asyncio.wait_for(self._summary_wake.wait(), timeout=wait)
             except asyncio.TimeoutError:
                 pass
 
@@ -934,7 +956,8 @@ class Pipeline:
         next_dates = {"daily": tomorrow, "weekly": monday, "monthly": _next_month(now.date())}
         next_runs = {kind: datetime.combine(day, datetime_time.min, SHANGHAI).isoformat()
                      for kind, day in next_dates.items()}
-        failures = self.store.summary_jobs_in_state("pending", "retry", "waiting", "blocked")[:10]
+        failures = self.store.summary_jobs_in_state("pending", "retry", "waiting", "blocked")
+        failures = sorted(failures, key=lambda job: job["state"] != "blocked")[:10]
         return {**self.summary_schedule, "next_runs": next_runs, "failures": failures}
 
     def latest_reports(self) -> dict:

@@ -258,6 +258,22 @@ async def _groups_refresh(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "groups": r["count"], **r})
 
 
+async def _summary_retry(request: web.Request) -> web.Response:
+    # GUI 本机 JSON 请求；拒绝浏览器跨站请求，避免意外触发收费补生成。
+    if request.remote not in ("127.0.0.1", "::1") or request.headers.get("Origin") or not _auth_ok(request):
+        return web.json_response({"ok": False, "error": "仅允许本机授权操作"}, status=403)
+    if request.content_type != "application/json":
+        return web.json_response({"ok": False, "error": "需要 JSON 请求"}, status=400)
+    try:
+        body = await request.json()
+        result = request.app["pipe"].retry_summary_job(
+            str(body["kind"]), str(body["start_date"]), str(body["end_date"]),
+            confirmed=body.get("confirmed") is True, revision=float(body["updated_at"]))
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return web.json_response({"ok": False, "error": "未确认或任务状态已变化，请刷新后重新确认"}, status=409)
+    return web.json_response(result)
+
+
 def build_app(cfg: dict, pipeline) -> web.Application:
     app = web.Application(client_max_size=MAX_WS_MSG)
     app["cfg"] = cfg
@@ -276,5 +292,6 @@ def build_app(cfg: dict, pipeline) -> web.Application:
     app.router.add_get(r"/usage/calls/{call_id:\d+}", _usage_sources)
     app.router.add_post("/summary/now", _summary_now)
     app.router.add_get("/summary/days", _summary_days)
+    app.router.add_post("/summary/retry", _summary_retry)
     app.router.add_post("/groups/refresh", _groups_refresh)
     return app

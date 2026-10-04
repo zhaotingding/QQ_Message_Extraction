@@ -99,6 +99,13 @@
   任务按唯一周期领取；中断后先核对成稿，无成稿且结果不明则 blocked，不能重启就重发。
   明确临时失败最多 3 轮、轮间至少 30 分钟；无密钥／预算不足保持 pending。
   预检要用最新 API 快照，不能用服务启动时的 key 状态阻断后来保存的配置。
+- **v0.8.6 中断恢复**：2026-10-04 实际日志显示 10 月 3 日日报上传后约 64 秒断连，未收到响应头；
+  本地账本 #506 用量未知、任务 blocked、无成稿。旧异常处理丢掉底层类型，无法断定代理或服务端原因。
+  官方 Chat 摘要改流式，Responses 沿用流式；结束标志缺失不可落成稿或自动整单重发。
+  补生成必须确认最新 `updated_at`，原子重置 blocked 后唤醒原调度循环，不能并行另起生成循环；
+  本轮重试次数重置，原次数写日志。先检查成稿复用；已收到的请求 ID 随异常保存到账本。
+  2026-10-04：`test_summary_recovery.py`、`test_period_scheduler.py`、`test_transport.py`、`test_gui.py`
+  离线/模拟及本机 HTTP 验证通过，证据 `data/diagnostics/v0.8.6/`；真实网络改善及补生成尚未实测。
 - **证据与验证**：2026-09-29，`pipeline.py`、`store.py`、`summarize.py`、`summary_review.py` 与 `gui.py`；
   `tests/test_period_summary.py`、`test_period_scheduler.py` 与真实 Tk 合成数据库测试覆盖跨月、依赖、复用及批注。
   证据位于 `data/diagnostics/v0.8.1/`，仅离线/模拟验证；真实周一/月初触发和模型最终表达待运行验收。

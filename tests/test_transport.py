@@ -81,6 +81,26 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(received), 1)
         self.assertLess(len(received[0][2]), 64 * 1024)
 
+    async def test_chat_sse_over_real_http_handles_fragmented_utf8(self):
+        received = []
+        async def handler(request):
+            received.append(await request.json())
+            r = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await r.prepare(request)
+            event = {"choices": [{"index": 0, "delta": {"content": "中文完整摘要🙂"}, "finish_reason": "stop"}]}
+            body = (": heartbeat\r\n\r\ndata: " + json.dumps(event, ensure_ascii=False) +
+                    '\r\n\r\ndata: {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 2}}\r\n\r\n'
+                    'data: [DONE]\r\n\r\n').encode("utf-8")
+            for offset in range(0, len(body), 7):
+                await r.write(body[offset:offset + 7])
+                await asyncio.sleep(0)
+            return r
+        async with local_llm(handler) as llm:
+            result = await llm._post({**payload(False), "stream": True})
+        self.assertEqual(result["choices"][0]["message"]["content"], "中文完整摘要🙂")
+        self.assertEqual(result["usage"]["prompt_tokens"], 10)
+        self.assertEqual(len(received), 1)
+
     async def test_404_fallback_replays_complete_upload(self):
         received = await self.collect([404, 200])
         self.assertEqual([row[0] for row in received],

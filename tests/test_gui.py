@@ -89,6 +89,38 @@ check("允许删除全部发言人", app._collect()["filters"]["blocked_senders"
 app._load_into_widgets()
 check("重新加载恢复保存的名单", app.lst_blocked_senders.get(0, "end") == ("Q群管家", "智能客服"))
 
+print("\n=== 失败摘要确认恢复（无网络） ===")
+_retry_job = dict(kind="daily", start_date="2026-10-03", end_date="2026-10-04",
+                  state="blocked", updated_at=100, error="结果未知")
+_retry_proc = app.proc
+app.proc = object()
+app._apply_summary_schedule({"summary_schedule": {**_retry_job, "failures": [_retry_job]}})
+check("失败状态显示具体日期", "2026-10-03 — 2026-10-04" in app.v_summary_schedule.get())
+check("补生成列表显示具体失败任务", "2026-10-03" in app.cb_summary_retry.get())
+with patch("msgx.gui.messagebox.askyesno", return_value=False), patch("msgx.gui.threading.Thread") as _thread:
+    app.retry_summary()
+    check("取消确认不提交请求", not _thread.called and not app._summary_retry_busy)
+from unittest.mock import MagicMock
+from types import SimpleNamespace
+_retry_response = MagicMock()
+_retry_response.__enter__.return_value.read.return_value = b'{"ok":true,"state":"pending"}'
+_retry_opener = Mock()
+_retry_opener.open.return_value = _retry_response
+with patch("msgx.gui.messagebox.askyesno", return_value=True), \
+        patch("msgx.gui.urllib.request.build_opener", return_value=_retry_opener), \
+        patch("msgx.gui.threading.Thread", side_effect=lambda target, daemon: SimpleNamespace(start=target)):
+    app.retry_summary()
+    app.retry_summary()
+    check("提交期间连续点击只发一次", _retry_opener.open.call_count == 1)
+    _request = _retry_opener.open.call_args.args[0]
+    check("确认绑定日期与失败版本", json.loads(_request.data) == {
+        "kind": "daily", "start_date": "2026-10-03", "end_date": "2026-10-04", "updated_at": 100, "confirmed": True})
+app._dispatch_event("summary_retry_done", (app.proc, {"ok": True, "state": "pending"}))
+check("队列确认不冒充生成成功", "队列" in app.status.get() and not app._summary_retry_busy)
+app._apply_summary_retry_jobs([])
+check("无失败任务隐藏补生成行", not app.summary_retry_row.winfo_manager())
+app.proc = _retry_proc
+
 print("\n=== 设置页可滚动（窗口矮时「保存设置」不再被切掉）===")
 allw: list = []
 

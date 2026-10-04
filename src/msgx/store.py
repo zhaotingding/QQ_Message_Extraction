@@ -878,6 +878,14 @@ class Store:
         self.conn.commit()
         return cur.rowcount == 1
 
+    def retry_summary_job(self, kind: str, start: str, end: str, revision: float, now: float) -> bool:
+        cur = self.conn.execute(
+            "UPDATE summary_jobs SET state='pending',attempts=0,next_attempt_at=0,error='',updated_at=?"
+            " WHERE kind=? AND start_date=? AND end_date=? AND state='blocked' AND updated_at=?",
+            (now, kind, start, end, revision))
+        self.conn.commit()
+        return cur.rowcount == 1
+
     def summary_jobs_in_state(self, *states: str) -> list[dict]:
         marks = ",".join("?" for _ in states)
         return [dict(row) for row in self.conn.execute(

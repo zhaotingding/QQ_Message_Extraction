@@ -47,6 +47,7 @@ class ReaderReviewTests(unittest.TestCase):
         app.v_latest_reports = {kind: tk.StringVar() for kind in ("daily", "weekly", "monthly")}
         app.v_summary_schedule = tk.StringVar()
         app.v_summary_next = tk.StringVar()
+        app._apply_summary_retry_jobs = lambda _jobs: None  # 这里只构建阅读页；恢复控件由完整 GUI 套件覆盖。
         app.status = tk.StringVar()
         app._build_report_tab(app.nb)
         self.root.update()

@@ -295,7 +295,8 @@ class LLM:
         except Exception as exc:
             status = f"请求被拒绝：{exc}；用量未知" if isinstance(exc, APIRequestRejected) else "请求失败，用量未知"
             self.store.record_api_call(ts=started, purpose=purpose, source_ids=source_ids or [],
-                                       model=payload["model"], usage=None, cost_cny=None, status=status, provider=provider)
+                                       model=payload["model"], usage=None, cost_cny=None, status=status, provider=provider,
+                                       request_id=_safe_request_id(getattr(exc, "request_id", "")))
             raise
         usage = data.get("usage")
         if usage and "prompt_cache_hit_tokens" not in usage:
@@ -372,7 +373,7 @@ class LLM:
             ],
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "stream": False,
+            "stream": require_complete and urlsplit(self.llm["base_url"]).hostname == "api.openai.com",
         }
         if not think:
             # 该模型默认开启思考，思考 token 与正文共用 max_tokens 且按输出价计费。
@@ -484,7 +485,10 @@ class LLM:
         s = await self.session()
         base = self.llm["base_url"].rstrip("/")
         responses = self.llm.get("protocol") == "responses"
+        summary_stream = bool(payload.get("stream"))
         outgoing = self._responses_payload(payload) if responses else dict(payload)
+        if summary_stream and not responses:
+            outgoing["stream_options"] = {"include_usage": True}
         if not responses and "api" in self.cfg:
             effort = self.cfg["api"]["reasoning"]
             outgoing["reasoning_effort"] = effort
@@ -506,9 +510,15 @@ class LLM:
         last = ""
         queued = 0
         started = time.monotonic()
+        phase, request_id = "连接或发送请求", ""
+        options = {}
+        if summary_stream:
+            options["timeout"] = aiohttp.ClientTimeout(
+                total=max(600, float(self.llm.get("timeout_seconds", 90))), connect=30, sock_read=180)
 
         async def upload():
-            nonlocal queued
+            nonlocal queued, phase
+            phase = "上传请求体"
             # 同一个 HTTP 请求分段写入，不拆消息、不增加模型调用。
             # 本机约 452 KiB 大包直接写出会在 15～20 秒断连；相同内容按此节奏
             # 上传已实测成功。保留 Content-Length，避免改成 chunked 传输编码。
@@ -517,6 +527,7 @@ class LLM:
                 chunk = encoded[offset:offset + 8192]
                 yield chunk
                 queued += len(chunk)
+            phase = "等待响应头"
             log.info("API 请求体已提交：%d 字节，耗时 %.2fs；等待响应", queued, time.monotonic() - started)
 
         try:
@@ -525,15 +536,20 @@ class LLM:
                 urls.append(f"{base}/v1/chat/completions")
             for url in urls:
                 queued, started = 0, time.monotonic()
+                phase, request_id = "连接或发送请求", ""
                 if paced:
                     log.info("API 开始上传：%.1f KiB，单次请求，每段 8 KiB", len(encoded) / 1024)
                 # 每次尝试都创建新的迭代器，404 路径回退和重试不能复用耗尽的正文。
-                async with s.post(url, headers=headers, data=upload() if paced else encoded, allow_redirects=False) as r:
+                async with s.post(url, headers=headers, data=upload() if paced else encoded, allow_redirects=False, **options) as r:
+                    phase = "接收响应正文"
+                    request_id = _safe_request_id(getattr(r, "headers", {}).get("x-request-id"))
                     if paced:
                         log.info("API 响应头已收到：HTTP %d，耗时 %.2fs；正在接收结果", r.status, time.monotonic() - started)
                     if r.status == 200:
                         if responses:
                             return await self._read_response(r)
+                        if outgoing.get("stream") and "text/event-stream" in getattr(r, "headers", {}).get("Content-Type", ""):
+                            return await self._read_chat_stream(r)
                         body = security.redact(await r.text())
                         try:
                             result = json.loads(body)
@@ -550,13 +566,49 @@ class LLM:
                         raise _Transient(last)
                     if r.status != 404:
                         break
-        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as e:
+        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError,
+                AmbiguousResponseError, json.JSONDecodeError, UnicodeDecodeError) as e:
             if isinstance(e, aiohttp.ClientConnectorError):
                 raise _Transient(f"{type(e).__name__}（阶段：连接未建立）") from None
-            raise AmbiguousResponseError("API 连接中断，处理结果及用量未知；未自动重发") from None
-        except asyncio.TimeoutError:
-            raise AmbiguousResponseError("API 请求超时，处理结果及用量未知；未自动重发") from None
+            detail = (f"API 请求中断：{type(e).__name__}；阶段={phase}；"
+                      f"耗时={time.monotonic() - started:.1f}s；request_id={request_id or '未收到'}；"
+                      "处理结果及用量未知；未自动重发")
+            log.warning("%s", detail)
+            error = AmbiguousResponseError(detail)
+            error.request_id = request_id
+            raise error from None
         raise APIRequestRejected(last or "请求失败")
+
+    async def _read_chat_stream(self, response) -> dict:
+        """只接受有完成标志和 DONE 的流；用量块可缺失，此时账本保留未知。"""
+        parts, lines = [], []
+        finish, usage, tier = None, None, ""
+        try:
+            async for raw in response.content:
+                line = raw.decode("utf-8").rstrip("\r\n")
+                if line.startswith("data:"):
+                    lines.append(line[5:].lstrip())
+                elif not line and lines:
+                    value, lines = "\n".join(lines), []
+                    if value == "[DONE]":
+                        if finish is None:
+                            break
+                        return {"choices": [{"message": {"content": "".join(parts)}, "finish_reason": finish}],
+                                "usage": usage, "service_tier": tier,
+                                "request_id": _safe_request_id(response.headers.get("x-request-id"))}
+                    event = json.loads(security.redact(value))
+                    if event.get("error"):
+                        break
+                    if event.get("usage") is not None:
+                        usage = event["usage"]
+                    tier = event.get("service_tier") or tier
+                    for choice in event.get("choices") or []:
+                        if choice.get("index", 0) == 0:
+                            parts.append((choice.get("delta") or {}).get("content") or "")
+                            finish = choice.get("finish_reason") or finish
+        except (ValueError, UnicodeError):
+            pass  # 原始响应不得写入错误日志。
+        raise AmbiguousResponseError("流式响应不完整；未自动重发")
 
     def _responses_payload(self, payload: dict) -> dict:
         inputs = []
