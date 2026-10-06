@@ -45,6 +45,7 @@ SUITES = [
     ("缓存凭证自动登录", "test_login.py"),
     ("手动强制重启与进程隔离", "test_napcat_restart.py"),
     ("界面构建", "test_gui.py"),
+    ("界面操作反馈", "test_gui_feedback.py"),
 ]
 
 

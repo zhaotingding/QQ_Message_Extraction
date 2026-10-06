@@ -165,6 +165,11 @@ class App:
         outer = ttk.Frame(self.root, padding=8)
         outer.pack(fill="both", expand=True)
 
+        self.status = tk.StringVar(value="就绪")
+        self.status_label = ttk.Label(outer, textvariable=self.status, foreground="#245cc4")
+        self.status_label.pack(fill="x", pady=(0, 4))
+        self.status_label.bind("<Configure>", lambda e: self.status_label.configure(wraplength=max(200, e.width)))
+
         nb = ttk.Notebook(outer)
         nb.pack(fill="both", expand=True)
         self.nb = nb
@@ -176,10 +181,6 @@ class App:
         self._build_usage_tab(nb)
         self._build_report_tab(nb)
 
-        self.status = tk.StringVar(value="就绪")
-        ttk.Label(outer, textvariable=self.status, foreground="#245cc4").pack(
-            anchor="w", pady=(4, 0)
-        )
 
     # ---- 标签页 1：运行状态 ----
 
@@ -320,12 +321,12 @@ class App:
         )
         self.cb_log_src.pack(side="left", padx=(6, 0))
         self.cb_log_src.bind("<<ComboboxSelected>>", lambda _e: self._switch_log_source())
-        ttk.Button(bar, text="刷新", width=5, command=self._refresh_alt_log).pack(
+        ttk.Button(bar, text="刷新", width=5, command=self._refresh_log).pack(
             side="left", padx=6
         )
         ttk.Button(
             bar, text="打开记录目录",
-            command=lambda: open_path(napcat_mod.log_path(self.cfg).parent),
+            command=lambda: self._open_external(napcat_mod.log_path(self.cfg).parent),
         ).pack(side="right")
         self.v_log_hint = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self.v_log_hint, style="Hint.TLabel").pack(
@@ -360,11 +361,13 @@ class App:
     def retry_summary(self) -> None:
         index = self.cb_summary_retry.current()
         if self._summary_retry_busy or self.proc is None or not 0 <= index < len(self._summary_retry_jobs):
+            self.status.set("正在提交，请稍候…" if self._summary_retry_busy else "请先启动服务并选择需要补生成的摘要")
             return
         job = dict(self._summary_retry_jobs[index])
         if not messagebox.askyesno("确认补生成", f"补生成 {job['start_date']} — {job['end_date']} 的摘要？\n\n"
                 "此前请求可能已经计费，重新生成可能重复收费。程序会先检查已有成稿；缺失时才重新请求模型。\n"
                 "完成后将自动继续依赖它的周报、月报。", parent=self.root):
+            self.status.set("已取消补生成，未提交请求")
             return
         self._summary_retry_busy = True
         self.btn_summary_retry.configure(state="disabled")
@@ -512,6 +515,14 @@ class App:
         self.alt_log.see("end")
         self.alt_log.configure(state="disabled")
 
+    def _refresh_log(self) -> None:
+        if self.v_log_src.get() == "协议端日志":
+            self._refresh_alt_log()
+            self.status.set("协议端日志已刷新 · " + time.strftime("%H:%M:%S"))
+        else:
+            self.log.see("end")
+            self.status.set("服务日志为实时接收，已定位到最新记录 · " + time.strftime("%H:%M:%S"))
+
     @classmethod
     def _append_log_line(cls, widget, line: str) -> None:
         tag = cls._log_tag(line)
@@ -543,7 +554,8 @@ class App:
         bar.columnconfigure(7, weight=1)
         self.v_rt_auto = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            bar, text="自动刷新（每 3 秒）", variable=self.v_rt_auto
+            bar, text="自动刷新（每 3 秒）", variable=self.v_rt_auto,
+            command=lambda: self.status.set("已开启自动刷新" if self.v_rt_auto.get() else "已暂停自动刷新，可点击立即刷新")
         ).grid(row=0, column=0)
         ttk.Button(bar, text="立即刷新", width=9, command=self.refresh_messages).grid(row=0, column=1, padx=6)
         self.v_rt_limit = tk.StringVar(value="200")
@@ -692,11 +704,15 @@ class App:
         ttk.Button(controls, text="删除此地址的密钥", command=self.delete_api_key).pack(side="left", padx=4)
         ttk.Button(controls, text="导入配置", command=self.import_api_config).pack(side="left")
         ttk.Button(controls, text="导出配置", command=self.export_api_config).pack(side="left", padx=4)
+        self.v_api_feedback = tk.StringVar(value="")
+        self.api_feedback_label = ttk.Label(api, textvariable=self.v_api_feedback, foreground="#245cc4", wraplength=730)
+        self.api_feedback_label.grid(row=row+3, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        self.v_api_key.trace_add("write", lambda *_: self._api_key_status())
         ttk.Label(api, text="选择配置即保存切换；编辑参数后点击保存。新任务使用所选 API，在途摘要仍用原配置。\n"
                   "配置导出不含密钥；不同配置或地址不复用密钥。更换模型请核对容量和费率，汇率为手动估值。\n"
                   "官方 OpenAI：flex 为半价慢速，default 为 Standard；单价填写 Standard 基准价，自动按档位折算。\n"
                   "Flex 最长等待 15 分钟，资源不足会有限重试，不自动切换 Standard；其他平台不发送此参数。",
-                  style="Hint.TLabel", wraplength=730).grid(row=row+3, column=0, columnspan=2, sticky="w")
+                  style="Hint.TLabel", wraplength=730).grid(row=row+4, column=0, columnspan=2, sticky="w")
 
         # --- 摘要 ---
         sm = ttk.LabelFrame(tab, text="自动摘要", padding=12)
@@ -744,14 +760,14 @@ class App:
         sb.pack(side="right", fill="y")
         row = ttk.Frame(gp)
         row.pack(anchor="w", pady=(8, 0))
-        ttk.Button(row, text="刷新群列表", command=self.refresh_groups).pack(side="left")
+        self.btn_groups_refresh = ttk.Button(row, text="刷新群列表", command=self.refresh_groups)
+        self.btn_groups_refresh.pack(side="left")
         # 「只保留当前账号的群」（v0.5.4）。群表是**历次登录的并集**：换个账号登进来
         # 一次，它的全部群就永久留在库里（实测误登一次主号灌进来 30 个空群），
         # 下拉框里再也找不到自己关心的那几个。这个按钮把不属于当前账号、又一条消息
         # 都没有的群清掉 —— 有消息的一律保留（删了会让那个群的摘要静默失效）。
-        ttk.Button(
-            row, text="只保留当前账号的群", command=self.prune_groups
-        ).pack(side="left", padx=8)
+        self.btn_groups_prune = ttk.Button(row, text="只保留当前账号的群", command=self.prune_groups)
+        self.btn_groups_prune.pack(side="left", padx=8)
         ttk.Label(
             gp,
             text="群列表保留各账号的历史数据；共同群记录多个接收账号。"
@@ -881,12 +897,17 @@ class App:
         names = self.lst_blocked_senders.get(0, "end")
         if name and name not in names:
             self.lst_blocked_senders.insert("end", name)
+            self.status.set("已添加过滤发言人，点击保存设置后生效")
+        else:
+            self.status.set("该发言人已在列表中，无需重复添加" if name else "请先填写要过滤的发言人")
         self.v_blocked_sender.set("")
         return "break"
 
     def _remove_blocked_senders(self) -> None:
-        for index in reversed(self.lst_blocked_senders.curselection()):
+        selected = self.lst_blocked_senders.curselection()
+        for index in reversed(selected):
             self.lst_blocked_senders.delete(index)
+        self.status.set(f"已移除 {len(selected)} 项，点击保存设置后生效" if selected else "请先选中要删除的发言人")
 
     def _load_into_widgets(self) -> None:
         p = self.prefs
@@ -975,23 +996,32 @@ class App:
             "ui": self.prefs.get("ui", {}),
         }
 
+    def _settings_feedback(self, message: str) -> None:
+        message = security.redact(message)
+        self.status.set(message)
+        self.v_api_feedback.set(time.strftime("%H:%M:%S") + " · " + message)
+
     def save_prefs(self, silent: bool = False) -> bool:
+        new_key = self.v_api_key.get().strip()
+        if new_key:
+            security.register(new_key)
         try:
             data = self._collect()
         except ValueError as exc:
             if not silent:
-                self.status.set(f"设置有误：{exc}")
+                self._settings_feedback(f"设置有误：{exc}；未保存")
                 self._log_ui(f"[界面] 设置有误：{exc}\n")
             return False
+        key_saved = False
         try:
-            if self.v_api_key.get().strip():
+            if new_key:
                 credentials.save(data["api"]["base_url"], self.v_api_key.get(), profile_id=self._api_selected)
-                security.register(self.v_api_key.get().strip())
+                key_saved = True
                 self.v_api_key.set("")
             prefs_mod.save(data, self.prefs_file)
         except (OSError, credentials.CredentialError) as exc:
             if not silent:
-                self.status.set(f"保存失败：{exc}")
+                self._settings_feedback(("新密钥已保存，但配置保存失败：" if key_saved else "保存失败：") + str(exc))
                 self._log_ui(f"[界面] 保存失败：{exc}\n")
             return False
         self.prefs = data
@@ -1001,8 +1031,9 @@ class App:
         self._api_key_status()
         self.v_summary_schedule_desc.set(self._summary_schedule_desc())
         n_groups = len(data["groups"]) or "全部"
-        self.status.set(
-            f"已保存 · 新任务使用 {data['api']['provider']} / {data['api']['model']} · 摘要约 {data['summary_target_chars']} 字 · 群 {n_groups}"
+        self._settings_feedback(
+            ("保存成功 · 新密钥已配置（仅本地保存，未验证 API 可用性）" if key_saved else "保存成功 · 密钥未更改")
+            + f" · 新任务使用 {data['api']['provider']} / {data['api']['model']} · 摘要约 {data['summary_target_chars']} 字 · 群 {n_groups}"
             + ("（其他非 API 服务设置重启后生效）" if self.proc else "")
         )
         return True
@@ -1037,9 +1068,13 @@ class App:
         name = f"custom_{i}"
         self._api_profiles[name] = {**api_settings.DEFAULTS, "provider": f"自定义 {i}"}
         self._show_api_profile(name)
-        self.status.set("新配置待填写并保存；未保存前继续使用原配置。密钥需单独设置。")
+        self._settings_feedback("新配置待填写并保存；未保存前继续使用原配置。密钥需单独设置。")
 
     def _api_key_status(self) -> None:
+        if self.v_api_key.get().strip():
+            self.v_api_key_status.set("新密钥尚未保存；点击下方「保存配置 / 替换密钥」后生效")
+            self.v_api_feedback.set("新密钥待保存；此前的保存结果不代表本次输入已保存")
+            return
         try:
             present = bool(credentials.read(api_settings.endpoint(self.v_api["base_url"].get()), profile_id=self._api_selected))
             self.v_api_key_status.set("已配置（Windows 凭据管理器）" if present else "此地址未配置密钥")
@@ -1051,13 +1086,14 @@ class App:
             credentials.delete(api_settings.endpoint(self.v_api["base_url"].get()), profile_id=self._api_selected)
             self.v_api_key.set("")
             self._api_key_status()
-            self.status.set("此地址的密钥已删除；在途请求可能继续完成，后续请求不再使用该密钥")
+            self._settings_feedback("此地址的密钥已删除；在途请求可能继续完成，后续请求不再使用该密钥")
         except (ValueError, credentials.CredentialError) as exc:
-            self.status.set(str(exc))
+            self._settings_feedback(str(exc))
 
     def import_api_config(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("API 配置", "*.json")])
         if not path:
+            self._settings_feedback("已取消导入，配置未更改")
             return
         try:
             profile = api_settings.validate(json.loads(Path(path).read_text(encoding="utf-8")))
@@ -1065,9 +1101,9 @@ class App:
                 var.set(str(profile[key]))
             self.v_api_key.set("")
             self._api_key_status()
-            self.status.set("API 配置已载入，点击保存后生效；密钥需单独配置")
+            self._settings_feedback("API 配置已载入，点击保存后生效；密钥需单独配置")
         except (OSError, ValueError, TypeError):
-            self.status.set("导入失败：配置格式无效或含不允许的字段；请勿在配置文件中填写密钥")
+            self._settings_feedback("导入失败：配置格式无效或含不允许的字段；请勿在配置文件中填写密钥")
 
     def export_api_config(self) -> None:
         try:
@@ -1075,42 +1111,60 @@ class App:
             path = filedialog.asksaveasfilename(defaultextension=".json", initialfile="api-config.json")
             if path:
                 Path(path).write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
-                self.status.set("API 配置已导出，不含密钥")
+                self._settings_feedback("API 配置已导出，不含密钥")
+            else:
+                self._settings_feedback("已取消导出，未写入文件")
         except (OSError, ValueError):
-            self.status.set("导出失败：请检查配置或文件写入权限")
+            self._settings_feedback("导出失败：请检查配置或文件写入权限")
 
     def reload_prefs(self) -> None:
-        self.prefs = prefs_mod.load(self.prefs_file)
+        try:
+            if self.prefs_file.exists():
+                if not isinstance(json.loads(self.prefs_file.read_text(encoding="utf-8")), dict):
+                    raise ValueError("偏好文件必须是对象")
+            loaded = prefs_mod.load(self.prefs_file)
+            api_settings.catalog(self.cfg, loaded)
+        except (OSError, ValueError, TypeError):
+            self._settings_feedback("重新加载失败：偏好文件无法读取或格式无效，当前编辑已保留")
+            return
+        self.prefs = loaded
         self._load_into_widgets()
-        self.status.set("已重新加载设置")
+        self._settings_feedback("已重新加载设置" if self.prefs_file.exists() else "偏好文件尚不存在，已加载默认设置")
 
     def open_prefs_file(self) -> None:
         if not self.prefs_file.exists():
-            self.save_prefs(silent=True)
-        open_path(self.prefs_file.parent)
+            if not self.save_prefs():
+                return
+        self._open_external(self.prefs_file)
 
     # ---------------- 群列表 ----------------
 
-    def refresh_groups(self, prune: bool = False) -> dict:
-        """刷新群列表。``prune=True`` 时同时请服务删掉别的账号留下的空群。
-
-        先让服务经协议端调 get_group_list 拉真实群名（NapCat 就在线上，
-        没理由显示「(未命名)」）；服务没跑或协议端不在线时退回本地库。
-        返回服务端给的元信息（``uin`` / ``deleted`` / ``protected``），失败返回 ``{}``。
-        """
-        fetched: dict = {}
-        if self.proc is not None:
+    def refresh_groups(self, prune: bool = False) -> None:
+        if getattr(self, "_groups_busy", False):
+            self.status.set("正在刷新群列表，请稍候…")
+            return
+        self.status.set("正在清理空群并刷新…" if prune else "正在刷新群列表…")
+        if self.proc is None:
+            self._render_groups({})
+            return
+        self._groups_busy = True
+        self.btn_groups_refresh.configure(state="disabled")
+        self.btn_groups_prune.configure(state="disabled")
+        port = int(self.cfg["onebot"]["http_port"])
+        def work():
+            fetched = {}
             try:
-                port = int(self.cfg["onebot"]["http_port"])
-                url = f"http://127.0.0.1:{port}/groups/refresh"
-                if prune:
-                    url += "?prune=1"
+                url = f"http://127.0.0.1:{port}/groups/refresh" + ("?prune=1" if prune else "")
                 req = urllib.request.Request(url, data=b"", method="POST")
                 op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                with op.open(req, timeout=20) as r:
-                    fetched = json.loads(r.read().decode("utf-8"))
-            except Exception:  # noqa: BLE001
-                fetched = {}
+                with op.open(req, timeout=20) as response:
+                    fetched = json.loads(response.read().decode("utf-8"))
+            except Exception:
+                pass  # 完成事件明确说明回退本地库，清理失败不会宣称成功。
+            self.events.put(("groups_done", (fetched, prune)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_groups(self, fetched: dict) -> bool:
         saved = set(self.prefs.get("groups") or [])
         uin = str(fetched.get("uin") or "")
         self._group_ids = []
@@ -1148,7 +1202,7 @@ class App:
                     self.lst_groups.insert("end", label)
         except Exception as exc:  # noqa: BLE001
             self.status.set(f"读取群列表失败：{exc}")
-            return fetched
+            return False
         for i, gid in enumerate(self._group_ids):
             if gid in saved:
                 self.lst_groups.selection_set(i)
@@ -1165,7 +1219,7 @@ class App:
         if protected:
             parts.append(f"保留 {len(protected)} 个有消息但不属于当前账号的群（删了会让摘要失效）")
         self.status.set("；".join(parts))
-        return fetched
+        return True
 
     def prune_groups(self) -> None:
         """「只保留当前账号的群」：让服务按当前登录账号删掉别的账号留下的空群。"""
@@ -1182,16 +1236,7 @@ class App:
         ):
             self.status.set("已取消「只保留当前账号的群」")
             return
-        r = self.refresh_groups(prune=True)
-        if not r:
-            self.status.set("清理失败：服务不可达或协议端未连接（群列表未改动）")
-            return
-        deleted = r.get("deleted") or []
-        protected = r.get("protected") or []
-        if deleted:
-            self._log_ui(f"[界面] 已清理 {len(deleted)} 个不属于当前账号的空群：{', '.join(deleted)}\n")
-        if protected:
-            self._log_ui(f"[界面] 保留（有消息，未删）：{', '.join(protected)}\n")
+        self.refresh_groups(prune=True)
 
     # ---------------- 消费明细与摘要全文（v0.6.0） ----------------
 
@@ -1205,7 +1250,8 @@ class App:
         self.usage_viewport.pack(side="left", fill="both", expand=True)
         tab = self.usage_content = ttk.Frame(self.usage_viewport)
         self._usage_window = self.usage_viewport.create_window(0, 0, window=tab, anchor="nw")
-        ttk.Button(tab, text="刷新消费明细", command=self.refresh_usage).pack(anchor="w")
+        self.btn_usage_refresh = ttk.Button(tab, text="刷新消费明细", command=self.refresh_usage)
+        self.btn_usage_refresh.pack(anchor="w")
         self.v_usage = tk.StringVar(value="Token 来自 API；金额为本地估算。今日按北京时间，OpenAI 平台按 UTC 日期统计。")
         self.usage_info_label = ttk.Label(tab, textvariable=self.v_usage, wraplength=880)
         self.usage_info_label.pack(fill="x", pady=6)
@@ -1287,11 +1333,14 @@ class App:
 
     def refresh_usage(self) -> None:
         if self._usage_busy:
+            self.v_usage.set("正在读取消费明细，请稍候…")
             return
         if self.proc is None:
             self.v_usage.set("请启动服务后刷新；旧版每日合计无法还原到具体消息。")
             return
         self._usage_busy = True
+        self.btn_usage_refresh.configure(state="disabled")
+        self.v_usage.set("正在读取消费明细…")
         port = int(self.cfg["onebot"]["http_port"])
         def work() -> None:
             try:
@@ -1304,10 +1353,11 @@ class App:
 
     def _render_usage(self, data: dict) -> None:
         self._usage_busy = False
+        self.btn_usage_refresh.configure(state="normal")
         if data.get("error"):
             self.v_usage.set(f"消费明细读取失败：{security.redact(str(data['error']))}")
             return
-        self.v_usage.set(f"当前用途总金额 ¥{data.get('visible_cost_cny', 0):.6f}；今日消费 ¥{data.get('today_cost_cny', 0):.6f}。"
+        self.v_usage.set(f"已刷新 {time.strftime('%H:%M:%S')} · 当前用途总金额 ¥{data.get('visible_cost_cny', 0):.6f}；今日消费 ¥{data.get('today_cost_cny', 0):.6f}。"
                          "仅显示摘要总结、图片理解；金额为本地估算，今日按北京时间。"
                          "旧记录缺缓存写入、服务层级或美元信息，无法精确对账；未知费用另行标注。")
         utc_days = data.get("openai_utc_days", [])
@@ -1467,7 +1517,7 @@ class App:
         actions = ttk.Frame(reader)
         actions.pack(fill="x")
         self.btn_open_report = ttk.Button(actions, text="打开完整 HTML 文件", state="disabled", style="Reader.TButton",
-                                         command=lambda: open_path(Path(self._summary_path)))
+                                         command=lambda: self._open_external(Path(self._summary_path)))
         self.btn_open_report.pack(side="left")
         self.btn_copy_report = ttk.Button(actions, text="复制全文", command=self._copy_report, state="disabled", style="Reader.TButton")
         self.btn_copy_report.pack(side="left", padx=6)
@@ -1521,7 +1571,7 @@ class App:
         self.report_text.pack(fill="both", expand=True)
         self.report_notes_frame = ttk.LabelFrame(reader, text="我的心得（个人观点；切换、刷新及关闭时自动保存）", padding=4)
         ttk.Button(self.report_notes_frame, text="保存心得", style="Reader.TButton",
-                   command=self._save_report_notes).pack(side="right", anchor="n", padx=(6, 0))
+                   command=self._save_report_notes_clicked).pack(side="right", anchor="n", padx=(6, 0))
         self.report_notes = ScrolledText(self.report_notes_frame, wrap="word", height=2, font=(FONT, 10))
         self.report_notes.pack(side="left", fill="x", expand=True)
         self.v_report_review = tk.StringVar(value="标注与阅读状态保存在本地，不调用 API。")
@@ -1546,6 +1596,7 @@ class App:
         if not self._save_report_notes():
             return
         if self._report_history_busy:
+            self.v_report_history.set("正在读取本地摘要，请稍候…")
             if preferred_path:
                 self._report_pending_path = preferred_path
             return
@@ -1641,7 +1692,8 @@ class App:
             self.report_history.see(chosen)
             self._show_report(self._report_items[chosen])
         count = len(self._report_items)
-        self.v_report_history.set(f"最近 {count} 份 · 按内容日期倒序" if count else "暂无此类摘要；旧版摘要已隐藏")
+        self.v_report_history.set((f"最近 {count} 份 · 按内容日期倒序" if count else "暂无此类摘要；旧版摘要已隐藏")
+                                  + " · 更新 " + time.strftime("%H:%M:%S"))
         if self._report_pending_path:
             pending, self._report_pending_path = self._report_pending_path, ""
             self.refresh_report_history(pending)
@@ -1799,6 +1851,12 @@ class App:
         self._report_notes_saved = notes
         return True
 
+    def _save_report_notes_clicked(self) -> None:
+        if self._report_review is None:
+            self.v_report_review.set("请先选择可保存心得的摘要")
+        elif self._save_report_notes():
+            self.v_report_review.set("心得已保存 · " + time.strftime("%H:%M:%S"))
+
     def _set_report_read_state(self) -> None:
         if self._report_review is None:
             return
@@ -1841,9 +1899,12 @@ class App:
 
     def _copy_report(self) -> None:
         if self._report_content:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(self._report_content)
-            self.status.set("已复制完整摘要")
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(self._report_content)
+                self.status.set("已复制完整摘要")
+            except tk.TclError:
+                self.status.set("复制失败：剪贴板暂时不可用，请重试")
 
 
     # ---------------- 服务进程 ----------------
@@ -1934,7 +1995,17 @@ class App:
 
 
     def open_data_dir(self) -> None:
-        open_path(abs_path(self.cfg, "report_dir").parent)
+        self._open_external(abs_path(self.cfg, "report_dir").parent)
+
+    def _open_external(self, target: Path | str) -> None:
+        try:
+            if isinstance(target, Path):
+                open_path(target)
+            else:
+                open_url(target)
+            self.status.set("已交给系统默认程序打开：" + str(target))
+        except OSError as exc:
+            self.status.set("打开失败：" + security.redact(str(exc)))
 
     # ---------------- 实时消息 ----------------
 
@@ -1963,10 +2034,13 @@ class App:
     def refresh_messages(self) -> None:
         if self.proc is None:
             self.status.set("服务未运行 —— 启动服务后才能看到实时消息")
+            self.v_rt_status.set("服务未运行，请先启动服务")
             return
         if self._rt_busy:
+            self.v_rt_status.set("正在刷新消息，请稍候…")
             return
         self._rt_busy = True
+        self.v_rt_status.set("正在刷新消息…")
         self._rt_limit = self._read_rt_limit()
         threading.Thread(target=self._fetch_messages,
                          args=(*self._rt_request_key(), self.proc), daemon=True).start()
@@ -2145,7 +2219,7 @@ class App:
         if column == "image" and row.get("media_path"):
             path = Path(row["media_path"])
             if path.is_file():
-                open_path(path)
+                self._open_external(path)
             else:
                 self.status.set("本地图片已不存在")
         elif column == "recognize" and row.get("image_id") and row.get("media_path") and not row.get("vision_text"):
@@ -2156,6 +2230,7 @@ class App:
     def _start_rt_action(self, row_id: str, action: str, payload: dict) -> None:
         key = f"{row_id}:{action}"
         if key in self._rt_actions:
+            self.status.set("该图片操作正在进行，请稍候…")
             return
         self._rt_actions.add(key)
         self.status.set("正在提交图片识别…" if action == "vision" else "正在更新摘要选项…")
@@ -2169,7 +2244,7 @@ class App:
             )
             try:
                 op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                with op.open(req, timeout=120) as response:
+                with op.open(req, timeout=960 if action == "vision" else 120) as response:
                     result = json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 try:
@@ -2177,7 +2252,7 @@ class App:
                 except (ValueError, UnicodeError):
                     result = {"ok": False, "error": f"HTTP {exc.code}"}
             except Exception as exc:  # noqa: BLE001
-                result = {"ok": False, "error": str(exc)}
+                result = {"ok": False, "error": "操作结果未确认，请刷新查看后再决定是否重试：" + security.redact(str(exc))}
             self.events.put(("message_action", (key, action, result)))
 
         threading.Thread(target=work, daemon=True).start()
@@ -2188,9 +2263,9 @@ class App:
         profile = self.prefs.get("api") or self.cfg.get("api") or self.cfg.get("llm", {})
         host = urlsplit(str(profile.get("base_url") or "")).hostname
         if host == "api.openai.com":
-            open_url("https://platform.openai.com/settings/organization/billing/overview")
+            self._open_external("https://platform.openai.com/settings/organization/billing/overview")
         elif host == "api.deepseek.com":
-            open_url("https://platform.deepseek.com/usage")
+            self._open_external("https://platform.deepseek.com/usage")
         else:
             self.status.set("当前为自定义接口，请到该服务商的官方平台查看账单。")
 
@@ -2421,6 +2496,7 @@ class App:
         if not messagebox.askyesno("强制重启协议端", f"退出目标 QQ {account} 的 NapCat 进程并重新扫码。\n"
                                   "消息接收服务未运行时会先启动；不结束普通 QQ，不删除历史数据。\n"
                                   "可能需要一次 UAC 授权。继续吗？", parent=self.root):
+            self.status.set("已取消强制重启，进程保持原状")
             return
         self._login_busy = True
         self._login_verify_since = time.time()
@@ -2735,6 +2811,16 @@ class App:
                 self.refresh_messages()
             else:
                 self.status.set(result.get("error") or "图片操作失败")
+        elif kind == "groups_done":
+            self._groups_busy = False
+            self.btn_groups_refresh.configure(state="normal")
+            self.btn_groups_prune.configure(state="normal")
+            fetched, prune = value
+            rendered = self._render_groups(fetched)
+            if prune and not fetched:
+                self.status.set("清理结果未确认：服务不可达或协议端未连接，请刷新检查；当前显示本地群列表")
+            elif prune and rendered:
+                self.status.set(f"清理完成：删除 {len(fetched.get('deleted') or [])} 个空群，保留 {len(fetched.get('protected') or [])} 个有消息的历史群")
         elif kind == "report_history":
             self._render_report_history(*value)
         elif kind == "login_done":
@@ -2868,9 +2954,9 @@ class App:
     def on_close(self) -> None:
         if not self._save_report_notes():
             return
-        self.qr_watching = False  # 先停掉二维码监视线程，再关界面
-        self.v_rt_auto.set(False)  # 停掉实时消息轮询
         if self.proc is None:
+            self.qr_watching = False
+            self.v_rt_auto.set(False)
             self.root.destroy()
             return
         if not messagebox.askyesno(
@@ -2878,7 +2964,10 @@ class App:
             "服务进程还在运行。\n\n是否停止服务并关闭界面？",
             parent=self.root,
         ):
+            self.status.set("已取消关闭，服务继续运行")
             return
+        self.qr_watching = False  # 确认关闭后再停止二维码监视和实时刷新。
+        self.v_rt_auto.set(False)
         self.closing = True
         self.stop_service()
         self.status.set("正在等待服务安全退出后关闭…")
@@ -2891,24 +2980,18 @@ class App:
 
 
 def open_url(url: str) -> None:
-    """用系统默认浏览器打开链接。失败就静默 —— 不该因为打不开网页而打断任何操作。"""
-    try:
-        if os.name == "nt":
-            os.startfile(url)  # type: ignore[attr-defined]
-        else:
-            subprocess.Popen(["xdg-open", url])
-    except Exception:  # noqa: BLE001
-        pass
+    """提交给系统默认浏览器；调用方负责显示成功或失败。"""
+    if os.name == "nt":
+        os.startfile(url)  # type: ignore[attr-defined]
+    else:
+        subprocess.Popen(["xdg-open", url])
 
 
 def open_path(path: Path) -> None:
-    try:
-        if os.name == "nt":
-            os.startfile(str(path))  # type: ignore[attr-defined]
-        else:
-            subprocess.Popen(["xdg-open", str(path)])
-    except Exception:  # noqa: BLE001
-        pass
+    if os.name == "nt":
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
 
 
 def main(config_path: str | None = None) -> int:
