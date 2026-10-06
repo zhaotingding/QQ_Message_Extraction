@@ -185,12 +185,13 @@ check("实时消息表格列齐全",
       list(app.rt["columns"]) == ["time", "group", "who", "text", "state", "image", "recognize", "include", "account"],
       str(list(app.rt["columns"])))
 check("内容筛选默认显示全部消息", app.v_rt_filter.get() == "全部消息")
+check("实时消息默认请求200条", app.v_rt_limit.get() == "200" and app._rt_limit == 200)
 old_proc = app.proc
 app.proc = object()
 app.v_rt_filter.set("仅看图片")
 with patch("msgx.gui.threading.Thread") as thread:
     app.refresh_messages()
-    check("仅看图片筛选发送到服务端查询", thread.call_args.kwargs["args"] == (80, True, "", app.proc))
+    check("仅看图片筛选发送到服务端查询", thread.call_args.kwargs["args"] == (200, True, "", app.proc))
 app._rt_busy = False
 app.proc = old_proc
 app.v_rt_filter.set("全部消息")
@@ -1223,6 +1224,7 @@ print("\n=== 多 API 配置选择与独立保存 ===")
 app._show_api_profile("openai")
 app.v_api["base_url"].set("https://api.openai.com/v1")
 app.v_api["model"].set("my-openai-model")
+app.v_api["service_tier"].set("flex")
 app.v_api_key.set(_fake_key)
 with patch("msgx.gui.prefs_mod.save") as _save_prefs, patch("msgx.gui.credentials.save") as _save_key:
     app.api_selector.current(list(app._api_profiles).index("deepseek"))
@@ -1237,6 +1239,9 @@ with patch("msgx.gui.prefs_mod.save") as _save_prefs, patch("msgx.gui.credential
     app._select_api_profile()
     check("切回 OpenAI 保留两套独立模型", app.v_api["model"].get() == "my-openai-model"
           and app._api_profiles["deepseek"]["model"] == "my-deepseek-model")
+    check("服务档位随配置独立保存", app.v_api["service_tier"].get() == "flex"
+          and app._api_profiles["deepseek"]["service_tier"] == "default"
+          and _save_prefs.call_args.args[0]["api_profiles"]["openai"]["service_tier"] == "flex")
     _public = _save_prefs.call_args.args[0]
     check("多配置保存不含密钥", _fake_key not in json.dumps(_public)
           and {"openai", "deepseek"}.issubset(_public["api_profiles"]))

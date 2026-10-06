@@ -8,6 +8,7 @@ from urllib.parse import urlsplit, urlunsplit
 DEFAULTS = {
     "provider": "OpenAI 官方", "base_url": "https://api.openai.com/v1",
     "protocol": "responses", "model": "gpt-6-luna", "reasoning": "none",
+    "service_tier": "flex",
     "context_tokens": 1050000, "max_output_tokens": 128000,
     "input_price": 0.10, "cached_price": 0.01, "output_price": 0.50,
     "currency": "USD", "usd_cny": 7.0,
@@ -41,6 +42,10 @@ def validate(values: dict) -> dict:
         raise ValueError("API 配置包含未知字段；密钥必须在程序中单独保存")
     out = {**DEFAULTS, **values}
     out["base_url"] = endpoint(str(out["base_url"]))
+    if "service_tier" not in values and urlsplit(out["base_url"]).hostname != "api.openai.com":
+        out["service_tier"] = "default"
+    if out["service_tier"] not in ("default", "flex"):
+        raise ValueError("服务档位必须是 default（Standard）或 flex")
     for key in ("provider", "model"):
         text = str(out[key]).strip()
         if not text or len(text) > 100 or any(c in text for c in "\r\n") or "sk-" in text:
@@ -86,7 +91,7 @@ def apply(cfg: dict, values: dict) -> dict:
 def deepseek_profile(llm: dict) -> dict:
     """只迁移旧配置的公开参数，不读取或复制旧密钥。"""
     return validate({**DEFAULTS, "provider": "DeepSeek", "base_url": llm["base_url"],
-                     "model": llm["model"], "protocol": "chat_completions",
+                     "model": llm["model"], "protocol": "chat_completions", "service_tier": "default",
                      "context_tokens": 1000000, "max_output_tokens": 393216, "currency": "CNY",
                      "input_price": llm["price_cache_miss_cny_per_mtok"],
                      "cached_price": llm["price_cache_hit_cny_per_mtok"],

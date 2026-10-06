@@ -53,7 +53,7 @@ class Response:
 class ApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.cfg = api_settings.apply(copy.deepcopy(DEFAULTS), api_settings.DEFAULTS)
+        self.cfg = api_settings.apply(copy.deepcopy(DEFAULTS), {**api_settings.DEFAULTS, "service_tier": "default"})
         self.cfg["app"]["db_path"] = str(Path(self.tmp.name) / "test.db")
         self.store = Store(self.cfg["app"]["db_path"])
         self.llm = LLM(self.cfg, self.store)
@@ -72,6 +72,74 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                 {"type": "message", "content": [{"type": "output_text", "text": "完整摘要"}]}],
                 "usage": {"input_tokens": 1000, "output_tokens": 100,
                           "input_tokens_details": {"cached_tokens": 400}}}
+
+    async def test_flex_defaults_save_and_legacy_profile_loading(self):
+        old = {k: v for k, v in api_settings.DEFAULTS.items() if k != "service_tier"}
+        profiles, _ = api_settings.catalog({}, {"api_profiles": {"openai": old}})
+        self.assertEqual(profiles["openai"]["service_tier"], "flex")
+        self.assertEqual(profiles["deepseek"]["service_tier"], "default")
+        self.assertEqual(api_settings.validate({**old, "base_url": "https://custom.invalid/v1"})["service_tier"], "default")
+        path = Path(self.tmp.name) / "prefs.json"
+        for tier in ("flex", "default"):
+            profiles["openai"]["service_tier"] = tier
+            prefs.save({"api_profiles": profiles, "active_api_profile": "openai"}, path)
+            loaded, _ = api_settings.catalog({}, prefs.load_raw(path))
+            self.assertEqual(loaded["openai"]["service_tier"], tier)
+        with self.assertRaises(ValueError):
+            api_settings.validate({"service_tier": "typo"})
+
+    async def test_flex_request_both_protocols_timeout_and_accounting(self):
+        self.cfg["api"]["service_tier"] = "flex"
+        for protocol in ("responses", "chat_completions"):
+            self.llm.llm["protocol"] = protocol
+            for returned in ("flex", "default", ""):
+                value = self.response() if protocol == "responses" else {
+                    "choices": [{"message": {"content": "完整摘要"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1000, "completion_tokens": 100,
+                              "prompt_tokens_details": {"cached_tokens": 400}}}
+                if returned:
+                    value["service_tier"] = returned
+                session = Mock()
+                session.post.return_value = Response(value)
+                with patch.object(self.llm, "session", AsyncMock(return_value=session)):
+                    await self.llm.chat("x", "y", require_complete=True, purpose="摘要总结")
+                sent = session.post.call_args.kwargs
+                self.assertEqual(json.loads(sent["data"])["service_tier"], "flex")
+                self.assertEqual(sent["timeout"].total, 900)
+                self.assertEqual(sent["timeout"].sock_read, 900)
+                row = self.store.api_usage_details()["items"][0]
+                multiplier = 1 if returned == "default" else .5
+                self.assertAlmostEqual(row["cost_usd"], (600 * .1 + 400 * .01 + 100 * .5) / 1000000 * multiplier)
+                self.assertEqual(row["service_tier"], returned)
+                self.assertEqual(json.loads(row["pricing"])["requested_service_tier"], "flex")
+                if not returned:
+                    self.assertIn("按请求Flex估算", row["status"])
+        self.assertAlmostEqual(self.llm.cost_cny(1000, 100), self.llm.cost_cny(1000, 100, service_tier="default") * .5)
+        # 图片请求不启用摘要流式，但同样使用 Flex 等待上限。
+        with patch.object(self.llm, "session", AsyncMock(return_value=session)):
+            await self.llm._post_once({"model": "gpt-6-luna", "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA=="}}]}], "stream": False})
+        self.assertEqual(session.post.call_args.kwargs["timeout"].total, 900)
+
+    async def test_flex_429_backoff_never_falls_back_and_other_providers_unchanged(self):
+        from msgx.llm import RetryableRequestError
+        self.cfg["api"]["service_tier"] = "flex"
+        session = Mock()
+        session.post.return_value = Response({"error": {"code": "resource_unavailable"}}, status=429)
+        with patch.object(self.llm, "session", AsyncMock(return_value=session)), \
+                patch("msgx.llm.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            with self.assertRaises(RetryableRequestError):
+                await self.llm._post({"model": "gpt-6-luna", "messages": [], "max_tokens": 100}, retries=3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
+        self.assertEqual(session.post.call_count, 3)
+        self.assertTrue(all(json.loads(call.kwargs["data"])["service_tier"] == "flex" for call in session.post.call_args_list))
+        self.llm.llm.update(base_url="https://api.deepseek.com", protocol="chat_completions")
+        session.post.reset_mock()
+        session.post.return_value = Response({"choices": []})
+        with patch.object(self.llm, "session", AsyncMock(return_value=session)):
+            await self.llm._post_once({"model": "deepseek-flash", "messages": []})
+        self.assertNotIn("service_tier", json.loads(session.post.call_args.kwargs["data"]))
+        self.assertNotIn("timeout", session.post.call_args.kwargs)
 
     async def test_responses_stream_maps_body_usage_and_price(self):
         session = Mock()

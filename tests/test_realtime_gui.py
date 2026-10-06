@@ -247,7 +247,7 @@ class RealtimeGuiTests(unittest.TestCase):
             app.v_rt_group.set(group_a)
             app._on_rt_group_changed()
             refresh.assert_called_once()
-        self.assertEqual(app._rt_request_key(), (80, False, "1002"))
+        self.assertEqual(app._rt_request_key(), (200, False, "1002"))
         self.assertEqual(app.rt.get_children(), ())
         payload = sample_payload()
         payload["items"] = [row for row in payload["items"] if row["group_id"] == "1002"]
@@ -257,16 +257,16 @@ class RealtimeGuiTests(unittest.TestCase):
         with patch.object(app, "refresh_messages"):
             app.v_rt_filter.set("仅看图片")
             app._on_rt_filter_changed()
-        self.assertEqual(app._rt_request_key(), (80, True, "1002"))
+        self.assertEqual(app._rt_request_key(), (200, True, "1002"))
         with patch.object(app, "refresh_messages"):
             app.rt_activity.selection_set("1003")
             app._on_rt_activity_click()
-        self.assertEqual(app._rt_request_key(), (80, True, "1003"))
+        self.assertEqual(app._rt_request_key(), (200, True, "1003"))
         self.assertEqual(app.v_rt_group.get(), group_b)
         with patch.object(app, "refresh_messages"):
             app.v_rt_group.set("全部群")
             app._on_rt_group_changed()
-        self.assertEqual(app._rt_request_key(), (80, True, ""))
+        self.assertEqual(app._rt_request_key(), (200, True, ""))
 
     def test_stale_filter_or_process_result_never_replaces_current_rows(self):
         self.render()

@@ -83,7 +83,7 @@ class App:
         self.health_busy = False
         # 实时消息页：拉取是否在进行中（避免慢响应时叠请求）、上次用的条数
         self._rt_busy = False
-        self._rt_limit = 80
+        self._rt_limit = 200
         self._rt_rows: dict[str, dict] = {}
         self._rt_actions: set[str] = set()
         self._summary_path = ""
@@ -546,7 +546,7 @@ class App:
             bar, text="自动刷新（每 3 秒）", variable=self.v_rt_auto
         ).grid(row=0, column=0)
         ttk.Button(bar, text="立即刷新", width=9, command=self.refresh_messages).grid(row=0, column=1, padx=6)
-        self.v_rt_limit = tk.StringVar(value="80")
+        self.v_rt_limit = tk.StringVar(value="200")
         ttk.Label(bar, text="显示条数").grid(row=0, column=2, padx=(6, 4))
         ttk.Entry(bar, textvariable=self.v_rt_limit, width=4).grid(row=0, column=3)
         self.v_rt_filter = tk.StringVar(value="全部消息")
@@ -661,6 +661,7 @@ class App:
         self.v_api = {}
         fields = [("provider", "服务平台"), ("base_url", "API 基础地址"), ("model", "模型（摘要及图片）"),
                   ("protocol", "接口格式"), ("reasoning", "思考强度"),
+                  ("service_tier", "OpenAI 服务档位"),
                   ("context_tokens", "上下文 Token 上限"), ("max_output_tokens", "输出 Token 上限"),
                   ("currency", "费率币种"), ("input_price", "输入单价 / 百万 Token"),
                   ("cached_price", "缓存输入单价 / 百万 Token"), ("output_price", "输出单价 / 百万 Token"),
@@ -668,7 +669,8 @@ class App:
                   ("long_input_multiplier", "长输入价格倍数"), ("long_output_multiplier", "长输出价格倍数"),
                   ("peak_multiplier", "高峰价格倍数"), ("peak_windows_utc", "工作日高峰时段（UTC）")]
         choices = {"protocol": ("responses", "chat_completions"), "currency": ("USD", "CNY"),
-                   "reasoning": ("none", "low", "medium", "high", "xhigh", "max")}
+                   "reasoning": ("none", "low", "medium", "high", "xhigh", "max"),
+                   "service_tier": ("flex", "default")}
         for row, (key, title) in enumerate(fields, 1):
             ttk.Label(api, text=title).grid(row=row, column=0, sticky="w", pady=2)
             var = self.v_api[key] = tk.StringVar()
@@ -691,7 +693,9 @@ class App:
         ttk.Button(controls, text="导入配置", command=self.import_api_config).pack(side="left")
         ttk.Button(controls, text="导出配置", command=self.export_api_config).pack(side="left", padx=4)
         ttk.Label(api, text="选择配置即保存切换；编辑参数后点击保存。新任务使用所选 API，在途摘要仍用原配置。\n"
-                  "配置导出不含密钥；不同配置或地址不复用密钥。更换模型请核对容量和费率，汇率为手动估值。",
+                  "配置导出不含密钥；不同配置或地址不复用密钥。更换模型请核对容量和费率，汇率为手动估值。\n"
+                  "官方 OpenAI：flex 为半价慢速，default 为 Standard；单价填写 Standard 基准价，自动按档位折算。\n"
+                  "Flex 最长等待 15 分钟，资源不足会有限重试，不自动切换 Standard；其他平台不发送此参数。",
                   style="Hint.TLabel", wraplength=730).grid(row=row+3, column=0, columnspan=2, sticky="w")
 
         # --- 摘要 ---
@@ -1994,9 +1998,9 @@ class App:
     def _read_rt_limit(self) -> int:
         """在主线程里读控件（Tkinter 变量不能在子线程碰）。"""
         try:
-            return max(1, min(int(self.v_rt_limit.get() or 80), 300))
+            return max(1, min(int(self.v_rt_limit.get() or 200), 300))
         except ValueError:
-            return 80
+            return 200
 
     def _fetch_messages(self, limit: int, images_only: bool = False, group_id: str = "", proc=None) -> None:
         port = int(self.cfg["onebot"]["http_port"])

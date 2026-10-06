@@ -69,7 +69,7 @@ def response(events):
 
 class ChatStreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_official_summary_uses_stream_long_timeout_and_records_usage(self):
-        cfg = api_settings.apply(copy.deepcopy(DEFAULTS), api_settings.DEFAULTS)
+        cfg = api_settings.apply(copy.deepcopy(DEFAULTS), {**api_settings.DEFAULTS, "service_tier": "default"})
         cfg["llm"].update(protocol="chat_completions", credential_store=False)
         store = Store(":memory:")
         self.addCleanup(store.close)

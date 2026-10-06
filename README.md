@@ -88,6 +88,17 @@ py -3.13 -m venv .venv
 上下文、输出上限、费率、长上下文计价规则和汇率也可编辑，换模型时按其文档调整。
 DeepSeek 预填旧 `[llm]` 中的地址、模型、费率及工作日峰谷时段，修改后与 OpenAI 互不覆盖。
 
+v0.8.7 新增「OpenAI 服务档位」：`flex` 为低价慢速，`default` 为 Standard。
+官方 OpenAI 的旧配置没有此字段时默认采用 Flex，已明确保存的选择保持不变；
+Chat Completions 和 Responses 的摘要及手动图片请求均适用，其他平台不发送此参数。
+单价仍填 **Standard 基准价**，无需自行减半：按实际返回档位估算，Flex 自动乘 0.5。
+例如 GPT-6 Luna 短上下文 Flex 输入/缓存输入/输出每百万 Token 为 $0.05/$0.005/$0.25；
+长上下文倍数继续适用。依据：[模型定价](https://developers.openai.com/api/docs/models/gpt-6-luna)、
+[Flex 使用说明](https://developers.openai.com/api/docs/guides/flex-processing)。
+Flex 单次总等待至少 15 分钟，资源不足时有限退避重试，不自动改用 Standard；
+结果未知仍需确认后补生成。未返回服务档位时，账单注明按请求档位估算，历史费用不重算。
+实时消息默认显示 200 条，仍可手动修改条数。
+
 在遮盖输入框粘贴自己的 API Key，点击「保存配置 / 替换密钥」。密钥保存在当前
 Windows 用户的凭据管理器中，保存后输入框清空、只显示已配置状态。
 选择配置会自动保存切换；直接编辑参数后需点击保存。新任务读取最新选择，正在运行的

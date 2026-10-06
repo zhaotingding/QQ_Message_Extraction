@@ -228,7 +228,7 @@ class LLM:
             output_mult = p["long_output_multiplier"] if long else 1
             fx = p["usd_cny"] if p["currency"] == "USD" else 1
             peak_mult = p["peak_multiplier"] if (self.is_peak(ts) if peak is None else peak) else 1
-            tier_mult = {"priority": 2, "fast": 2, "flex": 0.5}.get(service_tier, 1) if urlsplit(p["base_url"]).hostname == "api.openai.com" else 1
+            tier_mult = {"priority": 2, "fast": 2, "flex": 0.5}.get(service_tier or p.get("service_tier", "default"), 1) if urlsplit(p["base_url"]).hostname == "api.openai.com" else 1
             # 缓存写入属于输入的一部分，按写入价替换普通价，不能重复相加。
             return fx * peak_mult * tier_mult / 1_000_000 * ((hit * p["cached_price"]
                                       + (in_tokens - hit - written) * p["input_price"]
@@ -311,7 +311,8 @@ class LLM:
         if tier not in ("default", "priority", "fast", "flex", "scale", "auto", ""):
             tier = "unknown"
         cost = None
-        estimated_tier = tier or ("default" if official else "")
+        requested_tier = self.cfg.get("api", {}).get("service_tier", "default") if official else ""
+        estimated_tier = tier or requested_tier
         if usage is not None and (not official or estimated_tier in ("default", "priority", "fast", "flex")):
             cost = self.cost_cny(int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)),
                                  int(usage.get("prompt_cache_hit_tokens", 0)), ts=started, service_tier=estimated_tier,
@@ -327,7 +328,7 @@ class LLM:
         elif self.cache_write_multiplier(payload["model"]) != 1 and usage.get("prompt_cache_write_tokens") is None:
             status += "，缓存写入用量未返回（按0估算）"
         if official and not tier_returned:
-            status += "，服务等级未返回（按请求Standard估算）"
+            status += f"，服务等级未返回（按请求{'Flex' if requested_tier == 'flex' else 'Standard'}估算）"
         self.store.record_api_call(ts=started, purpose=purpose, source_ids=source_ids or [],
                                    model=payload["model"], usage=usage, cost_cny=cost, status=status, provider=provider,
                                    cost_usd=cost / self.cfg["api"]["usd_cny"] if cost is not None and self.cfg.get("api", {}).get("currency") == "USD" else None,
@@ -335,7 +336,8 @@ class LLM:
                                    pricing={**{key: self.cfg["api"][key] for key in ("currency", "usd_cny", "input_price", "cached_price", "output_price",
                                             "long_context_threshold", "long_input_multiplier", "long_output_multiplier", "peak_multiplier", "peak_windows_utc", "base_url")},
                                             "cache_write_multiplier": self.cache_write_multiplier(payload["model"]),
-                                            "service_tier_source": "response" if tier_returned else "request_default" if official else "unknown"} if "api" in self.cfg else None)
+                                            "requested_service_tier": requested_tier,
+                                            "service_tier_source": "response" if tier_returned else f"request_{requested_tier}" if official else "unknown"} if "api" in self.cfg else None)
         if complete:
             log.info("API 请求成功 · %s · 输入 %s / 输出 %s Token", purpose,
                      (usage or {}).get("prompt_tokens", "未知"), (usage or {}).get("completion_tokens", "未知"))
@@ -473,7 +475,9 @@ class LLM:
                     "LLM 请求失败（第 %d/%d 次，该次耗时 %.1fs）：%s —— 重试",
                     attempt, n, dt, e,
                 )
-                await asyncio.sleep(min(0.6 * attempt, 3.0))
+                flex = (urlsplit(self.llm["base_url"]).hostname == "api.openai.com"
+                        and self.cfg.get("api", {}).get("service_tier") == "flex")
+                await asyncio.sleep(min(2 ** attempt, 30) if flex else min(0.6 * attempt, 3.0))
         raise RetryableRequestError(f"请求失败（已重试 {n} 次）: {last}")
 
     async def _post_once(self, payload: dict) -> dict:
@@ -499,7 +503,7 @@ class LLM:
         if not responses and urlsplit(base).hostname == "api.openai.com" and "max_tokens" in outgoing:
             outgoing["max_completion_tokens"] = outgoing.pop("max_tokens")
         if urlsplit(base).hostname == "api.openai.com":
-            outgoing["service_tier"] = "default"
+            outgoing["service_tier"] = self.cfg.get("api", {}).get("service_tier", "default")
         encoded = json.dumps(outgoing).encode("utf-8")
         paced = len(encoded) > 64 * 1024
         headers = {
@@ -512,7 +516,10 @@ class LLM:
         started = time.monotonic()
         phase, request_id = "连接或发送请求", ""
         options = {}
-        if summary_stream:
+        if outgoing.get("service_tier") == "flex":
+            options["timeout"] = aiohttp.ClientTimeout(
+                total=max(900, float(self.llm.get("timeout_seconds", 90))), connect=30, sock_read=900)
+        elif summary_stream:
             options["timeout"] = aiohttp.ClientTimeout(
                 total=max(600, float(self.llm.get("timeout_seconds", 90))), connect=30, sock_read=180)
 

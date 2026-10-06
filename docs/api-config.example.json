@@ -4,6 +4,7 @@
   "protocol": "responses",
   "model": "gpt-6-luna",
   "reasoning": "none",
+  "service_tier": "flex",
   "context_tokens": 1050000,
   "max_output_tokens": 128000,
   "input_price": 0.1,
