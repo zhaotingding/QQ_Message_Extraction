@@ -84,6 +84,23 @@ def _from_cq_string(s: str, at_ids: set) -> tuple[str, list, bool]:
     return "".join(out), images, at_me
 
 
+def message_links(event: dict) -> tuple[list[str], str]:
+    """独立保留明确的 @ 对象与引用 ID，不依赖被截断的原始事件。"""
+    segments = event.get("message")
+    if isinstance(segments, str):
+        segments = [{"type": m.group(1), "data": _cq_params(m.group(2))} for m in CQ_RE.finditer(segments)]
+    targets, reply = set(), ""
+    for seg in segments if isinstance(segments, list) else []:
+        if not isinstance(seg, dict):
+            continue
+        data = seg.get("data") or {}
+        if seg.get("type") == "at" and str(data.get("qq", "")).isdigit():
+            targets.add(str(data["qq"]))
+        if seg.get("type") == "reply" and not reply:
+            reply = str(data.get("id", ""))
+    return sorted(targets), reply
+
+
 def mentions_all(event: dict) -> bool:
     """按协议标记识别 @全体成员，避免把正文中引用的同名文字误判为群提醒。"""
     segments = event.get("message")
@@ -161,12 +178,7 @@ def parse_onebot_event(event: dict, self_id: str, at_ids: set | None = None) -> 
     text = "".join(text_parts).strip()
     raw_msg = event.get("raw_message") or ""
 
-    reply_to = ""
-    if isinstance(segments, list):
-        for seg in segments:
-            if isinstance(seg, dict) and seg.get("type") == "reply":
-                reply_to = str((seg.get("data") or {}).get("id", ""))
-                break
+    _, reply_to = message_links(event)
 
     sender = event.get("sender") or {}
     sender_name = (

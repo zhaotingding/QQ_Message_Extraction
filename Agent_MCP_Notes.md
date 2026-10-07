@@ -77,6 +77,18 @@
 
 ## 实时群活跃度口径
 
+- **v0.9.0 与我相关**：按当前目标 QQ 的 `sender_id`、协议 @ 对象或同群引用原消息识别，
+  不能用昵称或正文包含账号来猜。排除 `at_all`，相关查询先筛选再 LIMIT，独立于主表图片筛选。
+  历史 `raw` 最多 20000 字且过滤记录可能为空，不能依赖它实时反查；新增 `mentioned_ids` 保存完整明确对象，
+  首次迁移仅恢复可用协议及已有 `at_me` 信息。没有原消息的引用不能凭空关联。
+  2026-10-07 本机 NapCat 源码 `handleMsg` 实际检查每个 adapter 的 `reportSelfMessage`，默认 false；
+  用户目标账号连接也实际为 false。仅支持 `message_sent` 解析不足以收到本人发言，必须开启协议上报。
+  `/OB11Config/SetConfig` 接收 JSON 字符串 `config`，保存并热更新网络连接，不需要退出 QQ。
+  代码、跨群/账号隔离、旧库迁移与零模型调用由 `tests/test_related_messages.py` 模拟验证；
+  证据见 `data/diagnostics/v0.9.0/`，不将模拟输入视为真实 QQ 发言验收。
+  同日已通过管理接口仅开启目标账号本项目连接的上报，读回配置一致且 QQ 在线；
+  证据 `napcat-self-report.json`，变更前备份 `data/backups/v0.9.0/napcat-onebot-before.json`（本地、不入 Git）。
+
 - **v0.8.5 发言人过滤**：替代 v0.8.4 固定管家规则；`filters.blocked_senders` 缺失时默认
   `Q群管家 / 智能客服`，显式空列表必须保留。完整名称匹配，不匹配正文或子串。Q群管家在名单内时，
   同时匹配 2026-10-03 从本地协议核验的账号 `2854196310`；删去该项必须一并停用账号匹配。

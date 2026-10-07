@@ -7,7 +7,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .models import Msg
+from .models import Msg, message_links
 from .prefs import QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME, blocked_senders
 
 SCHEMA = """
@@ -218,6 +218,7 @@ class Store:
 
     def _migrate(self) -> None:
         """幂等补齐老库缺失的列。"""
+        links_missing = "mentioned_ids" not in {c[1] for c in self.conn.execute("PRAGMA table_info(messages)")}
         for table, migs in (
             ("usage", USAGE_MIGRATIONS),
             ("messages", MESSAGE_MIGRATIONS),
@@ -234,6 +235,19 @@ class Store:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
 
         self._migrate_accounts()
+        if links_missing:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN mentioned_ids TEXT NOT NULL DEFAULT '[]'")
+            for row in self.conn.execute("SELECT id,raw,at_me,received_by,reply_to FROM messages").fetchall():
+                try:
+                    event = json.loads(row["raw"] or "{}")
+                    targets, reply = message_links(event if isinstance(event, dict) else {})
+                except ValueError:
+                    targets, reply = [], ""
+                if row["at_me"] and row["received_by"] and row["received_by"] not in targets:
+                    targets.append(row["received_by"])
+                self.conn.execute("UPDATE messages SET mentioned_ids=?,reply_to=? WHERE id=?",
+                                  (json.dumps(targets), row["reply_to"] or reply, row["id"]))
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_reply ON messages(group_id,msg_id,sender_id)")
 
         # 老库里已经处理完的图没有 vision_state。按「有没有语义文本」回填一次，
         # 否则它们会被当成「未尝试」而被无意义地全量重跑。
@@ -450,8 +464,8 @@ class Store:
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO messages"
             "(group_id, msg_id, sender_id, sender_name, ts, msg_type, text,"
-            " has_media, image_urls, media_state, at_me, at_all, reply_to, raw, received_by, include_vision)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " has_media, image_urls, media_state, at_me, at_all, reply_to, raw, received_by, include_vision,mentioned_ids)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 m.group_id,
                 m.msg_id,
@@ -469,6 +483,7 @@ class Store:
                 "" if filtered else json.dumps(m.raw, ensure_ascii=False)[:20000],
                 bot_uin,
                 0,
+                json.dumps(sorted(set(message_links(m.raw)[0]) | ({bot_uin} if m.at_me and bot_uin else set()))),
             ),
         )
         if cur.rowcount == 0:
@@ -642,12 +657,17 @@ class Store:
 
     # ---------- 给界面「实时消息」页 ----------
 
-    def recent_messages(self, limit: int = 60, images_only: bool = False, group_id: str = "") -> list:
+    def recent_messages(self, limit: int = 60, images_only: bool = False, group_id: str = "",
+                        account: str = "", related_only: bool = False) -> list:
         """最近入库的消息（倒序）。带群名与图片处理状态，供界面直接展示。"""
         sender_sql, sender_params = self._sender_condition("m.")
         rows = list(
             self.conn.execute(
-                "SELECT m.id, m.group_id, m.sender_name, m.ts, m.text, m.msg_type,"
+                "SELECT m.id, m.group_id, m.sender_name, m.sender_id, m.ts, m.text, m.msg_type,"
+                " CASE WHEN ?<>'' AND m.sender_id=? THEN 'self'"
+                " WHEN ?<>'' AND m.at_all=0 AND (EXISTS(SELECT 1 FROM json_each(m.mentioned_ids) WHERE value=?)"
+                " OR (m.reply_to<>'' AND EXISTS(SELECT 1 FROM messages parent WHERE parent.group_id=m.group_id"
+                " AND parent.msg_id=m.reply_to AND parent.sender_id=? AND parent.ts<=m.ts))) THEN 'reply' ELSE '' END AS relation,"
                 " m.media_state, m.vision_state, m.ocr_text, m.vision_text, m.media_path,"
                 " m.has_media, m.include_vision, m.at_me,"
                 " m.received_by, (SELECT GROUP_CONCAT(account) FROM message_receipts"
@@ -656,9 +676,11 @@ class Store:
                 " FROM messages m LEFT JOIN groups g ON g.id = m.group_id"
                 " WHERE (?=0 OR EXISTS (SELECT 1 FROM message_images i WHERE i.message_row=m.id))"
                 " AND (?='' OR m.group_id=?)"
+                " AND (?=0 OR (relation<>'' AND m.at_all=0))"
                 f" AND {sender_sql}"
                 " ORDER BY m.ts DESC, m.id DESC LIMIT ?",
-                (int(images_only), group_id, group_id, *sender_params, limit),
+                (account, account, account, account, account, int(images_only), group_id, group_id,
+                 int(related_only), *sender_params, limit),
             )
         )
         result = []

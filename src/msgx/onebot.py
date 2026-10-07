@@ -188,8 +188,11 @@ async def _messages_recent(request: web.Request) -> web.Response:
     images_only = request.query.get("images", "") == "1"
     group_id = request.query.get("group_id", "")
     store = request.app["pipe"].store
-    rows = store.recent_messages(limit, images_only=images_only, group_id=group_id)
+    account = str(getattr(request.app["pipe"], "target_account", "") or getattr(request.app["pipe"], "bot_uin", ""))
+    rows = store.recent_messages(limit, images_only=images_only, group_id=group_id, account=account)
     return web.json_response({"ok": True, "items": [dict(r) for r in rows],
+                              "related": store.recent_messages(limit, group_id=group_id, account=account, related_only=True) if account else [],
+                              "related_account": account,
                               "activity": store.group_activity()})
 
 

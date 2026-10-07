@@ -46,6 +46,7 @@ SUITES = [
     ("手动强制重启与进程隔离", "test_napcat_restart.py"),
     ("界面构建", "test_gui.py"),
     ("界面操作反馈", "test_gui_feedback.py"),
+    ("与我相关的消息", "test_related_messages.py"),
 ]
 
 

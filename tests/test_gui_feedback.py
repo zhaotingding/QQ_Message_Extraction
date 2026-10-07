@@ -44,6 +44,42 @@ class FeedbackTests(unittest.TestCase):
             self.root.tk.call("after", "cancel", callback)
         self.root.destroy()
 
+    def test_custom_icon_persists_as_local_copy(self):
+        from PIL import Image
+        source = Path(self.tmp.name) / "source.png"
+        Image.new("RGBA", (64, 48), "red").save(source)
+        with patch.object(gui.filedialog, "askopenfilename", return_value=str(source)):
+            self.app.choose_app_icon()
+        saved = prefs.load(self.app.prefs_file)
+        icon = Path(saved["ui"]["icon_path"])
+        self.assertTrue(icon.is_file())
+        source.unlink()
+        self.app.prefs = saved
+        self.app._apply_app_icon()
+        self.assertIn("已应用", self.app.v_icon_status.get())
+        with patch.object(gui.filedialog, "askopenfilename", return_value=""):
+            self.app.choose_app_icon()
+        self.assertIn("已取消", self.app.status.get())
+        self.assertTrue(icon.is_file())
+
+    def test_related_tab_red_rows_detail_and_flex_label(self):
+        app = self.app
+        self.assertEqual([app.rt_bottom.tab(i, "text") for i in range(3)], ["群活跃度", "消息详情", "与我相关"])
+        rows = [{"id": 1, "ts": 1, "group_id": "1", "text": "我的正文", "relation": "self"},
+                {"id": 2, "ts": 2, "group_id": "1", "text": "回复正文", "relation": "reply"},
+                {"id": 3, "ts": 3, "group_id": "1", "text": "普通正文"}]
+        app._render_messages(rows)
+        self.assertIn("related", app.rt.item("1", "tags"))
+        self.assertIn("related", app.rt.item("2", "tags"))
+        self.assertNotIn("related", app.rt.item("3", "tags"))
+        app._render_related(rows[:2], "100")
+        app.rt_related.selection_set("2")
+        app._related_selected()
+        self.assertIn("回复正文", app.rt_detail.get("1.0", "end"))
+        app._render_messages(rows)
+        self.assertIn("回复正文", app.rt_detail.get("1.0", "end"))
+        self.assertEqual(app._usage_tier_label({"service_tier": "flex", "pricing": json.dumps({"base_url":"https://api.openai.com/v1"})}), "flex ×0.5")
+
     def test_key_save_pending_success_and_no_replacement(self):
         app = self.app
         app.v_api_key.set(self.key)

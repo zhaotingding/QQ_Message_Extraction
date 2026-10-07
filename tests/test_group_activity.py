@@ -196,7 +196,7 @@ class GroupActivityRouteTests(ActivityFixture, unittest.IsolatedAsyncioTestCase)
             with self.subTest(limit=value):
                 response = await _messages_recent(SimpleNamespace(query={"limit": value}, app={"pipe": pipe}))
                 self.assertEqual(response.status, 200)
-                fake_store.recent_messages.assert_called_with(expected, images_only=False, group_id="")
+                fake_store.recent_messages.assert_called_with(expected, images_only=False, group_id="", account="")
 
 
 if __name__ == "__main__":

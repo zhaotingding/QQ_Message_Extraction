@@ -128,6 +128,7 @@ class App:
         self._group_ids: list[str] = []
         self._build()
         self._load_into_widgets()
+        self._apply_app_icon()
         self.refresh_groups()
         self.root.after(0, self.refresh_report_history)
         self.root.after(100, self._drain)
@@ -601,9 +602,10 @@ class App:
         xsb.grid(row=2, column=0, sticky="ew")
         self.rt.bind("<ButtonRelease-1>", self._on_rt_click)
         self.rt.bind("<<TreeviewSelect>>", self._on_rt_select)
-        # 交替行色便于阅读；被 @ 的消息按普通消息呈现。
+        # 交替行色便于阅读；与我相关的消息使用红字。
         self.rt.tag_configure("odd", background="#f5f7fa")
         self.rt.tag_configure("failed", foreground="#a15c00")
+        self.rt.tag_configure("related", foreground="#c62828")
 
         hint = ttk.Frame(tab)
         hint.grid(row=3, column=0, sticky="ew", pady=(5, 4))
@@ -616,6 +618,25 @@ class App:
         self.rt_details_tab = ttk.Frame(self.rt_bottom)
         self.rt_bottom.add(self.rt_activity_tab, text="群活跃度")
         self.rt_bottom.add(self.rt_details_tab, text="消息详情")
+        self.rt_related_tab = ttk.Frame(self.rt_bottom)
+        self.rt_bottom.add(self.rt_related_tab, text="与我相关")
+        self._rt_related_rows = {}
+        self.v_rt_related = tk.StringVar(value="我发出的 / 单独 @ 我或引用回复我的；排除 @全体成员，双击查看详情")
+        ttk.Label(self.rt_related_tab, textvariable=self.v_rt_related, style="Hint.TLabel").pack(anchor="w")
+        related_wrap = ttk.Frame(self.rt_related_tab)
+        related_wrap.pack(fill="both", expand=True)
+        self.rt_related = ttk.Treeview(related_wrap, columns=("time", "group", "kind", "who", "text"), show="headings", height=5)
+        for key, title, width in (("time", "时间", 130), ("group", "群", 160), ("kind", "关系", 85), ("who", "发言人", 110), ("text", "内容", 400)):
+            self.rt_related.heading(key, text=title)
+            self.rt_related.column(key, width=width, stretch=key == "text")
+        related_scroll = ttk.Scrollbar(related_wrap, command=self.rt_related.yview)
+        related_xscroll = ttk.Scrollbar(related_wrap, orient="horizontal", command=self.rt_related.xview)
+        self.rt_related.configure(yscrollcommand=related_scroll.set, xscrollcommand=related_xscroll.set)
+        related_xscroll.pack(side="bottom", fill="x")
+        related_scroll.pack(side="right", fill="y")
+        self.rt_related.pack(fill="both", expand=True)
+        self.rt_related.bind("<<TreeviewSelect>>", self._related_selected)
+        self.rt_related.bind("<Double-1>", lambda _e: self.rt_bottom.select(self.rt_details_tab))
         self.v_rt_activity_status = tk.StringVar(value="今日未过滤消息累计 · 点击群可筛选消息")
         ttk.Label(self.rt_activity_tab, textvariable=self.v_rt_activity_status,
                   style="Hint.TLabel").pack(anchor="w", pady=3)
@@ -855,6 +876,12 @@ class App:
                  "两种方式都绕不过 UAC 授权弹窗 —— NapCat 要往 QQ 进程注入 DLL，这是管理员操作。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(6, 0))
+
+        appearance = ttk.LabelFrame(tab, text="程序图标", padding=12)
+        appearance.pack(fill="x", pady=(12, 0))
+        ttk.Button(appearance, text="选择图标（PNG / ICO）", command=self.choose_app_icon).pack(side="left")
+        self.v_icon_status = tk.StringVar(value="未指定图标")
+        ttk.Label(appearance, textvariable=self.v_icon_status, style="Hint.TLabel", wraplength=600).pack(side="left", padx=8)
 
         # --- 操作 ---
         ops = ttk.Frame(tab)
@@ -1137,6 +1164,42 @@ class App:
                 return
         self._open_external(self.prefs_file)
 
+    def _apply_app_icon(self) -> None:
+        path = (self.prefs.get("ui") or {}).get("icon_path")
+        if not path:
+            return
+        try:
+            if os.name == "nt":
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("msgx.desktop")
+            self.root.iconbitmap(default=str(path))
+            self.v_icon_status.set("已应用自定义图标；以后启动继续使用")
+        except (OSError, tk.TclError):
+            self.v_icon_status.set("图标加载失败，请重新选择 PNG 或 ICO")
+
+    def choose_app_icon(self) -> None:
+        source = filedialog.askopenfilename(filetypes=[("程序图标", "*.png *.ico")])
+        if not source:
+            self.status.set("已取消选择图标")
+            return
+        try:
+            from PIL import Image
+            path = self.prefs_file.parent / "app-icon.ico"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with Image.open(source) as image:
+                icon = image.convert("RGBA")
+                icon.thumbnail((256, 256))
+                canvas = Image.new("RGBA", (256, 256))
+                canvas.paste(icon, ((256-icon.width)//2, (256-icon.height)//2))
+                canvas.save(path, format="ICO", sizes=[(16,16), (32,32), (48,48), (64,64), (128,128), (256,256)])
+            data = {**self.prefs, "ui": {**self.prefs.get("ui", {}), "icon_path": str(path)}}
+            prefs_mod.save(data, self.prefs_file)
+            self.prefs = data
+            self._apply_app_icon()
+            self.status.set(self.v_icon_status.get() + "；已保存本地副本，不依赖原文件")
+        except (OSError, ValueError):
+            self.status.set("图标保存失败，请检查图片格式和文件权限")
+
     # ---------------- 群列表 ----------------
 
     def refresh_groups(self, prune: bool = False) -> None:
@@ -1278,7 +1341,7 @@ class App:
         columns = ("time", "purpose", "source", "input", "output", "cache", "cost", "state", "today", "api", "usd", "tier", "cache_write")
         self.usage_table = ttk.Treeview(frame, columns=columns, show="headings", height=7)
         for key, label, width in zip(columns, ("时间（北京）", "用途", "消息/任务", "输入", "输出", "缓存读命中", "总金额（元·估算）", "结果", "今日消费（北京·元）", "平台 / 模型", "美元（估算）", "服务层级", "缓存写入"),
-                                   (125, 90, 100, 65, 65, 90, 125, 115, 145, 160, 105, 80, 80)):
+                                   (125, 90, 100, 65, 65, 90, 125, 115, 145, 160, 105, 160, 80)):
             self.usage_table.heading(key, text=label)
             if key in ("input", "output", "cache", "cost", "today", "usd", "cache_write"):
                 self.usage_table.heading(key, command=lambda k=key: self._sort_usage(self.usage_table, k))
@@ -1390,7 +1453,7 @@ class App:
                 f"{row['cost_cny']:.6f}" if row["cost_cny"] is not None else "未知", row["status"],
                 f"{row.get('today_cost_cny', 0):.6f}" if row.get("today_cost_cny", 0) is not None else "未知",
                 f"{row.get('provider') or '历史未记录'} / {row.get('model') or '未知'}",
-                f"{row['cost_usd']:.6f}" if row.get("cost_usd") is not None else "未知", row.get("service_tier") or "未记录",
+                f"{row['cost_usd']:.6f}" if row.get("cost_usd") is not None else "未知", self._usage_tier_label(row),
                 row["cache_write_tokens"] if row.get("cache_write_tokens") is not None else "未知"))
             self._usage_numbers[self.usage_table][iid] = dict(input=row["in_tokens"], output=row["out_tokens"],
                                                              cache=row["cache_hit_tokens"], cost=row["cost_cny"], today=row.get("today_cost_cny", 0), usd=row.get("cost_usd"),
@@ -1429,6 +1492,15 @@ class App:
             label = tree.heading(column, "text").removesuffix(" ▼").removesuffix(" ▲")
             tree.heading(column, text=label + ((" ▼" if descending else " ▲") if column == key else ""))
 
+    @staticmethod
+    def _usage_tier_label(row: dict) -> str:
+        pricing = json.loads(row.get("pricing") or "{}")
+        tier = row.get("service_tier") or pricing.get("requested_service_tier") or ""
+        multiplier = {"default": 1, "flex": .5, "fast": 2, "priority": 2}.get(tier)
+        if pricing.get("base_url", "").rstrip("/") == "https://api.openai.com/v1" and multiplier is not None:
+            return f"{tier} ×{multiplier:g}" + ("（按请求估算）" if not row.get("service_tier") else "")
+        return tier or "未记录"
+
     def _usage_selected(self, _event=None) -> None:
         selection = self.usage_table.selection()
         if not selection:
@@ -1439,6 +1511,10 @@ class App:
         self.usage_detail.configure(state="normal")
         self.usage_detail.delete("1.0", "end")
         self.usage_detail.insert("end", f"{row['purpose']} · {row['source_type']} · {row.get('provider') or '历史平台未记录'} · 模型 {row['model']}\n正在读取关联消息…")
+        pricing = json.loads(row.get("pricing") or "{}")
+        if pricing:
+            self.usage_detail.insert("1.end", f" · {self._usage_tier_label(row)} · 基准单价/百万Token："
+                                     f"输入 {pricing.get('input_price', '未知')} / 缓存 {pricing.get('cached_price', '未知')} / 输出 {pricing.get('output_price', '未知')} {pricing.get('currency', '')}；金额已按档位折算")
         self.usage_detail.configure(state="disabled")
         port = int(self.cfg["onebot"]["http_port"])
         def work() -> None:
@@ -2096,7 +2172,37 @@ class App:
             return
         if payload is not None:
             self._render_activity(payload.get("activity") or {})
+            self._render_related(payload.get("related") or [], payload.get("related_account") or "")
+        else:
+            self.v_rt_related.set("与我相关的消息刷新失败；保留上次结果")
         self._render_messages(payload.get("items") if payload else None)
+
+    def _render_related(self, rows: list, account: str) -> None:
+        selected = self.rt_related.selection()
+        self._rt_related_rows = {str(row["id"]): row for row in rows}
+        self.rt_related.delete(*self.rt_related.get_children())
+        for iid, row in self._rt_related_rows.items():
+            ocr = " / ".join(image.get("ocr_text") or "" for image in row.get("images", [])).strip(" / ")
+            body = " ".join((row.get("text", "") + (" OCR:" + ocr if ocr else "")).split())
+            self.rt_related.insert("", "end", iid=iid, values=(
+                datetime.fromtimestamp(row["ts"], BEIJING).strftime("%m-%d %H:%M:%S"),
+                row.get("group_name") or row.get("group_id"), "我发出的" if row.get("relation") == "self" else "回复我的",
+                row.get("sender_name", ""), body[:300]))
+        if selected and self.rt_related.exists(selected[0]):
+            self.rt_related.selection_set(selected[0])
+        self.v_rt_related.set((f"QQ {account} · 最近 {len(rows)} 条 · 随群筛选；排除 @全体成员，双击查看详情"
+                               if account else "尚未确定当前 QQ 账号，请先启动并连接服务"))
+
+    def _related_selected(self, _event=None) -> None:
+        selected = self.rt_related.selection()
+        row = self._rt_related_rows.get(selected[0]) if selected else None
+        if row:
+            self.rt.selection_remove(*self.rt.selection())
+            detail = dict(row)
+            if row.get("images"):
+                detail["ocr_text"] = "\n".join(image.get("ocr_text") or "" for image in row["images"])
+                detail["vision_text"] = "\n".join(image.get("vision_text") or "" for image in row["images"])
+            self._show_message_detail(detail)
 
     def _render_activity(self, activity: dict) -> None:
         groups = activity.get("groups") or []
@@ -2169,6 +2275,8 @@ class App:
                 tags.append("odd")
             if state == "图片未识别":
                 tags.append("failed")
+            if r.get("relation") in ("self", "reply"):
+                tags.append("related")
             self.rt.insert(
                 "",
                 "end",
@@ -2194,6 +2302,13 @@ class App:
     def _on_rt_select(self, _event=None) -> None:
         selection = self.rt.selection()
         row = self._rt_rows.get(str(selection[0])) if selection else None
+        if row:
+            self.rt_related.selection_remove(*self.rt_related.selection())
+        elif self.rt_related.selection():
+            return
+        self._show_message_detail(row)
+
+    def _show_message_detail(self, row) -> None:
         detail = ""
         if row:
             detail = f"消息正文：\n{row.get('text') or '（无文本）'}"
