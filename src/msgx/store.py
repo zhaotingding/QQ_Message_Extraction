@@ -666,7 +666,7 @@ class Store:
                 "SELECT m.id, m.group_id, m.sender_name, m.sender_id, m.ts, m.text, m.msg_type,"
                 " CASE WHEN ?<>'' AND m.sender_id=? THEN 'self'"
                 " WHEN ?<>'' AND m.at_all=0 AND (EXISTS(SELECT 1 FROM json_each(m.mentioned_ids) WHERE value=?)"
-                " OR (m.reply_to<>'' AND EXISTS(SELECT 1 FROM messages parent WHERE parent.group_id=m.group_id"
+                " OR (m.reply_to<>'' AND EXISTS(SELECT 1 FROM messages parent INDEXED BY idx_msg_reply WHERE parent.group_id=m.group_id"
                 " AND parent.msg_id=m.reply_to AND parent.sender_id=? AND parent.ts<=m.ts))) THEN 'reply' ELSE '' END AS relation,"
                 " m.media_state, m.vision_state, m.ocr_text, m.vision_text, m.media_path,"
                 " m.has_media, m.include_vision, m.at_me,"

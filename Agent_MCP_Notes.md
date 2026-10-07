@@ -88,6 +88,13 @@
   证据见 `data/diagnostics/v0.9.0/`，不将模拟输入视为真实 QQ 发言验收。
   同日已通过管理接口仅开启目标账号本项目连接的上报，读回配置一致且 QQ 在线；
   证据 `napcat-self-report.json`，变更前备份 `data/backups/v0.9.0/napcat-onebot-before.json`（本地、不入 Git）。
+- **v0.9.1 推翻 v0.9.0 小库回归的性能结论**：用户实际库 133338 条，引用关联被 SQLite 规划为
+  `idx_msg_group_ts (group_id=? AND ts<?)`，单次相关列表只读查询 10 秒仍未完成，阻塞同一事件循环上的接收与健康接口。
+  显式使用 `idx_msg_reply` 后同库查询 0.276 秒；`tests/test_related_messages.py` 以 13.5 万条、稀疏相关消息和
+  SQLite VM 指令预算覆盖退化。不得仅以几条合成消息证明该界面可用。
+  2026-10-07 实际只读验证，`data/diagnostics/v0.9.1/readonly-query.json`。
+  GUI 强制重启补充接收服务重建；Windows venv 启动器 PID 与实际 Python 服务 PID 不同，
+  必须回收持有的 Popen 进程树，不能只 terminate 启动器，也不能按 Python 名称全杀。进程处置仅模拟验证。
 
 - **v0.8.5 发言人过滤**：替代 v0.8.4 固定管家规则；`filters.blocked_senders` 缺失时默认
   `Q群管家 / 智能客服`，显式空列表必须保留。完整名称匹配，不匹配正文或子串。Q群管家在名单内时，

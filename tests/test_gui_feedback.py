@@ -37,12 +37,85 @@ class FeedbackTests(unittest.TestCase):
                 setup.enter_context(patch.object(gui.App, method))
             self.app = gui.App(self.root)
         self.app.prefs_file = Path(self.tmp.name) / "prefs.json"
+        self.app.stop_file = Path(self.tmp.name) / "stop.signal"
+        self.patches.enter_context(patch.object(self.app, "_trace_gui"))
         self.key = "sk-feedback-SYNTHETIC-NOT-REAL-123456789"
 
     def close_root(self):
         for callback in self.root.tk.call("after", "info"):
             self.root.tk.call("after", "cancel", callback)
         self.root.destroy()
+
+    def test_forced_restart_recovers_receiver_before_restarting_qq(self):
+        app = self.app
+        old, new = Mock(stdout=None), Mock(stdout=None)
+        old.poll.return_value = None
+        new.poll.return_value = None
+        app.proc = old
+        cfg = {**app.cfg, "napcat": {"account": "100"}}
+        order = []
+        def stop(proc):
+            self.assertIs(proc, old)
+            old.poll.return_value = 0
+            old.returncode = 0
+            order.append("stop")
+        def start():
+            app.proc = new
+            order.append("start")
+            return True
+        with patch.object(gui.messagebox, "askyesno", return_value=True), \
+                patch.object(app, "_login_config", return_value=cfg), \
+                patch.object(app, "_wait_receiver_ready", side_effect=[False, True]), \
+                patch.object(app, "_stop_unresponsive_receiver", side_effect=stop), \
+                patch.object(app, "start_service", side_effect=start), \
+                patch.object(gui.napcat_mod, "restart_target", side_effect=lambda c: order.append("qq") or {"ok":False,"note":"扫码待验证"}), \
+                patch.object(gui.threading, "Thread") as thread:
+            app.restart_napcat()
+            thread.call_args.kwargs["target"]()
+            while not app.events.empty():
+                app._dispatch_event(*app.events.get_nowait())
+            self.assertEqual(order, ["stop", "start"])
+            thread.call_args.kwargs["target"]()
+            while not app.events.empty():
+                app._dispatch_event(*app.events.get_nowait())
+            self.assertEqual(order, ["stop", "start", "qq"])
+            self.assertFalse(app._login_busy)
+
+    def test_receiver_force_stop_only_targets_owned_tree_and_cancel_prevents_restart(self):
+        app = self.app
+        proc = Mock(pid=12345, stdout=None)
+        proc.poll.return_value = None
+        proc.wait.side_effect = [gui.subprocess.TimeoutExpired("test", 5), 0]
+        app.proc = proc
+        app._restart_cancelled = False
+        with patch.object(gui.subprocess, "run") as run, patch.object(gui.os, "name", "nt"):
+            app._stop_unresponsive_receiver(proc)
+            self.assertEqual(run.call_args.args[0], ["taskkill", "/PID", "12345", "/T", "/F"])
+            run.reset_mock()
+            app.proc = Mock()
+            app._stop_unresponsive_receiver(proc)
+            run.assert_not_called()
+        app.proc = proc
+        app._restart_cancelled = True
+        with patch.object(app, "start_service") as start:
+            app._dispatch_event("receiver_recovered", (proc, app.cfg))
+            start.assert_not_called()
+
+    def test_rebuilt_receiver_failure_does_not_loop_or_restart_qq(self):
+        app = self.app
+        app.proc = Mock()
+        app._restart_cancelled = False
+        with patch.object(app, "_wait_receiver_ready", return_value=False), \
+                patch.object(app, "_stop_unresponsive_receiver") as stop, \
+                patch.object(gui.napcat_mod, "restart_target") as restart, \
+                patch.object(gui.threading, "Thread") as thread:
+            app._restart_with_receiver(app.cfg, recover=False)
+            thread.call_args.kwargs["target"]()
+            kind, result = app.events.get_nowait()
+            self.assertEqual(kind, "login_done")
+            self.assertFalse(result["ok"])
+            stop.assert_not_called()
+            restart.assert_not_called()
 
     def test_custom_icon_persists_as_local_copy(self):
         from PIL import Image

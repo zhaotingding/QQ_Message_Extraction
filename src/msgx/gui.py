@@ -2043,6 +2043,7 @@ class App:
         return True
 
     def stop_service(self) -> None:
+        self._restart_cancelled = True
         if self.proc is None:
             return
         try:
@@ -2609,11 +2610,13 @@ class App:
             return
         account = cfg["napcat"]["account"]
         if not messagebox.askyesno("强制重启协议端", f"退出目标 QQ {account} 的 NapCat 进程并重新扫码。\n"
-                                  "消息接收服务未运行时会先启动；不结束普通 QQ，不删除历史数据。\n"
+                                  "先恢复接收服务；无响应时会结束本程序的服务进程并重建。\n"
+                                  "不结束普通 QQ，不删除历史数据。\n"
                                   "可能需要一次 UAC 授权。继续吗？", parent=self.root):
             self.status.set("已取消强制重启，进程保持原状")
             return
         self._login_busy = True
+        self._restart_cancelled = False
         self._login_verify_since = time.time()
         self._login_account = account
         self._login_pending = False
@@ -2632,17 +2635,50 @@ class App:
         if self.proc is None and not self.start_service():
             self._login_finished({"ok": False, "note": "消息服务未能启动，未重启协议端；请检查设置和服务日志"})
             return
-        proc = self.proc
+        self._restart_with_receiver(cfg)
 
+    def _restart_with_receiver(self, cfg: dict, recover: bool = True) -> None:
+        proc = self.proc
         def work() -> None:
             if not self._wait_receiver_ready(proc, cfg):
+                if recover and not self.closing and not self._restart_cancelled:
+                    self.events.put(("note", "接收服务未响应，正在停止旧服务并重建…"))
+                    try:
+                        self._stop_unresponsive_receiver(proc)
+                    except (OSError, subprocess.SubprocessError) as exc:
+                        self.events.put(("login_done", {"ok": False, "note": "旧接收服务未能退出，未重启协议端：" + type(exc).__name__}))
+                        return
+                    self.events.put(("receiver_recovered", (proc, cfg)))
+                    return
                 self.events.put(("login_done", {"ok": False, "note": "消息接收服务未就绪或已停止，未重启协议端；请查看服务日志"}))
+                return
+            if self.closing or self._restart_cancelled:
+                self.events.put(("login_done", {"ok": False, "note": "已取消强制重启"}))
                 return
             self.events.put(("note", "消息接收服务已就绪，正在退出目标 NapCat 并请求新二维码；如有 UAC 请允许…"))
             result = napcat_mod.restart_target(cfg)
             self.events.put(("login_done", result))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _stop_unresponsive_receiver(self, proc) -> None:
+        """仅回收本窗口持有的服务进程；Windows venv 启动器还带有 Python 子进程。"""
+        if proc is None or proc.poll() is not None or proc is not self.proc:
+            return
+        self.stop_file.touch()
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        if self.closing or self._restart_cancelled or proc is not self.proc or proc.poll() is not None:
+            return
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=10, creationflags=CREATE_NO_WINDOW)
+        else:
+            proc.kill()
+        proc.wait(timeout=5)
 
     def _wait_receiver_ready(self, proc, cfg: dict, timeout: float = 30) -> bool:
         """工作线程就绪门禁，只访问本机；失败时不动协议端。"""
@@ -2940,6 +2976,17 @@ class App:
             self._render_report_history(*value)
         elif kind == "login_done":
             self._login_finished(value)
+        elif kind == "receiver_recovered":
+            proc, cfg = value
+            if self.closing or self._restart_cancelled or self.proc not in (None, proc):
+                self._login_finished({"ok": False, "note": "已取消强制重启，接收服务状态已变化"})
+                return
+            if self.proc is proc and proc is not None:
+                self._dispatch_event("exit", (proc, proc.returncode))
+            if not self.start_service():
+                self._login_finished({"ok": False, "note": "接收服务重建失败，未重启协议端；请查看服务日志"})
+                return
+            self._restart_with_receiver(cfg, recover=False)
         elif kind == "usage":
             self._render_usage(value)
         elif kind == "usage_sources":

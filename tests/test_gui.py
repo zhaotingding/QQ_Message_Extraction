@@ -1047,6 +1047,7 @@ app.proc = _receiver
 with patch.object(_mb, "askyesno", return_value=True), \
         patch.object(app, "start_service") as _start, \
         patch.object(app, "_wait_receiver_ready", return_value=False), \
+        patch.object(app, "_stop_unresponsive_receiver", side_effect=OSError("测试旧进程无法退出")), \
         patch.object(N, "restart_target") as _restart, \
         patch("msgx.gui.threading.Thread") as _thread, patch.object(app.events, "put") as _put:
     app.restart_napcat()

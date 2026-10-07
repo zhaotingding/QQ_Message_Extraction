@@ -59,6 +59,26 @@ class RelatedTests(unittest.IsolatedAsyncioTestCase):
             {"type":"at","data":{"qq":"all"}}, {"type":"reply","data":{"id":12}}]})
         self.assertEqual((targets, reply), (["100"], "12"))
 
+    def test_sparse_related_messages_in_large_group_have_bounded_query_work(self):
+        own = self.add(sender="100", ident="original")
+        reply = self.add(segments="[CQ:reply,id=original]引用回答")
+        # 大群历史远多于相关消息；不存在的引用必须按消息 ID 查找，不能扫描整段群历史。
+        self.store.conn.executemany(
+            "INSERT INTO messages(group_id,msg_id,sender_id,ts,reply_to) VALUES('1',?,'200',?,?)",
+            ((f"bulk-{i}", 2000+i, "missing" if i % 10 == 0 else "") for i in range(135000)))
+        self.store.conn.commit()
+        steps = 0
+        def budget():
+            nonlocal steps
+            steps += 10000
+            return steps > 20000000
+        self.store.conn.set_progress_handler(budget, 10000)
+        try:
+            rows = self.store.recent_messages(200, account="100", related_only=True)
+            self.assertEqual([r["id"] for r in rows], [reply, own])
+        finally:
+            self.store.conn.set_progress_handler(None, 0)
+
     async def test_own_sent_event_and_quote_enter_pipeline_without_llm(self):
         with tempfile.TemporaryDirectory() as directory:
             cfg = copy.deepcopy(DEFAULTS)
