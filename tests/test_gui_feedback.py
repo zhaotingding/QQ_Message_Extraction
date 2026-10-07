@@ -135,6 +135,40 @@ class FeedbackTests(unittest.TestCase):
         self.assertIn("已取消", self.app.status.get())
         self.assertTrue(icon.is_file())
 
+    def test_ico_import_keeps_original_bytes_and_authored_small_frames(self):
+        from PIL import Image
+        source = Path(self.tmp.name) / "authored.ico"
+        sizes = [(s, s) for s in (16, 20, 24, 32, 40, 48, 64, 128, 256)]
+        frames = [Image.new("RGBA", size, (index*20, 50, 200, 255)) for index, size in enumerate(sizes)]
+        frames[-1].save(source, sizes=sizes, append_images=frames[:-1])
+        original = source.read_bytes()
+        with patch.object(gui.filedialog, "askopenfilename", return_value=str(source)):
+            self.app.choose_app_icon()
+        target = Path(self.app.prefs["ui"]["icon_path"])
+        self.assertEqual(target.read_bytes(), original)
+        with Image.open(target) as icon:
+            self.assertEqual(icon.ico.sizes(), set(sizes))
+            self.assertEqual(icon.ico.getimage((24, 24)).getpixel((0, 0)), (40, 50, 200, 255))
+        # 再选已保存的图标也不能破坏它。
+        with patch.object(gui.filedialog, "askopenfilename", return_value=str(target)):
+            self.app.choose_app_icon()
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_png_frames_are_resampled_from_original(self):
+        from PIL import Image, ImageDraw
+        source = Path(self.tmp.name) / "sharp.png"
+        original = Image.new("RGBA", (1024, 1024))
+        draw = ImageDraw.Draw(original)
+        for offset in range(0, 1024, 7):
+            draw.line((offset, 0, 0, offset), fill=(0, 120, 255, 255), width=3)
+        original.save(source)
+        with patch.object(gui.filedialog, "askopenfilename", return_value=str(source)):
+            self.app.choose_app_icon()
+        with Image.open(self.app.prefs["ui"]["icon_path"]) as icon:
+            for side in (16, 20, 24, 32, 40, 48, 64, 128, 256):
+                expected = original.resize((side, side), Image.Resampling.LANCZOS)
+                self.assertEqual(icon.ico.getimage((side, side)).tobytes(), expected.tobytes())
+
     def test_related_tab_red_rows_detail_and_flex_label(self):
         app = self.app
         self.assertEqual([app.rt_bottom.tab(i, "text") for i in range(3)], ["群活跃度", "消息详情", "与我相关"])

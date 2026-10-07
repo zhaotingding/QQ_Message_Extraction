@@ -1183,15 +1183,27 @@ class App:
             self.status.set("已取消选择图标")
             return
         try:
+            from io import BytesIO
             from PIL import Image
             path = self.prefs_file.parent / "app-icon.ico"
             path.parent.mkdir(parents=True, exist_ok=True)
             with Image.open(source) as image:
-                icon = image.convert("RGBA")
-                icon.thumbnail((256, 256))
-                canvas = Image.new("RGBA", (256, 256))
-                canvas.paste(icon, ((256-icon.width)//2, (256-icon.height)//2))
-                canvas.save(path, format="ICO", sizes=[(16,16), (32,32), (48,48), (64,64), (128,128), (256,256)])
+                if image.format == "ICO":
+                    image.load()
+                    payload = Path(source).read_bytes()  # 保留作者提供的全部尺寸，不重新编码。
+                elif image.format == "PNG":
+                    icon = image.convert("RGBA")
+                    side = max(icon.size)
+                    canvas = Image.new("RGBA", (side, side))
+                    canvas.paste(icon, ((side-icon.width)//2, (side-icon.height)//2))
+                    sizes = [(s, s) for s in (16, 20, 24, 32, 40, 48, 64, 128, 256)]
+                    frames = [canvas.resize(size, Image.Resampling.LANCZOS) for size in sizes]
+                    output = BytesIO()
+                    frames[-1].save(output, format="ICO", sizes=sizes, append_images=frames[:-1])
+                    payload = output.getvalue()
+                else:
+                    raise ValueError("请选择 PNG 或 ICO")
+            path.write_bytes(payload)
             data = {**self.prefs, "ui": {**self.prefs.get("ui", {}), "icon_path": str(path)}}
             prefs_mod.save(data, self.prefs_file)
             self.prefs = data
