@@ -1169,10 +1169,15 @@ class App:
         if not path:
             return
         try:
+            from PIL import Image, ImageTk
             if os.name == "nt":
                 import ctypes
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("msgx.desktop")
-            self.root.iconbitmap(default=str(path))
+            # 显式设置当前窗口的各尺寸像素，避免文件图标加载路径重新缩放小帧。
+            with Image.open(path) as icon:
+                frames = [icon.ico.getimage(size).convert("RGBA") for size in sorted(icon.ico.sizes())]
+            self._icon_photos = [ImageTk.PhotoImage(frame, master=self.root) for frame in frames]
+            self.root.iconphoto(False, *self._icon_photos)
             self.v_icon_status.set("已应用自定义图标；以后启动继续使用")
         except (OSError, tk.TclError):
             self.v_icon_status.set("图标加载失败，请重新选择 PNG 或 ICO")
