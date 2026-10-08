@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import Msg, message_links
+from .message_keywords import matching_fields
 from .prefs import QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME, blocked_senders
 
 SCHEMA = """
@@ -188,9 +189,13 @@ VISION_MAX_TRIES = 3
 
 
 class Store:
-    def __init__(self, db_path: str | Path, *, filters: dict | None = None):
+    def __init__(self, db_path: str | Path, *, filters: dict | None = None, readonly: bool = False):
         self.filters = filters if filters is not None else {}
         p = Path(db_path)
+        if readonly:
+            self.conn = sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+            self.conn.row_factory = sqlite3.Row
+            return
         p.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(p), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
@@ -658,8 +663,18 @@ class Store:
     # ---------- 给界面「实时消息」页 ----------
 
     def recent_messages(self, limit: int = 60, images_only: bool = False, group_id: str = "",
-                        account: str = "", related_only: bool = False) -> list:
+                        account: str = "", related_only: bool = False,
+                        keyword_rules: tuple | None = None, offset: int = 0) -> list:
         """最近入库的消息（倒序）。带群名与图片处理状态，供界面直接展示。"""
+        keyword_sql = ""
+        if keyword_rules is not None:
+            if not keyword_rules:
+                return []
+            self.conn.create_function("keyword_match", 3,
+                                      lambda text, ocr, vision: bool(matching_fields(keyword_rules, text, ocr, vision)))
+            keyword_sql = (" AND (keyword_match(m.text,m.ocr_text,m.vision_text) OR EXISTS"
+                           " (SELECT 1 FROM message_images i WHERE i.message_row=m.id"
+                           " AND keyword_match('',i.ocr_text,i.vision_text)))")
         sender_sql, sender_params = self._sender_condition("m.")
         rows = list(
             self.conn.execute(
@@ -678,9 +693,9 @@ class Store:
                 " AND (?='' OR m.group_id=?)"
                 " AND (?=0 OR (relation<>'' AND m.at_all=0))"
                 f" AND {sender_sql}"
-                " ORDER BY m.ts DESC, m.id DESC LIMIT ?",
+                + keyword_sql + " ORDER BY m.ts DESC, m.id DESC LIMIT ? OFFSET ?",
                 (account, account, account, account, account, int(images_only), group_id, group_id,
-                 int(related_only), *sender_params, limit),
+                 int(related_only), *sender_params, limit, offset),
             )
         )
         result = []

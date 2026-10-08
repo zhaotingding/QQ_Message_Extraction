@@ -37,6 +37,8 @@ from . import api_settings, credentials, security, summary_review
 from .config import ROOT, abs_path, load
 from .summarize import BEIJING, DEFAULT_DIGEST_PROMPT, DIGEST_DEFAULT_CHARS, summary_chars
 from .usage_chart import daily_series, day_description, draw_daily_costs
+from .message_keywords import compile_rules, matching_message
+from .store import Store
 
 APP_TITLE = "消息萃取 msgx"
 FONT = "Microsoft YaHei UI"
@@ -131,6 +133,7 @@ class App:
         self._apply_app_icon()
         self.refresh_groups()
         self.root.after(0, self.refresh_report_history)
+        self.root.after(0, self._refresh_keyword_messages)
         self.root.after(100, self._drain)
         self.root.after(800, self._tick_health)
         self.root.after(1200, self._tick_realtime)
@@ -603,6 +606,7 @@ class App:
         self.rt.bind("<ButtonRelease-1>", self._on_rt_click)
         self.rt.bind("<<TreeviewSelect>>", self._on_rt_select)
         # 交替行色便于阅读；与我相关的消息使用红字。
+        self.rt.tag_configure("keyword", background="#fff2a8")
         self.rt.tag_configure("odd", background="#f5f7fa")
         self.rt.tag_configure("failed", foreground="#a15c00")
         self.rt.tag_configure("related", foreground="#c62828")
@@ -637,6 +641,39 @@ class App:
         self.rt_related.pack(fill="both", expand=True)
         self.rt_related.bind("<<TreeviewSelect>>", self._related_selected)
         self.rt_related.bind("<Double-1>", lambda _e: self.rt_bottom.select(self.rt_details_tab))
+        self._rt_keyword_rules = ()
+        self._rt_keyword_rows = {}
+        self._rt_source_rows = []
+        self._rt_keyword_busy = False
+        self._rt_keyword_offset = 0
+        self.rt_keyword_tab = ttk.Frame(self.rt_bottom)
+        self.rt_bottom.add(self.rt_keyword_tab, text="关键词消息")
+        keyword_bar = ttk.Frame(self.rt_keyword_tab)
+        keyword_bar.pack(fill="x")
+        ttk.Label(keyword_bar, text="关键信息").pack(side="left")
+        ttk.Button(keyword_bar, text="配置关键词", command=self._configure_message_keywords).pack(side="left", padx=6)
+        self.v_rt_keywords = tk.StringVar(value="尚未配置关键词；点击配置关键词添加，支持正则表达式")
+        ttk.Label(keyword_bar, textvariable=self.v_rt_keywords, style="Hint.TLabel").pack(side="left", padx=6)
+        self.btn_keyword_next = ttk.Button(keyword_bar, text="下一页", command=lambda: self._keyword_page(1), state="disabled")
+        self.btn_keyword_next.pack(side="right")
+        self.btn_keyword_prev = ttk.Button(keyword_bar, text="上一页", command=lambda: self._keyword_page(-1), state="disabled")
+        self.btn_keyword_prev.pack(side="right", padx=6)
+        keyword_wrap = ttk.Frame(self.rt_keyword_tab)
+        keyword_wrap.pack(fill="both", expand=True)
+        self.rt_keywords = ttk.Treeview(keyword_wrap, columns=("time", "group", "who", "rules", "text"), show="headings", height=5)
+        for key, title, width in (("time", "时间", 130), ("group", "群", 160), ("who", "发言人", 110),
+                                  ("rules", "命中规则", 180), ("text", "内容", 400)):
+            self.rt_keywords.heading(key, text=title)
+            self.rt_keywords.column(key, width=width, stretch=key == "text")
+        keyword_scroll = ttk.Scrollbar(keyword_wrap, command=self.rt_keywords.yview)
+        keyword_xscroll = ttk.Scrollbar(keyword_wrap, orient="horizontal", command=self.rt_keywords.xview)
+        self.rt_keywords.configure(yscrollcommand=keyword_scroll.set, xscrollcommand=keyword_xscroll.set)
+        keyword_xscroll.pack(side="bottom", fill="x")
+        keyword_scroll.pack(side="right", fill="y")
+        self.rt_keywords.pack(fill="both", expand=True)
+        self.rt_keywords.tag_configure("keyword", background="#fff2a8")
+        self.rt_keywords.bind("<<TreeviewSelect>>", self._keyword_selected)
+        self.rt_keywords.bind("<Double-1>", lambda _e: self.rt_bottom.select(self.rt_details_tab))
         self.v_rt_activity_status = tk.StringVar(value="今日未过滤消息累计 · 点击群可筛选消息")
         ttk.Label(self.rt_activity_tab, textvariable=self.v_rt_activity_status,
                   style="Hint.TLabel").pack(anchor="w", pady=3)
@@ -965,6 +1002,11 @@ class App:
                 )
             )
         )
+        self._rt_keyword_rules = ()
+        try:
+            self._rt_keyword_rules = compile_rules(p.get("message_keywords") or [])
+        except ValueError as exc:
+            self.v_rt_keywords.set(f"关键词配置有误：{exc}；请重新配置")
         saved = {str(g) for g in (p.get("groups") or [])}
         for i, gid in enumerate(self._group_ids):
             if gid in saved:
@@ -2126,6 +2168,7 @@ class App:
         return "完成"
 
     def refresh_messages(self) -> None:
+        self._refresh_keyword_messages()
         if self.proc is None:
             self.status.set("服务未运行 —— 启动服务后才能看到实时消息")
             self.v_rt_status.set("服务未运行，请先启动服务")
@@ -2143,8 +2186,10 @@ class App:
         return self._read_rt_limit(), self.v_rt_filter.get() == "仅看图片", self._rt_group_id
 
     def _on_rt_filter_changed(self, _event=None) -> None:
+        self._rt_keyword_offset = 0
         self._render_messages([])
         self.v_rt_status.set("正在读取筛选结果…")
+        self._refresh_keyword_messages()
         self.refresh_messages()
 
     def _on_rt_group_changed(self, _event=None) -> None:
@@ -2195,6 +2240,127 @@ class App:
             self.v_rt_related.set("与我相关的消息刷新失败；保留上次结果")
         self._render_messages(payload.get("items") if payload else None)
 
+    def _configure_message_keywords(self) -> None:
+        existing = getattr(self, "keyword_window", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            return
+        window = self.keyword_window = tk.Toplevel(self.root)
+        window.title("配置关键词消息")
+        window.transient(self.root)
+        window.geometry("660x430")
+        frame = ttk.Frame(window, padding=14)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="每行一条：普通文字按关键词匹配；以 re: 开头表示正则表达式。\n"
+                  "例如：Codex    或    re:额度|限流    或    re:价格\\s*[:：]\\s*\\d+\n"
+                  "匹配正文、已有 OCR 和图片语义，忽略英文大小写；不消耗 Token。",
+                  font=(FONT, 10)).pack(anchor="w", pady=(0, 8))
+        editor = ScrolledText(frame, wrap="none", font=(FONT, 10), height=9)
+        editor.pack(fill="both", expand=True)
+        editor.insert("1.0", "\n".join(self.prefs.get("message_keywords") or []))
+        feedback = tk.StringVar(value="保存后立即生效；清空列表并保存可关闭匹配。")
+        ttk.Label(frame, textvariable=feedback, wraplength=615).pack(anchor="w", pady=8)
+        actions = ttk.Frame(frame)
+        actions.pack(fill="x")
+
+        def save() -> None:
+            try:
+                rules = compile_rules(editor.get("1.0", "end-1c").splitlines())
+                data = {**self.prefs, "message_keywords": [label for label, _pattern in rules]}
+                prefs_mod.save(data, self.prefs_file)
+            except (ValueError, OSError) as exc:
+                feedback.set(f"保存失败：{exc}；原规则保持不变")
+                return
+            self.prefs = data
+            self._rt_keyword_rules = rules
+            self._rt_keyword_offset = 0
+            feedback.set(f"保存成功 · {len(rules)} 条规则已生效 · 无需重启服务")
+            self.status.set(feedback.get())
+            self._render_messages(self._rt_source_rows)
+            self._refresh_keyword_messages()
+
+        ttk.Button(actions, text="保存并生效", command=save).pack(side="left")
+        ttk.Button(actions, text="关闭", command=window.destroy).pack(side="right")
+        window.grab_set()
+        editor.focus_set()
+
+    def _keyword_request_key(self) -> tuple:
+        return (tuple(label for label, _pattern in self._rt_keyword_rules), self._rt_group_id,
+                tuple(prefs_mod.blocked_senders(self.prefs.get("filters") or {})), self._rt_keyword_offset)
+
+    def _keyword_page(self, direction: int) -> None:
+        self._rt_keyword_offset = max(0, self._rt_keyword_offset + direction * 200)
+        self._refresh_keyword_messages()
+
+    def _refresh_keyword_messages(self) -> None:
+        if self._rt_keyword_busy:
+            return
+        key = self._keyword_request_key()
+        if not self._rt_keyword_rules:
+            self._accept_keyword_messages(key, [], "")
+            return
+        self._rt_keyword_busy = True
+        self.v_rt_keywords.set("正在检索已保存的关键词消息…")
+        self.btn_keyword_prev.configure(state="disabled")
+        self.btn_keyword_next.configure(state="disabled")
+        db = abs_path(self.cfg, "db_path")
+        rules = self._rt_keyword_rules
+        filters = {"blocked_senders": list(key[2])}
+        events = self.events
+
+        def work() -> None:
+            rows, error = [], ""
+            try:
+                if db.exists():
+                    store = Store(db, filters=filters, readonly=True)
+                    try:
+                        rows = store.recent_messages(201, group_id=key[1], keyword_rules=rules, offset=key[3])
+                    finally:
+                        store.close()
+            except (OSError, sqlite3.Error) as exc:
+                error = security.redact(str(exc))
+            events.put(("keyword_messages", (key, rows, error)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _accept_keyword_messages(self, key: tuple, rows: list, error: str) -> None:
+        self._rt_keyword_busy = False
+        if key != self._keyword_request_key():
+            self._refresh_keyword_messages()
+            return
+        if error:
+            self.v_rt_keywords.set(f"关键词读取失败：{error}；保留上次结果")
+            self.btn_keyword_prev.configure(state="normal" if self._rt_keyword_offset else "disabled")
+            return
+        selected = self.rt_keywords.selection()
+        scroll = self.rt_keywords.yview()[0]
+        self._rt_keyword_rows = {str(row["id"]): row for row in rows[:200]}
+        self.rt_keywords.delete(*self.rt_keywords.get_children())
+        for iid, row in self._rt_keyword_rows.items():
+            ocr = " / ".join(image.get("ocr_text") or "" for image in row.get("images") or []).strip(" / ")
+            body = " ".join((row.get("text", "") + (" OCR:" + ocr if ocr else "")).split())
+            self.rt_keywords.insert("", "end", iid=iid, tags=("keyword",), values=(
+                datetime.fromtimestamp(row["ts"], BEIJING).strftime("%m-%d %H:%M:%S"),
+                row.get("group_name") or row.get("group_id"), row.get("sender_name", ""),
+                " / ".join(matching_message(self._rt_keyword_rules, row)), body[:400]))
+        if selected and self.rt_keywords.exists(selected[0]):
+            self.rt_keywords.selection_set(selected[0])
+            self._keyword_selected()
+        elif selected:
+            self._show_message_detail(None)
+        self.rt_keywords.yview_moveto(scroll)
+        self.btn_keyword_prev.configure(state="normal" if self._rt_keyword_offset else "disabled")
+        self.btn_keyword_next.configure(state="normal" if len(rows) > 200 else "disabled")
+        self.v_rt_keywords.set((f"第 {self._rt_keyword_offset // 200 + 1} 页 · {len(self._rt_keyword_rows)} 条 · 随群筛选，双击查看详情"
+                                if self._rt_keyword_rules else "尚未配置关键词；点击配置关键词添加，支持正则表达式"))
+
+    def _keyword_selected(self, _event=None) -> None:
+        selected = self.rt_keywords.selection()
+        row = self._rt_keyword_rows.get(selected[0]) if selected else None
+        if row:
+            self.rt.selection_remove(*self.rt.selection())
+            self.rt_related.selection_remove(*self.rt_related.selection())
+            self._show_collected_message(row)
+
     def _render_related(self, rows: list, account: str) -> None:
         selected = self.rt_related.selection()
         self._rt_related_rows = {str(row["id"]): row for row in rows}
@@ -2216,11 +2382,15 @@ class App:
         row = self._rt_related_rows.get(selected[0]) if selected else None
         if row:
             self.rt.selection_remove(*self.rt.selection())
-            detail = dict(row)
-            if row.get("images"):
-                detail["ocr_text"] = "\n".join(image.get("ocr_text") or "" for image in row["images"])
-                detail["vision_text"] = "\n".join(image.get("vision_text") or "" for image in row["images"])
-            self._show_message_detail(detail)
+            self.rt_keywords.selection_remove(*self.rt_keywords.selection())
+            self._show_collected_message(row)
+
+    def _show_collected_message(self, row: dict) -> None:
+        detail = dict(row)
+        if row.get("images"):
+            detail["ocr_text"] = "\n".join(image.get("ocr_text") or "" for image in row["images"])
+            detail["vision_text"] = "\n".join(image.get("vision_text") or "" for image in row["images"])
+        self._show_message_detail(detail)
 
     def _render_activity(self, activity: dict) -> None:
         groups = activity.get("groups") or []
@@ -2255,12 +2425,14 @@ class App:
         if rows is None:
             self.v_rt_status.set("读取失败（服务没跑，或接口不可达）")
             return
+        self._rt_source_rows = rows
         # 每 3 秒重建整表。保留选中行，否则用户刚点中的那一行会被刷没影。
         sel = self.rt.selection()
         keep = str(sel[0]) if sel else ""
         self.rt.delete(*self.rt.get_children())
         display_rows = []
         for parent in rows:
+            parent = {**parent, "keyword_matches": matching_message(self._rt_keyword_rules, parent)}
             images = parent.get("images") or []
             if images:
                 for index, image in enumerate(images, 1):
@@ -2289,6 +2461,8 @@ class App:
                 body = f"{caption} [图片] OCR:{preview}".strip()
             state = self._media_label(r)
             tags: list[str] = []
+            if r.get("keyword_matches"):
+                tags.append("keyword")
             if i % 2:
                 tags.append("odd")
             if state == "图片未识别":
@@ -2322,7 +2496,8 @@ class App:
         row = self._rt_rows.get(str(selection[0])) if selection else None
         if row:
             self.rt_related.selection_remove(*self.rt_related.selection())
-        elif self.rt_related.selection():
+            self.rt_keywords.selection_remove(*self.rt_keywords.selection())
+        elif self.rt_related.selection() or self.rt_keywords.selection():
             return
         self._show_message_detail(row)
 
@@ -2970,6 +3145,8 @@ class App:
             self._log_ui(f"[界面] {note}\n")
         elif kind == "messages":
             self._accept_messages(*value)
+        elif kind == "keyword_messages":
+            self._accept_keyword_messages(*value)
         elif kind == "message_action":
             key, action, result = value
             self._rt_actions.discard(key)

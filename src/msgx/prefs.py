@@ -28,6 +28,7 @@ DEFAULTS: dict = {
     "summary_prompt": "",    # 空 = 沿用 config.toml 或内置提示词
     "summary_target_chars": 3000,
     "groups": [],             # 空 = 关注全部群（群列表是「全选/多选」语义，空即全部）
+    "message_keywords": [],  # 普通关键词；re: 前缀表示正则表达式
     "filters": {
         "blocked_senders": list(DEFAULT_BLOCKED_SENDERS),
         "skip_face_only": False,    # 纯表情 / 表情包

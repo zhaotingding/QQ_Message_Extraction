@@ -38,6 +38,7 @@ SUITES = [
     ("群列表属主", "test_groups.py"),
     ("当日群活跃度与群筛选", "test_group_activity.py"),
     ("实时消息详情与筛选界面", "test_realtime_gui.py"),
+    ("关键词消息与只读历史检索", "test_message_keywords.py"),
     ("无额外推理与过滤链路", "test_pipeline.py"),
     ("服务生命周期", "test_service.py"),
     ("服务日志与脱敏", "test_service_logging.py"),

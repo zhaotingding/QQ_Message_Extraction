@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import queue
 import sys
+import tempfile
 import tkinter as tk
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,9 @@ from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from msgx.gui import App
+from msgx.message_keywords import compile_rules
+from msgx.store import Store
+from msgx.models import parse_onebot_event
 
 
 BEIJING = timezone(timedelta(hours=8))
@@ -69,6 +73,11 @@ class RealtimeGuiTests(unittest.TestCase):
         app = self.app
         app.root = self.root
         app.cfg = {"onebot": {"http_port": 1}}
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        app.cfg["app"] = {"db_path": str(Path(self.temp.name) / "test.db")}
+        app.prefs = {"message_keywords": [], "filters": {"blocked_senders": []}}
+        app.prefs_file = Path(self.temp.name) / "prefs.json"
         app.events = queue.Queue()
         app.proc = object()
         app.status = tk.StringVar(master=self.root)
@@ -111,6 +120,109 @@ class RealtimeGuiTests(unittest.TestCase):
         self.assertNotIn("学习进度表", app.rt.set("2:202", "text"))
         self.assertEqual(app.rt.set("2:201", "image"), "打开")
         self.assertIn("识别", app.rt.set("2:201", "recognize"))
+
+    def test_keywords_use_full_text_and_each_image_results_and_keep_related_red(self):
+        app = self.app
+        app._rt_keyword_rules = compile_rules(["记录", "re:实验结果$", "学习进度表"])
+        payload = sample_payload()
+        payload["items"][0]["text"] = "普通文字" * 300 + "实验结果"
+        payload["items"][0]["relation"] = "reply"
+        with patch.object(app, "_refresh_keyword_messages"):
+            self.render(payload)
+        self.assertIn("keyword", app.rt.item("3", "tags"))
+        self.assertIn("related", app.rt.item("3", "tags"))
+        self.assertIn("keyword", app.rt.item("2:201", "tags"))
+        self.assertIn("keyword", app.rt.item("2:202", "tags"))
+        self.assertNotIn("keyword", app.rt.item("1", "tags"))
+        self.assertEqual(str(app.rt.tag_configure("keyword", "background")), "#fff2a8")
+        self.assertEqual(str(app.rt.tag_configure("related", "foreground")), "#c62828")
+
+    def test_keyword_collection_details_survive_refresh_and_reject_old_rules(self):
+        app = self.app
+        app._rt_keyword_rules = compile_rules(["控制实验"])
+        key = app._keyword_request_key()
+        app._accept_keyword_messages(key, sample_payload()["items"][1:2], "")
+        app.rt_keywords.selection_set("2")
+        app._keyword_selected()
+        self.root.update()
+        self.assertIn("控制实验", self.detail())
+        self.assertIn("学习进度表", self.detail())
+        with patch.object(app, "_refresh_keyword_messages"):
+            self.render()
+        self.assertIn("控制实验", self.detail())
+        app._rt_keyword_rules = compile_rules(["新的规则"])
+        with patch.object(app, "_refresh_keyword_messages") as refresh:
+            app._accept_keyword_messages(key, [], "")
+            refresh.assert_called_once()
+        self.assertEqual(app.rt_keywords.get_children(), ("2",))
+
+    def test_keyword_configuration_validates_before_save_and_has_success_feedback(self):
+        app = self.app
+        app._configure_message_keywords()
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        widgets = list(descendants(app.keyword_window))
+        editor = next(w for w in widgets if isinstance(w, tk.Text))
+        save = next(w for w in widgets if isinstance(w, ttk.Button) and w.cget("text") == "保存并生效")
+        editor.insert("1.0", "Codex\nre:[")
+        save.invoke()
+        self.assertFalse(app.prefs_file.exists())
+        self.assertEqual(app._rt_keyword_rules, ())
+        self.assertTrue(any("第 2 行" in self.root.getvar(w.cget("textvariable"))
+                            for w in widgets if isinstance(w, ttk.Label) and w.cget("textvariable")))
+        editor.delete("1.0", "end")
+        editor.insert("1.0", "Codex\nre:额度|限流\nCodex\n\n")
+        with patch.object(app, "_refresh_keyword_messages"):
+            save.invoke()
+        saved = json.loads(app.prefs_file.read_text(encoding="utf-8"))
+        self.assertEqual(saved["message_keywords"], ["Codex", "re:额度|限流"])
+        self.assertEqual(saved["filters"], app.prefs["filters"])
+        self.assertIn("保存成功", app.status.get())
+        editor.delete("1.0", "end")
+        save.invoke()
+        self.assertEqual(app.rt_keywords.get_children(), ())
+        self.assertEqual(json.loads(app.prefs_file.read_text(encoding="utf-8"))["message_keywords"], [])
+
+    def test_keyword_pagination_and_failure_preserve_results(self):
+        app = self.app
+        app._rt_keyword_rules = compile_rules(["消息"])
+        row = sample_payload()["items"][0]
+        rows = [{**row, "id": n, "text": "命中消息"} for n in range(201)]
+        app._accept_keyword_messages(app._keyword_request_key(), rows, "")
+        self.assertEqual(len(app.rt_keywords.get_children()), 200)
+        self.assertEqual(str(app.btn_keyword_next.cget("state")), "normal")
+        with patch.object(app, "_refresh_keyword_messages"):
+            app.btn_keyword_next.invoke()
+        self.assertEqual(app._rt_keyword_offset, 200)
+        app._accept_keyword_messages(app._keyword_request_key(), rows[200:], "")
+        self.assertEqual(str(app.btn_keyword_prev.cget("state")), "normal")
+        self.assertEqual(str(app.btn_keyword_next.cget("state")), "disabled")
+        app._accept_keyword_messages(app._keyword_request_key(), [], "测试读取失败")
+        self.assertEqual(app.rt_keywords.get_children(), ("200",))
+        self.assertIn("失败", app.v_rt_keywords.get())
+
+    def test_background_keywords_query_saved_messages_even_when_service_is_stopped(self):
+        app = self.app
+        store = Store(app.cfg["app"]["db_path"], filters={"blocked_senders": []})
+        try:
+            msg = parse_onebot_event({"post_type": "message", "message_type": "group", "self_id": "100",
+                                      "group_id": "1", "user_id": "200", "message_id": "1", "time": 1000,
+                                      "message": "关键消息"}, "100")
+            ident = store.insert_message(msg)
+        finally:
+            store.close()
+        app.proc = None
+        app._rt_keyword_rules = compile_rules(["关键"])
+        app.refresh_messages()
+        self.assertIn("正在检索", app.v_rt_keywords.get())
+        kind, value = app.events.get(timeout=5)
+        self.assertEqual(kind, "keyword_messages")
+        # 后台只回传结果，界面必须由主线程接收后才更新。
+        self.assertEqual(app.rt_keywords.get_children(), ())
+        app._accept_keyword_messages(*value)
+        self.assertEqual(app.rt_keywords.get_children(), (str(ident),))
 
     def test_caption_and_saved_ocr_preview_are_single_line_and_do_not_change_source(self):
         payload = sample_payload()
