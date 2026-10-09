@@ -32,6 +32,10 @@ class AmbiguousResponseError(RuntimeError):
     """请求可能已被处理但未拿到完整结果；不自动整单重发。"""
 
 
+class BackgroundResponsePending(RuntimeError):
+    """已有后台响应 ID；下次只取回同一响应，不重新生成。"""
+
+
 def _safe_request_id(value) -> str:
     value = security.redact(value) if isinstance(value, str) else ""
     return value if re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", value) else ""
@@ -168,6 +172,16 @@ class LLM:
         result._session_owner = self._session_owner or self
         return result
 
+    def resume_snapshot(self, metadata: dict) -> LLM:
+        from .api_settings import apply
+        from .config import api_key
+        cfg = apply(self.cfg, metadata["api"])
+        cfg.update(active_api_profile=metadata["active_api_profile"], summary=metadata["summary"])
+        result = LLM(cfg, self.store)
+        result.configure(api_key(cfg))
+        result._session_owner = self._session_owner or self
+        return result
+
     # ---------- budget ----------
 
     def cache_write_multiplier(self, model: str | None = None) -> float:
@@ -286,13 +300,37 @@ class LLM:
 
     # ---------- core call ----------
 
-    async def _accounted_post(self, payload: dict, purpose: str, source_ids: list[int] | None) -> dict:
+    async def _accounted_post(self, payload: dict, purpose: str, source_ids: list[int] | None,
+                              request_key: tuple | None = None, metadata: dict | None = None) -> dict:
         """v0.6.0：每个有返回的请求立即落账，后续重试失败也不会丢掉前次费用。"""
         started = time.time()
         provider = self.cfg.get("api", {}).get("provider", "旧版 DeepSeek")
+        saved = self.store.summary_request(request_key) if request_key else None
+        if saved and saved["metadata"]["signature"] != metadata["signature"]:
+            # 分块摘要的上一段已经完成、落账并写入本地缓存，才允许开始下一段。
+            if not saved["result"] or saved["result"]["choices"][0]["finish_reason"] != "stop":
+                raise RuntimeError("后台摘要材料不一致，请检查任务记录")
+            self.store.clear_summary_request(request_key)
+            saved = None
+        if request_key and saved is None:
+            self.store.start_summary_request(request_key, metadata, started)
+            saved = self.store.summary_request(request_key)
+        elif saved and not saved["response_id"]:
+            raise AmbiguousResponseError("上次后台提交未收到任务 ID，结果及费用不明；请确认后补生成")
+        if saved:
+            started = saved["started_at"]
         try:
-            data = await self._post(payload)
+            if request_key:
+                data = await self._background_response(payload, request_key, saved)
+            else:
+                data = await self._post(payload)
+        except BackgroundResponsePending:
+            raise  # 查询中断没有产生新模型请求，不记一笔未知费用。
         except Exception as exc:
+            if saved and (saved["response_id"] or self.store.summary_request(request_key)["response_id"]):
+                raise  # 已接受的后台任务保留 ID，不能因查询失败重新提交。
+            if request_key and isinstance(exc, (RetryableRequestError, APIRequestRejected)):
+                self.store.clear_summary_request(request_key)
             status = f"请求被拒绝：{exc}；用量未知" if isinstance(exc, APIRequestRejected) else "请求失败，用量未知"
             self.store.record_api_call(ts=started, purpose=purpose, source_ids=source_ids or [],
                                        model=payload["model"], usage=None, cost_cny=None, status=status, provider=provider,
@@ -337,7 +375,8 @@ class LLM:
                                             "long_context_threshold", "long_input_multiplier", "long_output_multiplier", "peak_multiplier", "peak_windows_utc", "base_url")},
                                             "cache_write_multiplier": self.cache_write_multiplier(payload["model"]),
                                             "requested_service_tier": requested_tier,
-                                            "service_tier_source": "response" if tier_returned else f"request_{requested_tier}" if official else "unknown"} if "api" in self.cfg else None)
+                                            "service_tier_source": "response" if tier_returned else f"request_{requested_tier}" if official else "unknown"} if "api" in self.cfg else None,
+                                   summary_key=request_key)
         if complete:
             log.info("API 请求成功 · %s · 输入 %s / 输出 %s Token", purpose,
                      (usage or {}).get("prompt_tokens", "未知"), (usage or {}).get("completion_tokens", "未知"))
@@ -361,10 +400,15 @@ class LLM:
         purpose: str = "其他文本请求",
         source_ids: list[int] | None = None,
         require_complete: bool = False,
+        request_key: tuple | None = None,
+        request_signature: str = "",
+        report_info: dict | None = None,
     ) -> str:
-        if not self.available:
+        saved = self.store.summary_request(request_key) if request_key else None
+        resuming = bool(saved and saved["metadata"]["signature"] == request_signature and saved["response_id"])
+        if not self.available and not (resuming and saved["result"]):
             raise RuntimeError("LLM 未配置 api_key")
-        if not self.budget_ok():
+        if not resuming and not self.budget_ok():
             raise BudgetExceeded(f"今日预算已达上限 {self.llm['max_daily_cost_cny']} 元")
 
         payload = {
@@ -397,7 +441,13 @@ class LLM:
             budget = max(budget, int(self.llm.get("think_min_tokens", THINK_MIN_TOKENS)))
         payload["max_tokens"] = budget
 
-        data = await self._accounted_post(payload, purpose, source_ids)
+        metadata = None
+        if request_key:
+            payload["background"] = True
+            metadata = {"signature": request_signature, "api": self.cfg["api"],
+                        "active_api_profile": self.cfg.get("active_api_profile", ""),
+                        "summary": self.cfg.get("summary", {}), "report_info": report_info}
+        data = await self._accounted_post(payload, purpose, source_ids, request_key, metadata)
 
         choice = (data.get("choices") or [{}])[0]
         if require_complete:
@@ -488,7 +538,7 @@ class LLM:
                 raise RuntimeError("该 API 地址未配置安全密钥，或密钥已删除")
         s = await self.session()
         base = self.llm["base_url"].rstrip("/")
-        responses = self.llm.get("protocol") == "responses"
+        responses = self.llm.get("protocol") == "responses" or bool(payload.get("background"))
         summary_stream = bool(payload.get("stream"))
         outgoing = self._responses_payload(payload) if responses else dict(payload)
         if summary_stream and not responses:
@@ -617,6 +667,46 @@ class LLM:
             pass  # 原始响应不得写入错误日志。
         raise AmbiguousResponseError("流式响应不完整；未自动重发")
 
+    async def _background_response(self, payload: dict, key: tuple, saved: dict) -> dict:
+        if saved["result"]:
+            return saved["result"]
+        response_id = saved["response_id"]
+        data = None
+        if not response_id:
+            data = await self._post(payload)
+            response_id = data.get("response_id", "")
+            if not response_id:
+                raise AmbiguousResponseError("后台响应未返回任务 ID，未自动重发")
+            self.store.update_summary_request(key, response_id=response_id, request_id=data.get("request_id", ""))
+            log.info("自动摘要后台任务已接受：%s；后续仅查询同一响应", response_id)
+        started = time.monotonic()
+        while True:
+            if data and data.get("response_status") not in ("queued", "in_progress"):
+                original_id = self.store.summary_request(key)["request_id"]
+                data["request_id"] = original_id or data.get("request_id", "")
+                self.store.update_summary_request(key, result=data)
+                return data
+            if time.monotonic() - started >= 900:
+                raise BackgroundResponsePending("后台摘要仍在生成，稍后继续取回同一响应；不会重新提交消息")
+            if data:
+                await asyncio.sleep(5)
+            data = await self._retrieve_response(response_id)
+
+    async def _retrieve_response(self, response_id: str) -> dict:
+        session = await self.session()
+        try:
+            async with session.get(f"{self.llm['base_url'].rstrip('/')}/responses/{response_id}",
+                                   headers={"Authorization": f"Bearer {self.key}"}, allow_redirects=False,
+                                   timeout=aiohttp.ClientTimeout(total=60, connect=30)) as response:
+                if response.status == 200:
+                    return await self._read_response(response)
+                if response.status in RETRY_STATUS:
+                    raise BackgroundResponsePending(f"后台结果查询暂不可用（HTTP {response.status}），稍后继续取回同一响应")
+                raise APIRequestRejected(_http_error(response.status, await response.text(), response.headers))
+        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError,
+                ValueError, UnicodeError):
+            raise BackgroundResponsePending("后台结果查询连接中断，稍后继续取回同一响应；不会重新提交消息") from None
+
     def _responses_payload(self, payload: dict) -> dict:
         inputs = []
         for message in payload["messages"]:
@@ -627,8 +717,12 @@ class LLM:
                              "detail": item["image_url"].get("detail", "low")}) for item in content]
             inputs.append({"role": message["role"], "content": content})
         effort = self.cfg["api"]["reasoning"]
-        return {"model": payload["model"], "input": inputs, "max_output_tokens": payload["max_tokens"],
-                "reasoning": {"effort": effort}, "store": False, "stream": True}
+        background = bool(payload.get("background"))
+        result = {"model": payload["model"], "input": inputs, "max_output_tokens": payload["max_tokens"],
+                  "reasoning": {"effort": effort}, "store": background, "stream": not background}
+        if background:
+            result["background"] = True
+        return result
 
     async def _read_response(self, response) -> dict:
         headers = getattr(response, "headers", {})
@@ -666,7 +760,8 @@ class LLM:
             normalized = {"prompt_tokens": usage["input_tokens"], "completion_tokens": usage["output_tokens"],
                           "prompt_cache_hit_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens", 0),
                           "prompt_cache_write_tokens": (usage.get("input_tokens_details") or {}).get("cache_write_tokens")}
-        result = {"choices": [{"message": {"content": text},
+        result = {"response_id": _safe_request_id(data.get("id")), "response_status": status,
+                  "choices": [{"message": {"content": text},
                              "finish_reason": "stop" if status == "completed" else "incomplete"}], "usage": normalized}
         if data.get("service_tier"):
             result["service_tier"] = data["service_tier"]

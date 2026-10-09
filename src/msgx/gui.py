@@ -1208,13 +1208,13 @@ class App:
 
     def _apply_app_icon(self) -> None:
         path = (self.prefs.get("ui") or {}).get("icon_path")
+        local_icon = self.prefs_file.parent / "app-icon.ico" if hasattr(self, "prefs_file") else ROOT / ".ui" / "app-icon.ico"
+        if (not path or not Path(path).is_file()) and local_icon.is_file():
+            path = local_icon
         if not path:
             return
         try:
             from PIL import Image, ImageTk
-            if os.name == "nt":
-                import ctypes
-                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("msgx.desktop")
             # 显式设置当前窗口的各尺寸像素，避免文件图标加载路径重新缩放小帧。
             with Image.open(path) as icon:
                 frames = [icon.ico.getimage(size).convert("RGBA") for size in sorted(icon.ico.sizes())]
@@ -3351,6 +3351,10 @@ def open_path(path: Path) -> None:
 
 
 def main(config_path: str | None = None) -> int:
+    if os.name == "nt":
+        import ctypes
+        # 在创建窗口之前设置固定 ID，版本号不参与任务栏分组。
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("msgx.desktop")
     root = tk.Tk()
     App(root, config_path)
     root.mainloop()

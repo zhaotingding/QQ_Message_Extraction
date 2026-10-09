@@ -17,13 +17,21 @@ from msgx.gui import App
 
 def window_icon(root, kind):
     user = C.WinDLL("user32")
-    gdi = C.WinDLL("gdi32")
     user.GetParent.argtypes = [W.HWND]
     user.GetParent.restype = W.HWND
     user.SendMessageW.argtypes = [W.HWND, W.UINT, W.WPARAM, W.LPARAM]
     user.SendMessageW.restype = W.LPARAM
     user.GetClassLongPtrW.argtypes = [W.HWND, C.c_int]
     user.GetClassLongPtrW.restype = C.c_size_t
+    hwnd = user.GetParent(root.winfo_id())
+    handle = user.SendMessageW(hwnd, 0x7F, kind, 0) or user.GetClassLongPtrW(hwnd, -14 if kind == 1 else -34)
+    assert handle, "窗口没有可用图标"
+    return icon_pixels(handle)
+
+
+def icon_pixels(handle):
+    user = C.WinDLL("user32")
+    gdi = C.WinDLL("gdi32")
 
     class IconInfo(C.Structure):
         _fields_ = [("icon", W.BOOL), ("x", W.DWORD), ("y", W.DWORD),
@@ -40,9 +48,6 @@ def window_icon(root, kind):
     gdi.GetDIBits.argtypes = [W.HDC, W.HBITMAP, W.UINT, W.UINT, C.c_void_p, C.c_void_p, W.UINT]
     gdi.DeleteDC.argtypes = [W.HDC]
     gdi.DeleteObject.argtypes = [W.HGDIOBJ]
-    hwnd = user.GetParent(root.winfo_id())
-    handle = user.SendMessageW(hwnd, 0x7F, kind, 0) or user.GetClassLongPtrW(hwnd, -14 if kind == 1 else -34)
-    assert handle, "窗口没有可用图标"
     info = IconInfo()
     assert user.GetIconInfo(handle, C.byref(info))
     dc = gdi.CreateCompatibleDC(None)
@@ -61,6 +66,26 @@ def window_icon(root, kind):
 
 @unittest.skipUnless(os.name == "nt", "Windows 图标句柄测试")
 class WindowIconTests(unittest.TestCase):
+    def test_missing_preference_reuses_saved_local_icon(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "app-icon.ico"
+            Image.new("RGBA", (256, 256), (25, 90, 200, 255)).save(path)
+            root = tk.Tk()
+            try:
+                root.attributes("-alpha", 0)
+                app = App.__new__(App)
+                app.root, app.prefs = root, {"ui": {"last_tab": 0}}
+                app.prefs_file = Path(folder) / "preferences.json"
+                app.v_icon_status = tk.StringVar(root)
+                app._apply_app_icon()
+                root.update()
+                for kind in (0, 1):
+                    actual = window_icon(root, kind)
+                    self.assertEqual(actual.getpixel((0, 0)), (25, 90, 200, 255))
+                self.assertIn("已应用自定义图标", app.v_icon_status.get())
+            finally:
+                root.destroy()
+
     def test_png_compressed_ico_sets_actual_large_and_small_pixels(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "compressed.ico"

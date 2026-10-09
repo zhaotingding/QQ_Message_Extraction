@@ -95,6 +95,19 @@ CREATE TABLE IF NOT EXISTS summary_jobs (
   PRIMARY KEY(kind,start_date,end_date)
 );
 
+CREATE TABLE IF NOT EXISTS summary_requests (
+  kind TEXT NOT NULL,
+  start_date TEXT NOT NULL,
+  end_date TEXT NOT NULL,
+  response_id TEXT NOT NULL DEFAULT '',
+  request_id TEXT NOT NULL DEFAULT '',
+  started_at REAL NOT NULL,
+  metadata TEXT NOT NULL,
+  result TEXT NOT NULL DEFAULT '',
+  accounted INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(kind,start_date,end_date)
+);
+
 CREATE TABLE IF NOT EXISTS alerts (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   group_id   TEXT NOT NULL,
@@ -906,12 +919,12 @@ class Store:
             (kind, start, end, state, attempts, next_attempt_at, error, summary_id, now, attempts))
         self.conn.commit()
 
-    def claim_summary_job(self, kind: str, start: str, end: str, now: float) -> bool:
+    def claim_summary_job(self, kind: str, start: str, end: str, now: float, *, resume: bool = False) -> bool:
         cur = self.conn.execute(
-            "UPDATE summary_jobs SET state='running',attempts=attempts+1,updated_at=?"
+            "UPDATE summary_jobs SET state='running',attempts=attempts+?,updated_at=?"
             " WHERE kind=? AND start_date=? AND end_date=?"
-            " AND state IN ('pending','retry','waiting') AND attempts<3 AND next_attempt_at<=?",
-            (now, kind, start, end, now))
+            " AND state IN ('pending','retry','waiting') AND (attempts<3 OR ?=1) AND next_attempt_at<=?",
+            (int(not resume), now, kind, start, end, int(resume), now))
         self.conn.commit()
         return cur.rowcount == 1
 
@@ -930,6 +943,32 @@ class Store:
 
     def latest_period_summary(self, kind: str):
         return self.conn.execute("SELECT * FROM summaries WHERE kind=? ORDER BY window_end DESC,id DESC LIMIT 1", (kind,)).fetchone()
+
+    def summary_request(self, key: tuple) -> dict | None:
+        row = self.conn.execute("SELECT * FROM summary_requests WHERE kind=? AND start_date=? AND end_date=?", key).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["metadata"] = json.loads(item["metadata"])
+        item["result"] = json.loads(item["result"]) if item["result"] else None
+        return item
+
+    def start_summary_request(self, key: tuple, metadata: dict, started: float) -> None:
+        self.conn.execute("INSERT INTO summary_requests(kind,start_date,end_date,started_at,metadata) VALUES(?,?,?,?,?)",
+                          (*key, started, json.dumps(metadata, ensure_ascii=False)))
+        self.conn.commit()
+
+    def update_summary_request(self, key: tuple, *, response_id: str = "", request_id: str = "", result: dict | None = None) -> None:
+        self.conn.execute("UPDATE summary_requests SET response_id=CASE WHEN ?<>'' THEN ? ELSE response_id END,"
+                          "request_id=CASE WHEN ?<>'' THEN ? ELSE request_id END,result=COALESCE(?,result)"
+                          " WHERE kind=? AND start_date=? AND end_date=?",
+                          (response_id, response_id, request_id, request_id,
+                           json.dumps(result, ensure_ascii=False) if result is not None else None, *key))
+        self.conn.commit()
+
+    def clear_summary_request(self, key: tuple) -> None:
+        self.conn.execute("DELETE FROM summary_requests WHERE kind=? AND start_date=? AND end_date=?", key)
+        self.conn.commit()
 
     # ---------- alerts ----------
 
@@ -961,7 +1000,9 @@ class Store:
     def record_api_call(self, *, ts: float, purpose: str, source_ids: list[int], model: str,
                         usage: dict | None, cost_cny: float | None, status: str, provider: str = "",
                         cost_usd: float | None = None, service_tier: str = "",
-                        request_id: str = "", pricing: dict | None = None) -> None:
+                        request_id: str = "", pricing: dict | None = None, summary_key: tuple | None = None) -> None:
+        if summary_key and self.summary_request(summary_key)["accounted"]:
+            return
         ids = list(dict.fromkeys(source_ids))
         source_type = ("汇总报告" if purpose in ("日报合并", "摘要合并", "摘要成稿") else "系统检查") if not ids else "多条消息汇总"
         if len(ids) == 1:
@@ -978,6 +1019,9 @@ class Store:
             (ts, purpose, json.dumps(ids), source_type, model, incoming, outgoing, hit, cost_cny, status, provider,
              cost_usd, service_tier, request_id, json.dumps(pricing, ensure_ascii=False) if pricing else "", written),
         )
+        if summary_key:
+            # 同一事务提交费用和记账标记，恢复时不会重复累计同一后台响应。
+            self.conn.execute("UPDATE summary_requests SET accounted=1 WHERE kind=? AND start_date=? AND end_date=?", summary_key)
         if usage is not None:
             self.add_usage(datetime.fromtimestamp(ts, timezone(timedelta(hours=8))).date().isoformat(), incoming, outgoing,
                            cost_cny or 0.0, hit, max(0, incoming - hit))

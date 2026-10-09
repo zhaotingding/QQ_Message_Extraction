@@ -134,6 +134,25 @@
 
 ## 摘要批注与自动周期
 
+- **v0.9.4 替代官方自动摘要的长流恢复策略**：2026-10-09 旧日报已收到 HTTP 200，随后
+  接收正文 132.5 秒时报 ClientPayloadError；不是日期或触发器失败。仅延长超时和改流式仍会中断。
+  官方自动日／周／月改 `Responses background=true, store=true, stream=false`，收到 ID 后只 GET 同一响应。
+  保存原公开配置、任务材料与完整结果，重开按 ID 恢复；查询不消耗生成轮数、查询失败不记新费用。
+  API 账本和 accounted 标记同事务提交，成稿写入失败可以恢复；分块缓存先落盘，再推进下一块。
+  成稿完成后清理临时原始材料。没有响应 ID 的未知提交仍 blocked，不能重开就重发。
+  OpenAI 保留可查询响应至少 30 天；已过期或未完成输出需检查，不能自动新生成来冒充续取。
+  2026-10-09：7 项模拟恢复验证；实际一次补生成 10 月 8 日日报，10464 条有效消息、2163 字，
+  HTTP 200 后约 5 秒接受后台 ID，Flex 完整用量已返回。证据 `data/diagnostics/v0.9.4/live-summary.json`。
+  消息服务安全重载后协议自动重连且继续入库，未退出 QQ；凌晨定时触发本身尚未跨夜再次观测。
+- **v0.9.4 启动器图标约束**：`iconphoto` 仅改变窗口，不能改变 Explorer 中 EXE 的资源图标。
+  重建必须自动读取 `.ui/preferences.json` 指定路径或 `.ui/app-icon.ico`，使用 `tools/build_launcher.py`。
+  不要直接修改 PyInstaller onefile 资源而忽略尾部归档；本轮重建归档后实际运行隔离启动链路成功。
+  2026-10-09，Windows 实际提取 EXE 16/32/48/256 和窗口 16/32 帧，近不透明 RGB 与原帧完全一致，
+  `data/diagnostics/v0.9.4/icon-verification.json`、`launcher-verification.json`，实际验证。
+  同日用户目录仍显示 Python 大图，证明资源像素核验不能替代 Explorer 视图验收。
+  单文件 UPDATEITEM 通知不足；发送 SHCNE_ASSOCCHANGED 使图标/缩略图缓存失效，再重新载入项目目录后，
+  实际大图已恢复。构建加入缓存及目录变化通知，不删除系统缓存文件或重启 Explorer。
+  证据 `data/diagnostics/v0.9.4/explorer-after.png`，2026-10-09 实际目录截图。
 - **适用 v0.8.0 起**：阅读元数据按摘要 ID + 原文 SHA256 隔离；显示正文会去掉 Markdown 标记、插入空行，
   标注坐标不能直接套到原文。Windows Tk 的 `count` 对 emoji 与 `+N chars` 计数不同，
   使用已显示文字的 Python 字符数，并在恢复高亮时核对选中文字，防止错位。

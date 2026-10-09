@@ -10,6 +10,7 @@ import re
 import time
 from datetime import date, datetime, time as day_time, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .config import abs_path
 from .llm import IncompleteResponse, LLM
@@ -327,7 +328,12 @@ class Summarizer:
             worker = self
             if isinstance(self.llm, LLM):
                 llm = self.llm.snapshot()
+                saved = self.store.summary_request((kind, start.isoformat(), end.isoformat()))
+                if saved and saved["response_id"]:
+                    llm = self.llm.resume_snapshot(saved["metadata"])
                 worker = Summarizer(llm.cfg, self.store, llm)
+                if urlsplit(llm.llm["base_url"]).hostname == "api.openai.com":
+                    worker._request_key = (kind, start.isoformat(), end.isoformat())
             daily_limit = int(worker.scfg.get("target_chars", DIGEST_DEFAULT_CHARS))
             if not 1 <= daily_limit <= 100000:
                 raise ValueError("日报目标字数必须是 1 到 100000 的整数")
@@ -362,6 +368,14 @@ class Summarizer:
         if existing:
             self._progress(f"{PERIOD_LABELS[kind]}已完成，直接复用，不重复调用 API")
             return self._saved_result(existing)
+        request_key = getattr(self, "_request_key", None)
+        saved = self.store.summary_request(request_key) if request_key else None
+        if saved and saved["response_id"]:
+            info = saved["metadata"]["report_info"]
+            self._report_info = info
+            self._progress("正在取回已接受的后台摘要，不重新上传原始消息")
+            content = await self._summarize_blocks(**info["prepared"])
+            return self._save_period_content(content, info)
         if kind == "daily":
             if self.store.count_messages_window(start_ts, end_ts) == 0:
                 return None
@@ -404,15 +418,29 @@ class Summarizer:
             raise ValueError(f"目标字数对应的输出额度 {output_tokens} Token 超过模型上限 {max_output}")
         input_limit = context_tokens - output_tokens - max(2048, math.ceil(context_tokens * 0.01))
         self._progress(f"正在根据 {len(reports)} 份已保存摘要生成{PERIOD_LABELS[kind]}，目标约 {limit} 字")
+        title = f"{PERIOD_LABELS[kind]}（{start} 至 {end - timedelta(days=1)}）"
+        count = sum(int(row["msg_count"]) for row in reports)
+        info = self._prepare_period_request(kind, title, start_ts, end_ts, count, limit, source_sig,
+                                            system, blocks, output_tokens, input_limit)
         content = await self._summarize_blocks(system, blocks, "", output_tokens, input_limit)
         if summary_chars(content) > limit:
             log.warning("模型返回的%s超过篇幅上限：%d / %d 字；全文保留，未截断或追加请求",
                         PERIOD_LABELS[kind], summary_chars(content), limit)
-        title = f"{PERIOD_LABELS[kind]}（{start} 至 {end - timedelta(days=1)}）"
-        count = sum(int(row["msg_count"]) for row in reports)
-        path = self._write_report(title, content, "全部", start_ts, end_ts, count, limit)
-        self.store.add_summary("digest", start_ts, end_ts, count, content, kind, str(path), source_sig)
-        return self._saved_result(self.store.summary_for_window(kind, start_ts, end_ts))
+        return self._save_period_content(content, info)
+
+    def _prepare_period_request(self, kind, title, start, end, count, limit, source_sig,
+                                system, blocks, output_tokens, input_limit):
+        info = dict(kind=kind, title=title, start=start, end=end, count=count, limit=limit, source_sig=source_sig,
+                    prepared=dict(system=system, blocks=blocks, header="", output_tokens=output_tokens, input_limit=input_limit))
+        self._report_info = info
+        return info
+
+    def _save_period_content(self, content: str, info: dict) -> dict:
+        path = self._write_report(info["title"], content, "全部", info["start"], info["end"], info["count"], info["limit"])
+        self.store.add_summary("digest", info["start"], info["end"], info["count"], content, info["kind"], str(path), info["source_sig"])
+        if getattr(self, "_request_key", None):
+            self.store.clear_summary_request(self._request_key)
+        return self._saved_result(self.store.summary_for_window(info["kind"], info["start"], info["end"]))
 
     async def _run_day(self, day: date, limit: int, prompt: str | None, force: bool):
         start, end = self._day_bounds(day)
@@ -446,16 +474,17 @@ class Summarizer:
         input_limit = context_tokens - output_tokens - max(2048, math.ceil(context_tokens * 0.01))
         input_tokens = estimate_tokens(system) + estimate_tokens("\n\n".join(part for part, _ in blocks)) + 128
         self._progress(f"{day.isoformat()}：已读取 {len(blocks)} 条有效消息，预估输入 {input_tokens} Token")
+        title = f"日摘要（{day.isoformat()}{'，截至当前' if day == today else ''}）"
+        info = self._prepare_period_request(kind, title, start, actual_end, len(blocks), limit, "",
+                                            system, blocks, output_tokens, input_limit)
         content = await self._summarize_blocks(system, blocks, "", output_tokens, input_limit)
         if summary_chars(content) > limit:
             log.warning("模型返回的日摘要超过篇幅上限：%d / %d 字；全文保留，未截断或追加请求",
                         summary_chars(content), limit)
-        title = f"日摘要（{day.isoformat()}{'，截至当前' if day == today else ''}）"
-        path = self._write_report(title, content, "全部", start, actual_end, len(blocks), limit)
-        self.store.add_summary("digest", start, actual_end, len(blocks), content, kind, str(path))
+        result = self._save_period_content(content, info)
         saved = self.store.summary_for_window(kind, start, actual_end)
         log.info("%s 已生成（%d 条有效消息 / %d 字 / 上限 %d 字）：%s",
-                 title, len(blocks), summary_chars(content), limit, path)
+                 title, len(blocks), summary_chars(content), limit, result["path"])
         return saved
 
     async def run_digest(self, full: bool = False, hours: int = 24,
@@ -542,9 +571,13 @@ class Summarizer:
                 self._progress(f"复用已完成的{purpose}，本步无需 API 请求")
                 return content
         try:
+            options = {}
+            if getattr(self, "_request_key", None):
+                options = dict(request_key=self._request_key, request_signature=key, report_info=self._report_info)
             content = await self.llm.chat(
                 system, body, max_tokens=output_tokens, temperature=0.2, think=False,
                 purpose="摘要总结", source_ids=source_ids, require_complete=True,
+                **options,
             )
         except IncompleteResponse as exc:
             if exc.content:

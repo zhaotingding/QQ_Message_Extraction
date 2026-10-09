@@ -11,7 +11,7 @@ from aiohttp import WSCloseCode
 
 from . import billing, napcat, security
 from .config import api_key, load
-from .llm import LLM, BudgetExceeded, IncompleteResponse, RetryableRequestError
+from .llm import LLM, BudgetExceeded, IncompleteResponse, RetryableRequestError, BackgroundResponsePending
 from .media import MediaWorker
 from .models import Msg, parse_onebot_event
 from .prefs import skip_reason
@@ -747,9 +747,12 @@ class Pipeline:
         for job in self.store.summary_jobs_in_state("running"):
             start, end = date.fromisoformat(job["start_date"]), date.fromisoformat(job["end_date"])
             saved = self.store.summary_for_window(job["kind"], *self._period_bounds(start, end))
+            request = self.store.summary_request((job["kind"], start.isoformat(), end.isoformat()))
+            resuming = bool(request and request["response_id"])
             self.store.save_summary_job(job["kind"], start.isoformat(), end.isoformat(),
-                "done" if saved else "blocked", now=now, summary_id=saved["id"] if saved else None,
-                error="" if saved else "上次请求中断，处理结果及费用不明；已停止自动重试，请检查记录")
+                "done" if saved else "pending" if resuming else "blocked", now=now, summary_id=saved["id"] if saved else None,
+                error="" if saved else "继续取回已接受的后台摘要，未重新提交消息" if resuming else
+                "上次请求中断，处理结果及费用不明；已停止自动重试，请检查记录")
         self._summary_recovered = True
 
     def _due_summary_periods(self, today: date) -> list[tuple[str, date, date]]:
@@ -779,11 +782,14 @@ class Pipeline:
         saved = self.store.summary_for_window(kind, *self._period_bounds(start, end))
         args = (kind, start.isoformat(), end.isoformat())
         if saved:
+            self.store.clear_summary_request(args)
             self.store.save_summary_job(*args, "done", now=now, summary_id=saved["id"])
             checked[key] = True
             return True
         job = self.store.summary_job(*args)
-        if job and job["state"] == "empty" and kind == "daily" and not self.store.count_messages_window(*self._period_bounds(start, end)):
+        request = self.store.summary_request(args)
+        resuming = bool(request and request["response_id"])
+        if not resuming and job and job["state"] == "empty" and kind == "daily" and not self.store.count_messages_window(*self._period_bounds(start, end)):
             checked[key] = True
             return True
         if job and (job["state"] in ("blocked", "running") or job["next_attempt_at"] > now):
@@ -792,19 +798,19 @@ class Pipeline:
             self.store.save_summary_job(*args, "pending", now=now)
         # 依赖失败不能让父报告把残缺材料冒充完整报告；其余周期仍继续。
         ready = True
-        for child_kind, child_start, child_end in period_parts(kind, start, end):
+        for child_kind, child_start, child_end in ([] if resuming else period_parts(kind, start, end)):
             if not await self._ensure_summary_period(child_kind, child_start, child_end, now, checked):
                 ready = False
         if not ready:
             self.store.save_summary_job(*args, "waiting", now=now,
                                         error="依赖摘要尚未完成，本周期暂不生成")
             return False
-        if kind == "daily" and not self.store.count_messages_window(*self._period_bounds(start, end)):
+        if not resuming and kind == "daily" and not self.store.count_messages_window(*self._period_bounds(start, end)):
             self.store.save_summary_job(*args, "empty", now=now)
             checked[key] = True
             return True
         # 全空周/月不调用模型，各叶子任务的 empty 状态持久保存。
-        if kind != "daily" and all(self.store.summary_job(child_kind, child_start.isoformat(), child_end.isoformat())["state"] == "empty"
+        if not resuming and kind != "daily" and all(self.store.summary_job(child_kind, child_start.isoformat(), child_end.isoformat())["state"] == "empty"
                                     for child_kind, child_start, child_end in period_parts(kind, start, end)):
             self.store.save_summary_job(*args, "empty", now=now)
             checked[key] = True
@@ -813,9 +819,9 @@ class Pipeline:
             # 空周期尚未付费生成；晚入库或新选入图片可在后续检查中恢复。
             self.store.save_summary_job(*args, "pending", now=now)
         try:
-            current_llm = self.llm.snapshot()
-            available = current_llm.available
-            budget_ok = available and current_llm.budget_ok()
+            current_llm = self.llm.snapshot() if not resuming else None
+            available = resuming or current_llm.available
+            budget_ok = resuming or (available and current_llm.budget_ok())
         except Exception as exc:  # noqa: BLE001
             detail = "模型配置读取失败：" + security.redact(str(exc))[:200] + "；已停止自动重试，请检查设置"
             self.store.save_summary_job(*args, "blocked", now=now, error=detail)
@@ -826,7 +832,7 @@ class Pipeline:
             self.store.save_summary_job(*args, "pending", now=now, error=reason + "，等待恢复")
             self._set_summary_schedule("pending", reason + "，自动摘要等待恢复", kind, start, end)
             return False
-        if not self.store.claim_summary_job(*args, now):
+        if not self.store.claim_summary_job(*args, now, resume=resuming):
             return False
         self._set_summary_schedule("running", f"正在生成 {start} 至 {end} 的{PERIOD_NAMES[kind]}", kind, start, end)
         request_started = time.monotonic()
@@ -847,9 +853,11 @@ class Pipeline:
                 cause = cause.__cause__
             retry_at = 0
             failed_at = now + (time.monotonic() - request_started)
-            if isinstance(cause, BudgetExceeded):
+            if isinstance(cause, BackgroundResponsePending):
+                state, retry_at = "retry", failed_at + 60
+            elif isinstance(cause, BudgetExceeded):
                 state = "pending"
-                attempts = max(0, attempts - 1)  # 请求前预算检查没有消费模型请求次数。
+                attempts = max(0, attempts - int(not resuming))
             elif isinstance(cause, MissingSummary):
                 state = "waiting"
                 attempts = max(0, attempts - 1)
@@ -910,6 +918,10 @@ class Pipeline:
             self.store.save_summary_job(kind, start, end, "done", now=time.time(), summary_id=saved["id"])
             state = "done"
         elif self.store.retry_summary_job(kind, start, end, revision, time.time()):
+            request = self.store.summary_request((kind, start, end))
+            if request and (not request["response_id"] or request["result"] and
+                            request["result"]["choices"][0]["finish_reason"] != "stop"):
+                self.store.clear_summary_request((kind, start, end))
             state = "pending"
         else:
             raise ValueError("任务状态已变化，请刷新后重新确认")
@@ -944,6 +956,10 @@ class Pipeline:
                 continue
             midnight = datetime.combine(now.date() + timedelta(days=1), datetime_time.min, SHANGHAI)
             wait = min(30 * 60, max(0.01, (midnight - now).total_seconds()))
+            for job in self.store.summary_jobs_in_state("retry"):
+                request = self.store.summary_request((job["kind"], job["start_date"], job["end_date"]))
+                if request and request["response_id"]:
+                    wait = min(wait, max(1, job["next_attempt_at"] - now.timestamp()))
             try:
                 await asyncio.wait_for(self._summary_wake.wait(), timeout=wait)
             except asyncio.TimeoutError:

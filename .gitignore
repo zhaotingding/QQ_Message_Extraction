@@ -26,6 +26,8 @@ _install/
 # 不入库的原因：二进制无法 review、体积与机器相关；克隆后自己打一次即可。
 消息萃取.exe
 msgx_launcher.exe
+QQ_Message_Extraction.exe
+QQ_Message_Extraction.new.exe
 *.spec
 
 # ---- Python 缓存 ----

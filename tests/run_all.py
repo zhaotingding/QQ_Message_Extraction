@@ -22,6 +22,7 @@ SUITES = [
     ("过滤规则", "test_filters.py"),
     ("可编辑发言人过滤名单", "test_sender_filters.py"),
     ("摘要流式响应与确认恢复", "test_summary_recovery.py"),
+    ("后台摘要断线与重启恢复", "test_background_summary.py"),
     ("计费口径", "test_cost.py"),
     ("逐请求消费明细", "test_usage.py"),
     ("每日消费趋势", "test_usage_chart.py"),
