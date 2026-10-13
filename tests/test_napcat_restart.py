@@ -17,7 +17,7 @@ from msgx import napcat
 class ManualRestartTests(unittest.TestCase):
     def setUp(self):
         workspace = Path(__file__).resolve().parents[1]
-        self.root = workspace / 'data/diagnostics/v0.7.8/restart-tests' / uuid.uuid4().hex
+        self.root = workspace / 'data/test-temp/napcat-restart' / uuid.uuid4().hex
         self.root.mkdir(parents=True)
         self.assertTrue(self.root.resolve().is_relative_to(workspace))
         self.addCleanup(shutil.rmtree, self.root)

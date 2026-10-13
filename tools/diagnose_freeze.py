@@ -412,7 +412,7 @@ def main() -> int:
         if state == "dead":
             verdicts.append(("事件进了队列但没人消费",
                              "ingest 循环死了 —— 这是**代码问题**，不是协议端问题。"
-                             "重启服务；若复现请保留 data/service.log。"))
+                             "重启服务；若复现请保留 data/logs/service.log。"))
         elif state == "alive":
             print("    ⇒ 排除服务侧：处理链路完好。")
             if link_fresh:
