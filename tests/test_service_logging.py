@@ -101,6 +101,48 @@ class ServiceLoggingTests(unittest.TestCase):
         self.assertIn("服务进程开始启动（PID", saved)
         self.assertIn("服务进程已正常退出（退出码 0）", saved)
 
+    def test_fault_log_keeps_live_handle_until_service_finishes(self):
+        handles = []
+
+        async def service(*_args):
+            stream = enable.call_args.kwargs["file"]
+            handles.append(stream)
+            self.assertFalse(stream.closed)
+            self.assertTrue(app.faulthandler.is_enabled())
+            app.faulthandler.dump_traceback(file=stream, all_threads=True)
+
+        real_disable = app.faulthandler.disable
+
+        def disable():
+            self.assertFalse(handles[-1].closed)
+            real_disable()
+
+        with patch.object(app, "load", return_value=self.cfg), \
+                patch.object(app, "cmd_run", new=AsyncMock(side_effect=service)), \
+                patch.object(app.faulthandler, "enable", wraps=app.faulthandler.enable) as enable, \
+                patch.object(app.faulthandler, "disable", side_effect=disable) as stop:
+            self.assertEqual(app.main(["run"]), 0)
+            self.assertEqual(app.main(["run"]), 0)
+        self.assertEqual(enable.call_count, 2)
+        self.assertTrue(enable.call_args.kwargs["all_threads"])
+        self.assertEqual(stop.call_count, 2)
+        self.assertTrue(all(stream.closed for stream in handles))
+        self.assertFalse(app.faulthandler.is_enabled())
+        saved = (self.path.parent / "service-fault.log").read_text(encoding="utf-8")
+        self.assertEqual(saved.count(f"服务致命错误诊断开始（PID {app.os.getpid()}）"), 2)
+        self.assertRegex(saved, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+        self.assertIn("test_service_logging.py", saved)
+
+    def test_unwritable_fault_log_does_not_stop_service(self):
+        with patch.object(app, "load", return_value=self.cfg), \
+                patch.object(app, "cmd_run", new=AsyncMock()), \
+                patch.object(Path, "open", side_effect=PermissionError), \
+                patch.object(app.faulthandler, "enable") as enable:
+            self.assertEqual(app.main(["run"]), 0)
+        enable.assert_not_called()
+        self.assertIn("致命错误诊断无法写入", self.stdout.getvalue())
+        self.assertIn("服务进程已正常退出", self.path.read_text(encoding="utf-8"))
+
     def test_exception_is_logged_and_redacted(self):
         key = "test-service-exit-secret"
         register(key)
@@ -111,6 +153,7 @@ class ServiceLoggingTests(unittest.TestCase):
         self.assertIn("服务进程异常退出（退出码 1）", saved)
         self.assertIn("RuntimeError", saved)
         self.assertNotIn(key, saved)
+        self.assertFalse(app.faulthandler.is_enabled())
 
     def test_explicit_startup_failure_retains_exit_code(self):
         with patch.object(app, "load", return_value=self.cfg), \
@@ -119,12 +162,16 @@ class ServiceLoggingTests(unittest.TestCase):
                 app.main(["run"])
         self.assertEqual(error.exception.code, 2)
         self.assertIn("退出码 2", self.path.read_text(encoding="utf-8"))
+        self.assertFalse(app.faulthandler.is_enabled())
 
     def test_non_service_command_does_not_create_service_log(self):
         with patch.object(app, "load", return_value=self.cfg), \
-                patch.object(app, "cmd_stats", new=AsyncMock()):
+                patch.object(app, "cmd_stats", new=AsyncMock()), \
+                patch.object(app, "_open_service_fault_log") as fault_log:
             self.assertEqual(app.main(["stats"]), 0)
+        fault_log.assert_not_called()
         self.assertFalse(self.path.exists())
+        self.assertFalse((self.path.parent / "service-fault.log").exists())
 
     def test_manual_summary_command_is_removed_before_loading_config(self):
         with patch.object(app, "load") as load:

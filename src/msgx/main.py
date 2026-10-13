@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import json
 import logging
 import os
 import sys
 from contextlib import suppress
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import TextIO
 
 from aiohttp import web
 
@@ -53,6 +56,23 @@ def setup_logging(level: str, log_path: Path | None = None) -> None:
     ))
     handler.addFilter(SecretFilter())
     logging.getLogger().addHandler(handler)
+
+
+def _open_service_fault_log(path: Path) -> TextIO | None:
+    """致命错误直接写文件描述符；服务结束前必须保持该句柄打开。"""
+    stream = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stream = path.open("a", encoding="utf-8")
+        stream.write(f"\n{datetime.now():%Y-%m-%d %H:%M:%S} 服务致命错误诊断开始（PID {os.getpid()}）\n")
+        stream.flush()
+        faulthandler.enable(file=stream, all_threads=True)
+        return stream
+    except OSError as exc:
+        if stream is not None:
+            stream.close()
+        logging.getLogger("msgx").warning("致命错误诊断无法写入（%s），继续运行", type(exc).__name__)
+        return None
 
 
 async def cmd_run(cfg: dict, stop_file: str | None = None) -> None:
@@ -248,8 +268,10 @@ def main(argv: list[str] | None = None) -> int:
     }[args.cmd]
 
     log = logging.getLogger("msgx")
+    fault_log = None
     if is_service:
         log.info("服务进程开始启动（PID %s）", os.getpid())
+        fault_log = _open_service_fault_log(abs_path(cfg, "db_path").parent / "logs/service-fault.log")
     try:
         asyncio.run(coro())
     except KeyboardInterrupt:
@@ -265,6 +287,10 @@ def main(argv: list[str] | None = None) -> int:
             raise
         log.exception("服务进程异常退出（退出码 1）")
         return 1
+    finally:
+        if fault_log is not None:
+            faulthandler.disable()
+            fault_log.close()
     if is_service:
         log.info("服务进程已正常退出（退出码 0）")
     return 0

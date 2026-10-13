@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import re
@@ -25,6 +26,7 @@ import tkinter as tk
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -80,6 +82,12 @@ class App:
 
         self.prefs = prefs_mod.load(self.prefs_file)
         self.proc: subprocess.Popen | None = None
+        self._service_wanted = False
+        self._service_recoveries = 0
+        self._service_restart_id = None
+        self._expected_service_exit = None
+        self._service_recovering = False
+        self._receiver_rebuilding = False
         self.events: queue.Queue = queue.Queue()
         self.closing = False
         self.health_busy = False
@@ -2044,13 +2052,17 @@ class App:
 
     # ---------------- 服务进程 ----------------
 
-    def start_service(self) -> bool:
+    def start_service(self, *, automatic: bool = False) -> bool:
         if self.proc is not None:
             return self.proc.poll() is None
-        if not self.save_prefs(silent=False):
-            return False
-        if self._login_config() is None:
-            return False
+        if not automatic:
+            self._cancel_service_recovery()
+            self._service_wanted = False
+            if not self.save_prefs(silent=False):
+                return False
+            if self._login_config() is None:
+                return False
+            self._service_recoveries = 0
 
         try:
             self.stop_file.unlink(missing_ok=True)  # 清掉旧停止信号，否则新进程会立刻退出
@@ -2067,9 +2079,10 @@ class App:
         env.pop("ALL_PROXY", None)
         env["NO_PROXY"] = "127.0.0.1,localhost"
 
-        cmd = [worker_python(), "-u", "-m", "msgx.main", "run", "--stop-file", str(self.stop_file)]
+        cmd = [worker_python(), "-u", "-m", "msgx.main"]
         if self.config_path:
             cmd += ["--config", str(self.config_path)]
+        cmd += ["run", "--stop-file", str(self.stop_file)]
 
         self._log_ui("正在启动服务…\n")
         self._trace_gui("请求启动消息服务")
@@ -2094,6 +2107,8 @@ class App:
             return False
 
         self.v_service.set("启动中")
+        self._service_wanted = True
+        self._service_recovering = automatic
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.status.set("服务进程已创建，正在等待接收端口就绪…")
@@ -2103,10 +2118,16 @@ class App:
 
     def stop_service(self) -> None:
         self._restart_cancelled = True
+        self._cancel_service_recovery()
         if self.proc is None:
+            self._service_wanted = False
+            self.btn_stop.configure(state="disabled")
+            self.status.set("已取消自动恢复，服务保持停止")
             return
         try:
             self.stop_file.touch()
+            self._service_wanted = False
+            self._expected_service_exit = self.proc
             self._trace_gui("用户请求停止消息服务，已写入停止信号")
         except OSError as exc:
             self.status.set(f"服务停止失败：{exc}")
@@ -2116,12 +2137,60 @@ class App:
         self.status.set("已发出停止信号，正在等待服务安全退出…")
 
     def _read_pipe(self, proc: subprocess.Popen) -> None:
-        """子线程：只把日志丢进队列，绝不碰控件。"""
+        """逐行保存包含原生 stderr 的输出；子线程不碰控件。"""
+        handler = None
+        try:
+            path = abs_path(self.cfg, "db_path").parent / "logs/service-output.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(path, maxBytes=2 * 1024 * 1024,
+                                          backupCount=3, encoding="utf-8")
+            handler.setFormatter(logging.Formatter(
+                f"%(asctime)s launcher_pid={proc.pid} %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S"))
+        except OSError as exc:
+            self.events.put(("note", f"服务输出日志无法保存（{type(exc).__name__}），继续接收消息"))
         try:
             for line in proc.stdout:  # type: ignore[union-attr]
+                line = security.redact(line)
+                if handler is not None:
+                    handler.emit(logging.LogRecord("msgx.output", logging.INFO, "", 0,
+                                                   line.rstrip("\r\n"), (), None))
                 self.events.put(("line", line))
         finally:
-            self.events.put(("exit", (proc, proc.wait())))
+            code = proc.wait()
+            if handler is not None:
+                handler.emit(logging.LogRecord("msgx.output", logging.INFO, "", 0,
+                                               f"服务输出结束，退出码 {code}", (), None))
+                handler.close()
+            self.events.put(("exit", (proc, code)))
+
+    def _cancel_service_recovery(self) -> None:
+        if self._service_restart_id is not None:
+            self.root.after_cancel(self._service_restart_id)
+            self._service_restart_id = None
+
+    def _schedule_service_recovery(self) -> None:
+        if self._service_recoveries >= 3:
+            self._service_wanted = False
+            note = "接收服务连续异常退出，已停止自动恢复；请查看日志并手动启动服务"
+        else:
+            delay = (5, 15, 30)[self._service_recoveries]
+            self._service_recoveries += 1
+            self._service_restart_id = self.root.after(delay * 1000, self._recover_service)
+            self.btn_stop.configure(state="normal")
+            note = f"接收服务异常退出，{delay} 秒后自动恢复（{self._service_recoveries}/3）；可点击停止服务取消"
+        self.status.set(note)
+        self._log_ui(f"[界面] {note}\n")
+        self._trace_gui(note)
+
+    def _recover_service(self) -> None:
+        self._service_restart_id = None
+        if self.closing or not self._service_wanted or self.proc is not None:
+            return
+        if not self.start_service(automatic=True):
+            self._service_wanted = False
+            self.btn_stop.configure(state="disabled")
+            self.status.set("接收服务自动恢复未能启动；请查看日志并手动启动服务")
 
 
 
@@ -2736,12 +2805,16 @@ class App:
 
     def _login_finished(self, result: dict) -> None:
         self._login_busy = False
+        rebuilding = self._receiver_rebuilding
+        self._receiver_rebuilding = False
         self.btn_relogin.configure(state="normal")
         if self.btn_restart is not None:
             self.btn_restart.configure(state="normal")
         self.status.set(result["note"])
         self._log_ui(f"[界面] {result['note']}\n")
         self._trace_gui(f"协议操作结果：{result['note']}")
+        if rebuilding and self.proc is None and self._service_wanted and not self.closing:
+            self._schedule_service_recovery()
         if result.get("ok") or result.get("scan"):
             self._login_pending = True
             self._login_account = str(result.get("account") or self.prefs.get("qq_account") or "")
@@ -2808,6 +2881,8 @@ class App:
             self.status.set("已取消强制重启，进程保持原状")
             return
         self._login_busy = True
+        self._receiver_rebuilding = True
+        self._cancel_service_recovery()
         self._restart_cancelled = False
         self._login_verify_since = time.time()
         self._login_account = account
@@ -2858,6 +2933,7 @@ class App:
         if proc is None or proc.poll() is not None or proc is not self.proc:
             return
         self.stop_file.touch()
+        self._expected_service_exit = proc
         try:
             proc.wait(timeout=5)
             return
@@ -3043,7 +3119,7 @@ class App:
             self.health_busy = True
             threading.Thread(target=self._fetch_health, args=(self.proc,), daemon=True).start()
         elif self.proc is None:
-            self.v_service.set("未运行")
+            self.v_service.set("等待自动恢复" if self._service_restart_id is not None else "未运行")
             self.v_peer.set("消息服务未运行 · 协议端无法接入")
             self.v_protocol_detail.set("请启动服务；强制重启也会先启动接收服务。此状态不表示 QQ 登录失效。")
             self.v_stored.set("—")
@@ -3195,12 +3271,16 @@ class App:
             if gen == self.qr_gen and self.qr_watching and not self.closing:
                 self._show_qrcode(path)
         elif kind == "exit":
+            exited_proc = self.proc
             if isinstance(value, tuple):
                 proc, code = value
                 if proc is not self.proc:
                     return  # 旧进程的排队退出事件不能清掉新服务
                 value = code
-            self._trace_gui(f"消息服务已退出 code={value}")
+            expected = exited_proc is not None and exited_proc is self._expected_service_exit
+            self._expected_service_exit = None
+            self._service_recovering = False
+            self._trace_gui(f"消息服务已退出 code={value} launcher_pid={getattr(exited_proc, 'pid', None)} expected={expected}")
             if self.proc is not None and self.proc.stdout:
                 try:
                     self.proc.stdout.close()
@@ -3214,6 +3294,11 @@ class App:
             self.btn_stop.configure(state="disabled")
             self._log_ui(f"\n[界面] 服务进程已退出（退出码 {value}）\n")
             self.status.set("服务已停止" if value == 0 else f"服务异常退出（{value}），请看日志")
+            if value in (0, 2):
+                self._service_wanted = False
+            if (value not in (0, 2) and self._service_wanted and not expected
+                    and not self.closing and not self._receiver_rebuilding):
+                self._schedule_service_recovery()
 
     def _apply_health(self, data: dict | None) -> None:
         self._verify_login_message(data or {})
@@ -3225,6 +3310,14 @@ class App:
             self.btn_relogin.grid_remove()
             return
         self.v_service.set("运行中")
+        if data.get("uptime_seconds", 0) >= 300:
+            self._service_recoveries = 0
+        if self._service_recovering:
+            self._service_recovering = False
+            note = "接收服务已重新启动，健康检查通过"
+            self.status.set(note)
+            self._log_ui(f"[界面] {note}\n")
+            self._trace_gui(note)
         peers = data.get("ws_peers") or []
         protocol = data.get("protocol") or {}
         self._protocol_state = protocol
@@ -3311,6 +3404,9 @@ class App:
         if not self._save_report_notes():
             return
         if self.proc is None:
+            self.closing = True
+            self._service_wanted = False
+            self._cancel_service_recovery()
             self.qr_watching = False
             self.v_rt_auto.set(False)
             self.root.destroy()
