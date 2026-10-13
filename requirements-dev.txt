@@ -1,5 +1,0 @@
-# 开发/构建期依赖 —— 运行程序不需要这些。
-# 只有「重新打包 消息萃取.exe」时才要装：
-#     .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-# 打包命令见 README 的「重新打包 消息萃取.exe」一节。
-pyinstaller==6.22.3

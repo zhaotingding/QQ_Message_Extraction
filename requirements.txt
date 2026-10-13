@@ -1,5 +1,0 @@
-aiohttp>=3.9
-pillow>=10.0
-# 必须锁 1.2.3：1.3.x 改了 OCR 返回结构（不再返回 tuple），未在 1.3.x 上实测。
-# 详见 requirements.lock.txt 顶部注释。
-rapidocr-onnxruntime==1.2.3

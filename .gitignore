@@ -1,44 +1,25 @@
-# ---- 运行时产物（含真实聊天记录，绝不入库）----
+# 本地数据、密钥、环境和生成产物不入库；编辑器只共享明确放行项。
 data/
 runtime/
 *.log
-
-# ---- 环境与密钥 ----
 .venv/
-# 重建环境时留下的临时备份（venv 内部自带一个内容为 "*" 的 .gitignore 能挡住它，
-# 但那条规则可能被清理掉，这里显式再挡一层）
 .venv.bak*/
 venv/
 .env
-
-# ---- 界面本地偏好（每人一份，不入库）----
 .ui/
-
-# ---- AI 助手的工作记忆（含本机路径，与他人环境无关）----
-# 需要长期留存的踩坑记录已整理进 README 与 CHANGELOG。
 .workbuddy/
-
-# ---- 一次性安装物（NapCat 压缩包等大文件）----
 _install/
-
-# ---- 打包产物：主程序 exe 是构建出来的，不是源码 ----
-# 它由 tools/exe_main.py 打包而成（命令见 README「重新打包」一节）。
-# 不入库的原因：二进制无法 review、体积与机器相关；克隆后自己打一次即可。
 消息萃取.exe
 msgx_launcher.exe
 QQ_Message_Extraction.exe
 QQ_Message_Extraction.new.exe
 *.spec
-
-# ---- Python 缓存 ----
 __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
 build/
 dist/
-
-# ---- 编辑器：只放行共享的配置 ----
 .vscode/*
 !.vscode/settings.json
 !.vscode/extensions.json

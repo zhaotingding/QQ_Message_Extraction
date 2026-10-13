@@ -28,7 +28,7 @@ if not defined PYTHON_EXE (
   echo.
   echo 请在项目根目录执行下面两行来创建环境:
   echo     py -3.13 -m venv .venv
-  echo     .venv\Scripts\python.exe -m pip install -r requirements.lock.txt
+  echo     .venv\Scripts\python.exe -m pip install -e .
   echo.
   echo 注意: 不要用 Anaconda 基础环境的 python，依赖是装在独立环境里的。
   exit /b 1

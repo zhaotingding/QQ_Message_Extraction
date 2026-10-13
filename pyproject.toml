@@ -1,12 +1,6 @@
-# 消息萃取（msgx）项目配置
-#
-# 构建系统：setuptools（src 布局）
-# Python 要求：>= 3.11（用到 tomllib，3.10 及以下不可用）
-#
-# 版本号是单一来源：写在这里的 version 从 src/msgx/__init__.py 的 __version__ 读取，
-# 发版时只改那一个文件即可。
+# 安装、运行环境与打包依赖的唯一配置。版本从 msgx.__version__ 读取。
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -17,15 +11,41 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 
-# 与 requirements.txt 保持一致。复现完全相同的环境请用 requirements.lock.txt。
+# 保留当前运行环境的全部 21 个精确版本；升级时一起验证兼容性。
+# RapidOCR 1.2.3 是已验证版本，不能因合并配置顺带升级 OCR 接口。
 dependencies = [
-  "aiohttp>=3.9",
-  "pillow>=10.0",
+  "aiohappyeyeballs==2.7.1",
+  "aiohttp==3.14.3",
+  "aiosignal==1.4.0",
+  "attrs==26.1.0",
+  "flatbuffers==25.12.19",
+  "frozenlist==1.8.0",
+  "idna==3.20",
+  "multidict==6.9.0",
+  "numpy==2.5.3",
+  "onnxruntime==1.30.0",
+  "opencv-python==5.0.0.93",
+  "packaging==26.3",
+  "pillow==12.3.0",
+  "propcache==0.5.4",
+  "protobuf==7.36.2",
+  "pyclipper==1.4.0",
+  "PyYAML==6.0.3",
   "rapidocr-onnxruntime==1.2.3",
+  "shapely==2.1.2",
+  "six==1.17.0",
+  "yarl==1.25.1",
 ]
 
-[project.urls]
-Documentation = "https://github.com/"
+[project.optional-dependencies]
+build = [
+  "altgraph==0.17.5",
+  "pefile==2024.8.26; sys_platform == 'win32'",
+  "pyinstaller==6.22.3",
+  "pyinstaller-hooks-contrib==2026.7",
+  "pywin32-ctypes==0.2.3; sys_platform == 'win32'",
+  "setuptools==84.0.0",
+]
 
 [tool.setuptools.dynamic]
 version = { attr = "msgx.__version__" }

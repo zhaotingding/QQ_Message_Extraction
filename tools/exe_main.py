@@ -1,4 +1,4 @@
-"""主程序「消息萃取.exe」的入口（PyInstaller 冻结后运行的就是本文件）。
+"""主程序 QQ_Message_Extraction.exe 的入口（PyInstaller 冻结后运行的就是本文件）。
 
 职责只有一个：**打开图形界面**。服务不由它启动，用户自己在界面里点「启动服务」。
 
@@ -6,7 +6,7 @@
 
 把 onnxruntime / rapidocr / numpy 一起塞进 exe 会有两个明显代价：
 产物体积达数百 MB，且 onefile 每次启动都要把这几百 MB 解压到临时目录（启动慢好几秒）。
-而本项目本来就必须有自己的 `.venv`（依赖装在项目里，见 requirements.lock.txt），
+而本项目本来就必须有自己的 `.venv`（依赖装在项目里，见 pyproject.toml），
 所以 exe 只做「找到 .venv 并拉起界面」这一件事：
 
 - 体积约 10MB，秒开
@@ -76,7 +76,7 @@ def main() -> int:
         _report(
             "找不到界面程序。",
             f"期望位置：{GUI_ENTRY}\n\n"
-            "请确认「消息萃取.exe」位于项目根目录，且 tools\\gui_entry.py 存在。",
+            "请确认 QQ_Message_Extraction.exe 位于项目根目录，且 tools\\gui_entry.py 存在。",
         )
         return 1
 
@@ -87,7 +87,7 @@ def main() -> int:
             f"期望位置：{PROJECT_DIR}\\.venv\\Scripts\\pythonw.exe\n\n"
             "本项目把依赖装在项目内的 .venv 里。请在项目根目录打开终端执行：\n"
             "    py -3.13 -m venv .venv\n"
-            "    .venv\\Scripts\\python.exe -m pip install -r requirements.lock.txt\n\n"
+            "    .venv\\Scripts\\python.exe -m pip install -e .\n\n"
             "详见 README.md 的「安装」一节。",
         )
         return 1

@@ -1,24 +1,8 @@
-# 换行与编码策略
-#
-# 背景：本项目在 Windows 上运行，.bat/.cmd 必须是 GBK 编码 + CRLF 换行，
-# 否则在控制台（代码页 936）里中文会乱码。因此这些文件必须**字节原样**存取，
-# 不能参与任何换行规范化。
-
-# 其余文本统一以 LF 存储**并检出**（eol=lf）。不加 eol 的话 git 会在检出时
-# 转成 CRLF，每次操作都刷一屏 "LF will be replaced by CRLF" 警告，噪音很大；
-# 而且同一个仓库在不同机器上换行不一致，会产生无意义的 diff。
+# 普通文本统一 LF；批处理、VBS 保持原始字节；资源按二进制处理。
 * text=auto eol=lf
-
-# Windows 批处理：禁止任何转换（GBK 字节原样）
-*.bat -text
-*.cmd -text
-
-# 隐藏启动器：由 napcat.py 从源码常量按需重写（纯 ASCII + LF），
-# 必须**字节原样**存取 —— 一旦被规范化成 CRLF，每次启动都会发现「内容不一致」
-# 而重写一遍，白白产生噪音。wscript 读 LF 的 .vbs 没有问题（已实测）。
+*.bat -text whitespace=cr-at-eol
+*.cmd -text whitespace=cr-at-eol
 *.vbs -text
-
-# 二进制资源
 *.png binary
 *.jpg binary
 *.jpeg binary

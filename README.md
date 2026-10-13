@@ -92,8 +92,8 @@ re:价格\s*[:：]\s*\d+
 | NapCat | `NapCat.Shell.zip` | 见下方安装步骤。**不要**用 OneKey 包 |
 | 模型 API Key | 可选 | 默认 OpenAI 官方；不配也能接收消息，但不生成模型摘要、不调用图片解析 |
 
-依赖只有 3 个直接包（`aiohttp` / `pillow` / `rapidocr-onnxruntime`），全部支持 pip 直接安装，
-不需要 paddle、torch、Node.js。
+核心依赖为 `aiohttp` / `pillow` / `rapidocr-onnxruntime`，运行环境的 21 个包和构建工具
+统一在 `pyproject.toml` 中固定版本。不需要 paddle、torch、Node.js。
 
 ---
 
@@ -104,11 +104,12 @@ re:价格\s*[:：]\s*\d+
 ```powershell
 # 在项目根目录执行。"py -3.13" 换成你那个带 tkinter 的解释器
 py -3.13 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.lock.txt
+.venv\Scripts\python.exe -m pip install -e .
 ```
 
-`requirements.lock.txt` 是一份**实测跑通的环境快照**（21 个包，含传递依赖）。
-不要用 `requirements.txt` 复现环境 —— 它只声明直接依赖，版本范围较宽。
+`pyproject.toml` 是唯一依赖配置，包含 21 个精确版本的运行包及可选 `build` 构建工具。
+`-e` 安装保留源码路径，后续修改 `src/` 直接生效。Python 和操作系统也应采用已验证环境；
+固定包版本不能单独保证不同平台都能安装。当前验证记录见本文件末尾「单文件依赖配置」。
 
 > 如果 pip 装不上，先试默认源（很多情况下本地缓存里就有全部 wheel）；
 > 换国内镜像出问题时优先怀疑镜像本身，而不是网络。
@@ -665,6 +666,7 @@ OpenAI 返回的缓存写入 Token 单独按输入单价的 1.25 倍估算，不
 启动器代码或图标变化时重新构建（普通业务代码改动无需重打包）：
 
 ```powershell
+.venv\Scripts\python.exe -m pip install -e ".[build]"
 .venv\Scripts\python.exe tools\build_launcher.py
 ```
 
@@ -768,17 +770,14 @@ python tools/make_demo.py --post --reset
 │   └── reports/              ← 生成的摘要 HTML
 ├── .ui/                      ← 界面本地偏好，不入库
 │   └── preferences.json
-├── 消息萃取.exe              ← ★ 主程序：双击即打开图形界面
+├── QQ_Message_Extraction.exe ← ★ 主程序：双击即打开图形界面
 ├── config.toml               ← 配置文件（入库，团队共享）
-├── requirements.txt          ← 直接依赖（人工维护）
-├── requirements.lock.txt     ← 锁定版本（实测快照，不手工改）
-├── requirements-dev.txt      ← 只给打包用（PyInstaller），运行时不需要
 ├── .env.example              ← 环境变量模板
 ├── CHANGELOG.md
-└── pyproject.toml
+└── pyproject.toml            ← 唯一依赖配置：运行精确版本、构建工具、包元数据
 ```
 
-**`消息萃取.exe` 不在版本库里**（它是构建产物，已加入 `.gitignore`）。克隆仓库后按上面「重新打包」一节自行生成即可，或者直接用 `tools\START_HERE.cmd` 打开界面。
+**`QQ_Message_Extraction.exe` 不在版本库里**（它是构建产物，已加入 `.gitignore`）。克隆仓库后按上面「重新打包」一节自行生成即可，或者直接用 `tools\START_HERE.cmd` 打开界面。
 
 **代码为什么放在 `src/`？** 避免测试时把当前目录误当包导入，也让「哪些是业务代码、哪些是脚本」一目了然。
 `config.py` 中项目根是**三级上溯**（`src/msgx/config.py` → `src/` → 项目根），少写一层会导致配置读不到、数据库凭空重建。
@@ -1121,6 +1120,20 @@ python tools/check_napcat_env.py --probe    # 附带端口连通性探测
 **只读，不会修改任何东西。**
 
 ---
+
+## 单文件依赖配置
+
+运行与构建依赖均只维护 `pyproject.toml`，不再维护三份重复 requirements 清单。
+更新包版本时，在独立环境验证安装、依赖一致性、核心入口与 OCR，再更新验证记录。
+`.gitignore` 和 `.gitattributes` 各自保留：分别处理不入库文件和文件字节/换行规则。
+
+2026-10-13，Windows / Python 3.13.5 的全新独立 venv 验收通过：从 PyPI 安装 `-e .` 和
+`-e ".[build]"`，21 个运行包精确版本保持一致，`pip check`、wheel 构建、19 个业务模块导入、
+CLI 帮助和 Tk 初始化通过；本地合成图片 OCR 正确识别 `MSGX 2026 TEST`。
+隔离安装的项目元数据为 0.9.4.1。当前运行环境、用户配置和 API 未参与安装验收。
+证据位于 `data/diagnostics/dependency-singlefile-20261013/verification.json`。
+启动器已重建并在隔离目录验收新安装提示；EXE 的 16/32 像素图标资源与已有本地图标一致，
+记录见同目录 `launcher-verification.json`。本轮未重启正在运行的界面或接收服务。
 
 ## 许可
 

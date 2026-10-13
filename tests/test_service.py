@@ -41,7 +41,7 @@ def main() -> int:
     if not PY.exists():
         print(f"找不到项目虚拟环境：{PY}")
         print("请先执行：py -3.13 -m venv .venv")
-        print("          .venv\\Scripts\\python.exe -m pip install -r requirements.lock.txt")
+        print("          .venv\\Scripts\\python.exe -m pip install -e .")
         return 1
 
     ws_port, http_port = free_port(), free_port()
