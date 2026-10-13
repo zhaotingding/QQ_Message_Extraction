@@ -108,7 +108,7 @@ def _resolve(raw: str) -> Path | None:
 def resolve_dir(cfg: dict) -> Path | None:
     """NapCat 安装目录。
 
-    配置里**明确填了** ``[napcat] dir`` 就尊重它、不做二次猜测 —— 否则「填错路径」
+    配置里**明确填了** ``napcat.dir`` 就尊重它、不做二次猜测 —— 否则「填错路径」
     会静默地启动到别处的另一个 NapCat 上，这比报错难查得多。
     只有完全没配时才依次尝试 ``NAPCAT_HOME`` 与几个常见位置。
     """
@@ -127,12 +127,12 @@ def resolve_dir(cfg: dict) -> Path | None:
 
 
 def start_script(cfg: dict) -> Path | None:
-    """``[napcat] start_script`` 的绝对路径（可见排障模式用）。"""
+    """``napcat.start_script`` 的绝对路径（可见排障模式用）。"""
     return _resolve((cfg.get("napcat") or {}).get("start_script"))
 
 
 def restart_script(cfg: dict) -> Path | None:
-    """``[napcat] restart_script`` 的绝对路径（一键重置：全退 + 重登）。"""
+    """``napcat.restart_script`` 的绝对路径（一键重置：全退 + 重登）。"""
     return _resolve((cfg.get("napcat") or {}).get("restart_script"))
 
 
@@ -533,7 +533,7 @@ def log_tail(cfg: dict, lines: int = 400) -> str:
         # 「否定的证据」，直接误导用户（消息明明一直在进，却让他以为协议端没起来）。
         # 判断「是否在跑」只该看进程与实际入库的消息，不该看日志文件在不在。
         if d is None:
-            why = "（未配置 [napcat] dir，无法定位 NapCat 目录）"
+            why = "（未配置 napcat.dir，无法定位 NapCat 目录）"
         elif not (d / "logs").is_dir():
             why = f"（{d}\\logs\\ 目录不存在）"
         else:
@@ -592,7 +592,7 @@ def launch(cfg: dict, visible: bool = False) -> dict:
             cand = d / "launcher.bat"
             script = cand if cand.exists() else None
         if script is None:
-            return {"ok": False, "error": "未配置 [napcat] start_script，也找不到 launcher.bat"}
+            return {"ok": False, "error": "未配置 napcat.start_script，也找不到 launcher.bat"}
         if not script.exists():
             return {"ok": False, "error": f"启动脚本不存在：{script}"}
         _append_log(lp, header + f"  模式   : 可见（os.startfile）\n  脚本   : {script}\n")
@@ -638,13 +638,13 @@ def launch(cfg: dict, visible: bool = False) -> dict:
             if res.get("ok"):
                 res["mode"] = "visible-fallback"
                 res["note"] = (
-                    "没配置 [napcat] dir，无法定位 launcher.bat，因此改用可见模式启动。"
+                    "没配置 napcat.dir，无法定位 launcher.bat，因此改用可见模式启动。"
                     "填上 dir 后即可隐藏启动。"
                 )
             return res
         return {
             "ok": False,
-            "error": "没有配置 NapCat 目录：请在 config.toml 的 [napcat] dir 里填上安装目录"
+            "error": "没有配置 NapCat 目录：请在 config.yaml 的 napcat.dir 里填上安装目录"
                      "（例如 D:\\App\\NapCat），或在界面设置里改用可见模式。",
         }
     if pf["missing"]:
@@ -658,7 +658,7 @@ def launch(cfg: dict, visible: bool = False) -> dict:
             "ok": False,
             "error": "没能定位到 QQ.exe（注册表里没有 QQ 的安装记录）。\n\n"
             "NapCat 必须注入 QQ 才能工作。请确认 QQ 已安装；"
-            "或在 config.toml 的 [napcat] 段直接填 qq_path = \"D:\\\\App\\\\QQ\\\\QQ.exe\"。",
+            "或在 config.yaml 的 napcat 段直接填 qq_path: \"D:\\\\App\\\\QQ\\\\QQ.exe\"。",
         }
 
     vbs = vbs_path()
@@ -698,13 +698,13 @@ def restart(cfg: dict) -> dict:
     """
     script = restart_script(cfg)
     if script is None:
-        return {"ok": False, "error": "未配置 [napcat] restart_script（默认 tools/重启协议端.bat）"}
+        return {"ok": False, "error": "未配置 napcat.restart_script（默认 tools/重启协议端.bat）"}
     if not script.exists():
         return {"ok": False, "error": f"重置脚本不存在：{script}"}
 
     d = resolve_dir(cfg)
     if d is None:
-        return {"ok": False, "error": "没有配置 NapCat 目录：请在 config.toml 的 [napcat] dir 里填上安装目录"}
+        return {"ok": False, "error": "没有配置 NapCat 目录：请在 config.yaml 的 napcat.dir 里填上安装目录"}
     if not (d / "launcher.bat").exists():
         return {"ok": False, "error": f"{d} 里没有 launcher.bat —— 目录不对，重置会拉起别的东西"}
 

@@ -36,7 +36,7 @@ class FeedbackTests(unittest.TestCase):
             for method in ("refresh_groups", "refresh_report_history", "_tick_health", "_tick_realtime", "_trace_gui"):
                 setup.enter_context(patch.object(gui.App, method))
             self.app = gui.App(self.root)
-        self.app.prefs_file = Path(self.tmp.name) / "prefs.json"
+        self.app.prefs_file = Path(self.tmp.name) / "prefs.yaml"
         self.app.stop_file = Path(self.tmp.name) / "stop.signal"
         self.patches.enter_context(patch.object(self.app, "_trace_gui"))
         self.key = "sk-feedback-SYNTHETIC-NOT-REAL-123456789"
@@ -260,7 +260,7 @@ class FeedbackTests(unittest.TestCase):
 
     def test_reload_invalid_file_preserves_edits_and_close_cancel_preserves_refresh(self):
         app = self.app
-        app.prefs_file.write_text("invalid json", encoding="utf-8")
+        app.prefs_file.write_text("filters: [", encoding="utf-8")
         app.v_summary_chars.set("3456")
         app.reload_prefs()
         self.assertIn("重新加载失败", app.v_api_feedback.get())

@@ -75,7 +75,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         app.cfg = copy.deepcopy(DEFAULTS)
         app.cfg["app"]["db_path"] = str(self.folder / "messages.db")
         app.config_path = None
-        app.prefs_file = self.folder / "prefs.json"
+        app.prefs_file = self.folder / "prefs.yaml"
         app.stop_file = self.folder / "stop.signal"
         app.prefs = {"qq_account": "100"}
         app.proc = process()
@@ -234,7 +234,7 @@ class ServiceRecoveryTests(unittest.TestCase):
 
     def test_custom_config_precedes_subcommand_for_manual_and_automatic_start(self):
         app = self.app
-        app.config_path = self.folder / "config.toml"
+        app.config_path = self.folder / "config.yaml"
         for automatic in (False, True):
             with self.subTest(automatic=automatic):
                 app.proc = None

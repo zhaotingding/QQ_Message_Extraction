@@ -77,7 +77,7 @@ class MessageKeywordTests(unittest.TestCase):
 
     def test_rules_and_messages_survive_reopening_without_writes(self):
         ident = self.add("持久关键词")
-        path = Path(self.temp.name) / "prefs.json"
+        path = Path(self.temp.name) / "prefs.yaml"
         prefs.save({"message_keywords": ["持久"], "qq_account": "100"}, path)
         settings = prefs.load(path)
         self.assertEqual(settings["qq_account"], "100")

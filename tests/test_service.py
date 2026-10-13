@@ -47,23 +47,23 @@ def main() -> int:
     ws_port, http_port = free_port(), free_port()
     tmp = Path(tempfile.mkdtemp(prefix="msgx_test_"))
     stop_path = tmp / "stop.signal"
-    cfg_path = tmp / "config.toml"
+    cfg_path = tmp / "config.yaml"
     cfg_path.write_text(
         "\n".join(
             [
-                "[app]",
-                f'db_path = "{(tmp / "t.db").as_posix()}"',
-                f'media_dir = "{(tmp / "media").as_posix()}"',
-                f'report_dir = "{(tmp / "reports").as_posix()}"',
-                'log_level = "INFO"',
+                "app:",
+                f'  db_path: "{(tmp / "t.db").as_posix()}"',
+                f'  media_dir: "{(tmp / "media").as_posix()}"',
+                f'  report_dir: "{(tmp / "reports").as_posix()}"',
+                '  log_level: "INFO"',
                 "",
-                "[onebot]",
-                'host = "127.0.0.1"',
-                f"ws_port = {ws_port}",
-                f"http_port = {http_port}",
+                "onebot:",
+                '  host: "127.0.0.1"',
+                f"  ws_port: {ws_port}",
+                f"  http_port: {http_port}",
                 "",
-                "[llm]",
-                "enabled = false",  # 不调模型、不花钱
+                "llm:",
+                "  enabled: false",  # 不调模型、不花钱
                 "",
             ]
         ),

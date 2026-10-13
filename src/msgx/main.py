@@ -227,7 +227,7 @@ async def cmd_prune(cfg: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="msgx", description="QQ 群消息萃取服务")
-    ap.add_argument("-c", "--config", default=None, help="配置文件路径（默认 config.toml）")
+    ap.add_argument("-c", "--config", default=None, help="配置文件路径（默认 config.yaml）")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     # --stop-file 必须挂在 run 子命令上。挂在顶层的话，写成
@@ -255,7 +255,11 @@ def main(argv: list[str] | None = None) -> int:
 
         return gui_main(args.config)
 
-    cfg = load(args.config)
+    try:
+        cfg = load(args.config)
+    except (OSError, ValueError) as exc:
+        print(f"配置读取失败：{exc}", file=sys.stderr)
+        return 2
     is_service = args.cmd == "run"
     setup_logging(cfg["app"]["log_level"],
                   abs_path(cfg, "db_path").parent / "logs/service.log" if is_service else None)

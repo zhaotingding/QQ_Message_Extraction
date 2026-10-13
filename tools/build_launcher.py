@@ -1,17 +1,18 @@
 """重新构建现有启动器，始终沿用本机保存的自定义图标。"""
 from datetime import datetime
-import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from msgx import prefs, yaml_config
 
 
 def selected_icon(root: Path) -> Path | None:
-    preferences = root / ".ui" / "preferences.json"
-    saved = json.loads(preferences.read_text(encoding="utf-8")) if preferences.exists() else {}
+    preferences = prefs.prefs_path(root)
+    saved = yaml_config.read(preferences) if preferences.exists() else {}
     path = (saved.get("ui") or {}).get("icon_path")
     if path and Path(path).is_file():
         return Path(path)

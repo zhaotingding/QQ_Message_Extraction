@@ -167,7 +167,7 @@ qr_shown_mtime / _qr_fail_logged / qr_win / events(queue.Queue)`。
 3. 用户是低容忍度、直接反馈型：修 bug 时**不要引入新的弹窗/确认框**（他已经受够了
    乱弹窗）；日志文案要可读、不吓人。
 4. **绝不自动应答/自动登录/自动重启用户账号**：自动化只到「弹二维码」为止（风控）。
-5. 不要动 `config.toml` 里与本案无关的字段；不要动大号（1371109209）相关的一切。
+5. 不要动 `config.toml`（历史文件名，现已迁移为 `config.yaml`）里与本案无关的字段；不要动大号（1371109209）相关的一切。
 6. 代码风格与现仓库一致：中文注释、注释讲「为什么」、每个修复注明版本与根因；
    改完更新 `CHANGELOG.md`（发版 = 改 `src/msgx/__init__.py` 的 `__version__` →
    CHANGELOG → commit → `git tag vX.Y.Z`）。

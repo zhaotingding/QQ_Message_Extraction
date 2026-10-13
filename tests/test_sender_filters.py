@@ -23,7 +23,7 @@ START = int(DAY.timestamp())
 class SenderFilterTests(unittest.TestCase):
     def test_defaults_and_explicit_empty_survive_save_reload(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "prefs.json"
+            path = Path(tmp) / "prefs.yaml"
             prefs.save({"filters": {"skip_image_only": True}}, path)
             self.assertEqual(prefs.load(path)["filters"]["blocked_senders"], ["Q群管家", "智能客服"])
             for names in (["自定义客服", "O'Brien"], []):

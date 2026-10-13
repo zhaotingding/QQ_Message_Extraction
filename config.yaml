@@ -1,0 +1,103 @@
+# 消息萃取共享配置。省略的键使用内置默认值；保存后重启服务生效。
+# 本机设置由 .ui/preferences.yaml 覆盖；真实 API 密钥由界面保存到 Windows 凭据管理器。
+# 字符串账号、群号、日期和正则请加引号；Windows 路径推荐单引号，保留反斜杠。
+
+# 路径相对项目根目录；也可以填写绝对路径。
+app:
+  db_path: data/msgx.db
+  media_dir: data/media
+  report_dir: data/reports
+  log_level: INFO
+
+# NapCat 反向 WS：ws://127.0.0.1:6700/onebot/ws；HTTP 上报使用 /onebot。
+onebot:
+  host: 127.0.0.1
+  ws_port: 6700
+  http_port: 6701
+  access_token: ''
+
+# groups 为空表示全部群；names 的群号键必须是字符串。
+watch:
+  groups: []
+  names: {}
+
+# 未启用 api 时的旧 DeepSeek 参数。api_key_env 仅读系统环境，程序不加载 .env。
+llm:
+  enabled: true
+  base_url: https://api.deepseek.com
+  model: deepseek-flash
+  vision_model: deepseek-flash
+  api_key_env: DEEPSEEK_API_KEY
+  api_key: ''
+  max_daily_cost_cny: 10.0
+  price_cache_hit_cny_per_mtok: 0.02
+  price_cache_miss_cny_per_mtok: 1.0
+  price_output_cny_per_mtok: 4.0
+  peak_multiplier: 2.0
+  peak_windows_utc: 01:00-04:00,06:00-10:00
+  timeout_seconds: 90
+  post_retries: 4
+  think_min_tokens: 1200
+  vision_max_side: 1280
+  vision_jpeg_quality: 85
+
+# OCR 在本机执行；图片语义由界面手动操作调用 API。
+media:
+  ocr_enabled: true
+  vision_enabled: true
+  max_download_mb: 20
+  images_per_minute: 60
+
+# target_chars 是日报目标字数；周报、月报分别使用 2 倍和 3 倍。prompt 为空用内置提示词。
+summary:
+  prompt: ''
+  target_chars: 3000
+
+# 协议端脚本与安装目录；qq_path 为空时从注册表定位 QQ。
+napcat:
+  start_script: tools/start_napcat.bat
+  restart_script: tools/重启协议端.bat
+
+# 检查消息接收状态；保持现有恢复规则。
+watchdog:
+  enabled: true
+  check_seconds: 300
+  stale_minutes: 30
+  busy_min_messages: 5
+  baseline_days: 7
+  dir: D:\App\NapCat
+  hidden: true
+  log_file: data/logs/napcat.log
+  qq_path: ''
+
+# 旧 DeepSeek 平台账单；platform_token 属于本机凭证，不应写入共享配置。
+billing:
+  platform_token: ''
+  platform_enabled: true
+  cache_seconds: 600
+  start_year: 0
+  start_month: 0
+  timeout_seconds: 20
+
+# 清理原始消息和图片的保留天数。
+retention:
+  keep_days_raw: 90
+  keep_days_media: 30
+
+# 当前 API 的公开参数；费率是 Standard 基准，Flex 倍率由程序按实际档位计算。
+api:
+  provider: OpenAI 官方
+  base_url: https://api.openai.com/v1
+  protocol: responses
+  model: gpt-6-luna
+  reasoning: none
+  context_tokens: 1050000
+  max_output_tokens: 128000
+  input_price: 0.1
+  cached_price: 0.01
+  output_price: 0.5
+  currency: USD
+  usd_cny: 7.0
+  long_context_threshold: 272000
+  long_input_multiplier: 2.0
+  long_output_multiplier: 1.5

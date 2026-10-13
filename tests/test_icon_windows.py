@@ -75,7 +75,7 @@ class WindowIconTests(unittest.TestCase):
                 root.attributes("-alpha", 0)
                 app = App.__new__(App)
                 app.root, app.prefs = root, {"ui": {"last_tab": 0}}
-                app.prefs_file = Path(folder) / "preferences.json"
+                app.prefs_file = Path(folder) / "preferences.yaml"
                 app.v_icon_status = tk.StringVar(root)
                 app._apply_app_icon()
                 root.update()

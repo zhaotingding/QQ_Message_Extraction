@@ -6,15 +6,19 @@
 
 ## 配置与密钥
 
-- `config.toml` 保存公开配置；GUI 启动服务通过 `MSGX_PREFS` 叠加本地偏好。
+- `config.yaml` 保存公开配置；GUI 启动服务通过 `MSGX_PREFS` 叠加本地偏好。
   已保存设置与未提交编辑分开；在途模型任务保留开始时的配置、材料和费率快照。
-- 启用 `[api]` 后，密钥按配置标识和完整 API 基础地址从 Windows 凭据管理器读取；
+  本机偏好为 `.ui/preferences.yaml`；迁移旧偏好前需关闭仍写 JSON 的旧 GUI，防止覆盖最后一次保存。
+  `yaml_config.py` 统一解析/序列化；省略目标字数与显式设置默认值仍须区分。
+- 启用 `api` 配置后，密钥按配置标识和完整 API 基础地址从 Windows 凭据管理器读取；
   同地址不同配置不能串用。旧 OpenAI 凭据标识保留，重构不能更名后要求用户重新配置。
   凭据保存和偏好保存是两步，部分失败必须准确反馈，不能丢失用户输入。
 - 程序不自动加载 `.env`。旧版环境变量兼容仅读取系统环境中的 `api_key_env`；
   真实密钥不得放入受 Git 管理的配置或示例文件。
 - 证据：`config.py`、`credentials.py`、`api_settings.py`；本次静态核验。
   `tests/test_api_settings.py`、`test_gui_feedback.py` 覆盖配置隔离及部分保存失败（模拟验证）。
+  `data/diagnostics/yaml-migration-20261013/verification.yaml`：2026-10-13 实际配置迁移，核对值和类型、
+  正常停止后重开 GUI/服务并收到新入库消息；离线回归结果见同目录验收记录，不代表长期稳定性已验证。
 
 ## 接收、进程与扫码
 

@@ -82,7 +82,7 @@ check("空提示词 = 沿用配置文件", empty["summary"]["prompt"] == "原有
 check("无目标覆盖时沿用配置文件", empty["summary"]["target_chars"] == 3000)
 check("空群列表 = 关注全部", empty["watch"]["groups"] == [])
 with tempfile.TemporaryDirectory() as tmp:
-    path = Path(tmp) / "preferences.json"
+    path = Path(tmp) / "preferences.yaml"
     saved = {"summary_prompt": "只归纳技术主题 {{目标字数}}", "summary_target_chars": 4200,
              "interval_minutes": 720, "unrelated_preference": "保留"}
     save(saved, path)

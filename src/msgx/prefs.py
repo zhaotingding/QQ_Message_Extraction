@@ -1,8 +1,8 @@
 """界面偏好的读写与叠加。
 
-设计原则（与 config.toml 的分工）：
-  * `config.toml` 受 Git 管理，是**团队共享**的默认配置，界面永不改写它。
-  * `.ui/preferences.json` 是**每个人本地**的偏好，不入库，由界面自由读写。
+设计原则（与 config.yaml 的分工）：
+  * `config.yaml` 受 Git 管理，是**团队共享**的默认配置，界面永不改写它。
+  * `.ui/preferences.yaml` 是**每个人本地**的偏好，不入库，由界面自由读写。
 
 服务进程通过环境变量 `MSGX_PREFS` 获得偏好文件路径，在 `config.load()` 里叠加。
 摘要提示词和目标字数随每次手动请求传入；其他服务设置在重启后生效。
@@ -14,8 +14,10 @@ import os
 import re
 from pathlib import Path
 
+from . import yaml_config
+
 # 偏好文件的默认位置（相对项目根）
-PREFS_REL = Path(".ui") / "preferences.json"
+PREFS_REL = Path(".ui") / "preferences.yaml"
 ENV_PREFS = "MSGX_PREFS"
 
 # 本地 OneBot 事件已核对的 Q群管家账号；精确名称用于兼容缺少账号的旧记录。
@@ -25,7 +27,7 @@ DEFAULT_BLOCKED_SENDERS = (QGROUP_MANAGER_NAME, "智能客服")
 
 # 消息类型过滤默认关闭；发言人名单可在界面增删，空列表表示不过滤发言人。
 DEFAULTS: dict = {
-    "summary_prompt": "",    # 空 = 沿用 config.toml 或内置提示词
+    "summary_prompt": "",    # 空 = 沿用 config.yaml 或内置提示词
     "summary_target_chars": 3000,
     "groups": [],             # 空 = 关注全部群（群列表是「全选/多选」语义，空即全部）
     "message_keywords": [],  # 普通关键词；re: 前缀表示正则表达式
@@ -40,10 +42,10 @@ DEFAULTS: dict = {
     # 仅供参考展示，不入库
     "ui": {"last_tab": 0},
     # 协议端启动方式：true = 隐藏控制台窗口（默认，用户明确不要任务栏里堆黑框）。
-    # 它是界面上的勾选框，所以必须走偏好；界面不改写 config.toml。
+    # 它是界面上的勾选框，所以必须走偏好；界面不改写 config.yaml。
     "napcat_hidden": True,
     "qq_account": "",
-    # DeepSeek 平台登录态 token（查真实消费用）。**留空 = 沿用 config.toml**。
+    # DeepSeek 平台登录态 token（查真实消费用）。**留空 = 沿用 config.yaml**。
     # 说明：它是短期凭证，存在本地偏好文件里（.ui/ 不入版本库），不会进 Git。
     "platform_token": "",
 }
@@ -65,14 +67,14 @@ def load(path: Path | str | None = None) -> dict:
     if p is None or not p.exists():
         return json.loads(json.dumps(DEFAULTS))
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = yaml_config.read(p)
     except (OSError, ValueError):
         return json.loads(json.dumps(DEFAULTS))
     return _merge(json.loads(json.dumps(DEFAULTS)), data if isinstance(data, dict) else {})
 
 
 def save(prefs: dict, path: Path | str) -> None:
-    """原子写入：先写临时文件再替换，避免中途中断留下半份 JSON。"""
+    """原子写入：先写临时文件再替换，避免中途中断留下半份 YAML。"""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
@@ -83,7 +85,7 @@ def save(prefs: dict, path: Path | str) -> None:
         from .api_settings import catalog
         profiles, active = catalog({}, prefs)
         prefs = {**prefs, "api_profiles": profiles, "active_api_profile": active, "api": profiles[active]}
-    payload = json.dumps(prefs, ensure_ascii=False, indent=2) + "\n"
+    payload = yaml_config.dumps(prefs)
     tmp.write_text(payload, encoding="utf-8", newline="\n")
     tmp.replace(p)
 
@@ -102,14 +104,14 @@ def load_raw(path: Path | str | None = None) -> dict:
     """只读文件里**真实写了**的内容，不做默认值填充。
 
     用途：区分「用户从没设置过」和「用户就是选了默认值」。界面靠它决定某个
-    开关要不要回退到 config.toml 里的团队默认值 —— 填了默认值的 `load()`
-    会把两种情形抹平成一样的，那样 config.toml 里的默认值就永远不生效。
+    开关要不要回退到 config.yaml 里的团队默认值 —— 填了默认值的 `load()`
+    会把两种情形抹平成一样的，那样 config.yaml 里的默认值就永远不生效。
     """
     p = Path(path) if path else None
     if p is None or not p.exists():
         return {}
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = yaml_config.read(p)
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -124,7 +126,7 @@ def load_from_env() -> dict | None:
     if not p.exists():
         return None
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = yaml_config.read(p)
     except (OSError, ValueError):
         return None
     raw = data if isinstance(data, dict) else {}
@@ -137,7 +139,7 @@ def load_from_env() -> dict | None:
 def apply_to_config(cfg: dict, prefs: dict) -> dict:
     """把偏好叠加到配置字典上（返回新字典，不修改入参）。
 
-    只覆盖界面明确管理的字段。未设置或为空的项保持 config.toml 的值不变 ——
+    只覆盖界面明确管理的字段。未设置或为空的项保持 config.yaml 的值不变 ——
     这样「界面留空」等于「沿用配置文件」，而不是「清空」。
     """
     out = json.loads(json.dumps(cfg, ensure_ascii=False, default=str))
@@ -173,7 +175,7 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
     if "qq_account" in prefs:
         out.setdefault("napcat", {})["account"] = str(prefs.get("qq_account") or "").strip()
 
-    # 平台 token：留空 = 沿用 config.toml。
+    # 平台 token：留空 = 沿用 config.yaml。
     token = str(prefs.get("platform_token") or "").strip()
     if token:
         out.setdefault("billing", {})["platform_token"] = token

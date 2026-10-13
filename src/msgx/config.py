@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import os
-import tomllib
 from pathlib import Path
 
 from .prefs import DEFAULT_BLOCKED_SENDERS
+from . import yaml_config
 
 PACKAGE_DIR = Path(__file__).resolve().parent      # <项目根>/src/msgx
 SRC_DIR = PACKAGE_DIR.parent                       # <项目根>/src
 # 项目根 = src 的上一层。用 src 布局后这里是三级上溯，不是两级 —— 少写一层
-# 会让 config.toml、data/ 全部解析到 src/ 下面，表现为「配置读不到、数据库凭空重建」。
+# 会让 config.yaml、data/ 全部解析到 src/ 下面，表现为「配置读不到、数据库凭空重建」。
 # 允许用环境变量覆盖，便于把包安装到别处时仍能定位数据目录。
 ROOT = Path(os.environ["MSGX_ROOT"]) if os.environ.get("MSGX_ROOT") else SRC_DIR.parent
 
@@ -130,11 +130,13 @@ def _merge(base: dict, override: dict) -> dict:
 
 
 def load(path: str | Path | None = None) -> dict:
-    cfg_path = Path(path) if path else ROOT / "config.toml"
+    cfg_path = Path(path) if path else ROOT / "config.yaml"
     user: dict = {}
     if cfg_path.exists():
-        with open(cfg_path, "rb") as f:
-            user = tomllib.load(f)
+        user = yaml_config.read(cfg_path)
+    for section in (*DEFAULTS, "api"):
+        if section in user and not isinstance(user[section], dict):
+            raise ValueError(f"配置段 {section} 必须是键值映射，请检查 YAML 缩进")
     cfg = _merge(DEFAULTS, user)
     if "api" in user:
         from .api_settings import apply, deepseek_profile
@@ -144,7 +146,7 @@ def load(path: str | Path | None = None) -> dict:
 
     # 叠加界面偏好。只有 GUI 启动的子进程会设置 MSGX_PREFS 环境变量，
     # 直接跑命令行时不设，因此 CLI 行为完全不受影响。
-    # 这样界面改设置无需改写受 Git 管理的 config.toml，多人协作不会冲突。
+    # 这样界面改设置无需改写受 Git 管理的 config.yaml，多人协作不会冲突。
     from .prefs import apply_to_config, load_from_env
 
     prefs = load_from_env()

@@ -4,7 +4,7 @@
   * 本模块只负责「交互 + 进程管理」，不掺任何业务逻辑。
   * 服务跑在独立子进程里，日志经 stdout 管道 → queue → after() 回主线程。
     Tkinter 不是线程安全的，**所有控件更新必须发生在主线程**。
-  * 界面设置写入 .ui/preferences.json，**永不改写**受 Git 管理的 config.toml，
+  * 界面设置写入 .ui/preferences.yaml，**永不改写**受 Git 管理的 config.yaml，
     这样多人协作时不会因为各人的本地偏好互相覆盖。
 
 只用标准库 tkinter —— 不引入任何新依赖。
@@ -35,7 +35,7 @@ from urllib.parse import urlencode, urlsplit
 from . import __version__, DISPLAY_VERSION
 from . import napcat as napcat_mod
 from . import prefs as prefs_mod
-from . import api_settings, credentials, security, summary_review
+from . import api_settings, credentials, security, summary_review, yaml_config
 from .config import ROOT, abs_path, load
 from .summarize import BEIJING, DEFAULT_DIGEST_PROMPT, DIGEST_DEFAULT_CHARS, summary_chars
 from .usage_chart import daily_series, day_description, draw_daily_costs
@@ -936,8 +936,8 @@ class App:
         ttk.Button(ops, text="打开偏好文件", command=self.open_prefs_file).pack(side="right")
         ttk.Label(
             tab,
-            text="设置保存在 .ui/preferences.json（本人本地，不入版本库）。"
-                 "配置文件 config.toml 受版本管理，界面不会改写它。",
+            text="设置保存在 .ui/preferences.yaml（本人本地，不入版本库）。"
+                 "配置文件 config.yaml 受版本管理，界面不会改写它。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(8, 0))
         self._bind_wheel(tab, self._scroll_canvas)
@@ -1168,12 +1168,12 @@ class App:
             self._settings_feedback(str(exc))
 
     def import_api_config(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("API 配置", "*.json")])
+        path = filedialog.askopenfilename(filetypes=[("YAML API 配置", "*.yaml")])
         if not path:
             self._settings_feedback("已取消导入，配置未更改")
             return
         try:
-            profile = api_settings.validate(json.loads(Path(path).read_text(encoding="utf-8")))
+            profile = api_settings.validate(yaml_config.read(path))
             for key, var in self.v_api.items():
                 var.set(str(profile[key]))
             self.v_api_key.set("")
@@ -1185,9 +1185,10 @@ class App:
     def export_api_config(self) -> None:
         try:
             profile = api_settings.validate({key: var.get() for key, var in self.v_api.items()})
-            path = filedialog.asksaveasfilename(defaultextension=".json", initialfile="api-config.json")
+            path = filedialog.asksaveasfilename(defaultextension=".yaml", initialfile="api-config.yaml",
+                                              filetypes=[("YAML API 配置", "*.yaml")])
             if path:
-                Path(path).write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+                Path(path).write_text(yaml_config.dumps(profile), encoding="utf-8", newline="\n")
                 self._settings_feedback("API 配置已导出，不含密钥")
             else:
                 self._settings_feedback("已取消导出，未写入文件")
@@ -1197,8 +1198,7 @@ class App:
     def reload_prefs(self) -> None:
         try:
             if self.prefs_file.exists():
-                if not isinstance(json.loads(self.prefs_file.read_text(encoding="utf-8")), dict):
-                    raise ValueError("偏好文件必须是对象")
+                yaml_config.read(self.prefs_file)
             loaded = prefs_mod.load(self.prefs_file)
             api_settings.catalog(self.cfg, loaded)
         except (OSError, ValueError, TypeError):
@@ -2789,7 +2789,7 @@ class App:
     # ---------------- 协议端 ----------------
 
     def napcat_script(self) -> Path | None:
-        """协议端启动脚本的绝对路径；config.toml 没配置时返回 None。"""
+        """协议端启动脚本的绝对路径；config.yaml 没配置时返回 None。"""
         raw = str((self.cfg.get("napcat") or {}).get("start_script") or "").strip()
         if not raw:
             return None
@@ -3452,7 +3452,12 @@ def main(config_path: str | None = None) -> int:
         # 在创建窗口之前设置固定 ID，版本号不参与任务栏分组。
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("msgx.desktop")
     root = tk.Tk()
-    App(root, config_path)
+    try:
+        App(root, config_path)
+    except (OSError, ValueError) as exc:
+        messagebox.showerror("启动失败", f"无法载入设置，请检查 YAML 配置：\n{exc}", parent=root)
+        root.destroy()
+        return 2
     root.mainloop()
     return 0
 

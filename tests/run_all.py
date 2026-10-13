@@ -17,6 +17,7 @@ PROJ = HERE.parent
 PY = PROJ / ".venv" / "Scripts" / "python.exe"
 
 SUITES = [
+    ("YAML 配置与持久化", "test_yaml_config.py"),
     ("大号分支与历史数据隔离", "test_accounts.py"),
     ("API 配置与密钥安全", "test_api_settings.py"),
     ("过滤规则", "test_filters.py"),

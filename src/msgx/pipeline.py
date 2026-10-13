@@ -157,7 +157,7 @@ class Pipeline:
     async def refresh_group_names(self, prune: bool = False) -> dict:
         """从协议端拉群列表，把真实群名 + **属主账号**写进 groups 表。
 
-        groups 表的 name 此前只能靠 [watch] names 手填，没人填就永远是
+        groups 表的 name 此前只能靠 watch.names 手填，没人填就永远是
         「(未命名) 754842541」—— NapCat 就在线上，没理由不去问它。
 
         ``prune=True`` 时顺手删掉「不属于当前账号且没有消息」的群 —— 那就是

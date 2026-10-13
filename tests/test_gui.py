@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import sys
+import copy
 import json
 import time
 import sqlite3
@@ -29,6 +30,7 @@ except ImportError:
     print("  说明：python.org 的官方安装版自带 tkinter；某些精简发行版不带。")
     raise SystemExit(1)
 
+from msgx import prefs, yaml_config
 from msgx.gui import App  # noqa: E402
 from unittest.mock import Mock, patch
 
@@ -48,7 +50,10 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 print("=== 构建界面 ===")
 root = tk.Tk()
-app = App(root)
+# 用默认偏好验证界面，避免本机自定义发言人、API 和所选页面改变测试预期。
+with patch("msgx.gui.prefs_mod.load", return_value=copy.deepcopy(prefs.DEFAULTS)), \
+        patch("msgx.gui.prefs_mod.load_raw", return_value={}):
+    app = App(root)
 _reader_temp = tempfile.TemporaryDirectory(prefix="msgx-reader-")
 app.cfg["app"]["db_path"] = str(Path(_reader_temp.name) / "history.db")
 app.prefs["qq_account"] = "123"
@@ -530,8 +535,8 @@ check("界面 token 覆盖 config", merged["billing"]["platform_token"] == "ui-t
 merged2 = P.apply_to_config(base, {"platform_token": ""})
 check("token 留空 = 沿用 config（不是清空）",
       merged2["billing"]["platform_token"] == "cfg-token", merged2["billing"]["platform_token"])
-check("load_raw 不填默认值", P.load_raw(PROJ / ".ui" / "__not_exist__.json") == {},
-      str(P.load_raw(PROJ / ".ui" / "__not_exist__.json")))
+check("load_raw 不填默认值", P.load_raw(PROJ / ".ui" / "__not_exist__.yaml") == {},
+      str(P.load_raw(PROJ / ".ui" / "__not_exist__.yaml")))
 
 print("\n=== 协议端隐藏启动器 ===")
 import os  # noqa: E402
@@ -1199,19 +1204,19 @@ with patch("msgx.gui.credentials.read", return_value="") as _read_key, \
     check("切换地址不携带旧密钥", "未配置" in app.v_api_key_status.get() and app.save_prefs()
           and not _save_key.called and _read_key.call_args.args == ("https://other.invalid/v1",))
 app.v_api_key.set(_fake_key)
-with patch("msgx.gui.filedialog.asksaveasfilename", return_value="fake-api.json"), \
+with patch("msgx.gui.filedialog.asksaveasfilename", return_value="fake-api.yaml"), \
         patch("msgx.gui.Path.write_text") as _write:
     app.export_api_config()
-    _export = json.loads(_write.call_args.args[0])
+    _export = yaml_config.loads(_write.call_args.args[0])
     check("导出只含公开配置，不含未保存密钥", set(_export) == set(api_settings.DEFAULTS)
           and _fake_key not in _write.call_args.args[0])
-with patch("msgx.gui.filedialog.askopenfilename", return_value="fake-api.json"), \
-        patch("msgx.gui.Path.read_text", return_value=json.dumps(api_settings.DEFAULTS)):
+with patch("msgx.gui.filedialog.askopenfilename", return_value="fake-api.yaml"), \
+        patch("msgx.gui.Path.read_text", return_value=yaml_config.dumps(api_settings.DEFAULTS)):
     app.import_api_config()
     check("导入默认配置并清空待保存密钥", app.v_api["model"].get() == "gpt-6-luna"
           and app.v_api["base_url"].get() == "https://api.openai.com/v1" and not app.v_api_key.get())
-with patch("msgx.gui.filedialog.askopenfilename", return_value="fake-api.json"), \
-        patch("msgx.gui.Path.read_text", return_value=json.dumps({"api_key": _fake_key})):
+with patch("msgx.gui.filedialog.askopenfilename", return_value="fake-api.yaml"), \
+        patch("msgx.gui.Path.read_text", return_value=yaml_config.dumps({"api_key": _fake_key})):
     app.import_api_config()
     check("拒绝含密钥配置文件且错误不回显密钥", "导入失败" in app.status.get() and _fake_key not in app.status.get())
 with patch("msgx.gui.credentials.delete") as _delete:

@@ -97,7 +97,7 @@ goto menu
 
 :opt6
 echo.
-set /p CONFIRM=将按 config.toml 的保留策略删除过期数据，确认？
+set /p CONFIRM=将按 config.yaml 的保留策略删除过期数据，确认？
 if /i not "%CONFIRM%"=="y" goto menu
 "%PYTHON_EXE%" -m msgx.main prune
 echo.

@@ -79,7 +79,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(profiles["openai"]["service_tier"], "flex")
         self.assertEqual(profiles["deepseek"]["service_tier"], "default")
         self.assertEqual(api_settings.validate({**old, "base_url": "https://custom.invalid/v1"})["service_tier"], "default")
-        path = Path(self.tmp.name) / "prefs.json"
+        path = Path(self.tmp.name) / "prefs.yaml"
         for tier in ("flex", "default"):
             profiles["openai"]["service_tier"] = tier
             prefs.save({"api_profiles": profiles, "active_api_profile": "openai"}, path)
@@ -253,7 +253,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ds.cost_cny(1000, 100, cache_write_tokens=600), ds.cost_cny(1000, 100))
 
     async def test_snapshot_reads_saved_summary_only_without_changing_running_config(self):
-        path = Path(self.tmp.name) / "summary-prefs.json"
+        path = Path(self.tmp.name) / "summary-prefs.yaml"
         prefs.save({"summary_target_chars": 2000, "summary_prompt": "新提示词",
                     "filters": {"skip_image_only": True}}, path)
         original = copy.deepcopy(self.cfg)
@@ -478,7 +478,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             await pipe.stop()
 
     async def test_settings_persist_without_key_and_bind_full_endpoint(self):
-        path = Path(self.tmp.name) / "prefs.json"
+        path = Path(self.tmp.name) / "prefs.yaml"
         prefs.save({"api": api_settings.DEFAULTS}, path)
         loaded = prefs.apply_to_config(copy.deepcopy(DEFAULTS), prefs.load(path))
         self.assertEqual(loaded["llm"]["model"], "gpt-6-luna")
@@ -518,7 +518,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             logger.removeHandler(handler)
 
     async def test_profiles_switch_requests_without_changing_inflight_usage(self):
-        path = Path(self.tmp.name) / "profiles.json"
+        path = Path(self.tmp.name) / "profiles.yaml"
         profiles, _ = api_settings.catalog({}, {})
         def select(active):
             prefs.save({"api_profiles": profiles, "active_api_profile": active}, path)
@@ -562,7 +562,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(KEY, path.read_text())
 
     async def test_summary_pins_profile_and_keeps_single_job_lock(self):
-        path = Path(self.tmp.name) / "profiles.json"
+        path = Path(self.tmp.name) / "profiles.yaml"
         profiles, _ = api_settings.catalog({}, {})
         prefs.save({"api_profiles": profiles, "active_api_profile": "openai"}, path)
         summary = Summarizer(self.cfg, self.store, self.llm)

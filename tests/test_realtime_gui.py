@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from msgx import prefs
 from msgx.gui import App
 from msgx.message_keywords import compile_rules
 from msgx.store import Store
@@ -77,7 +78,7 @@ class RealtimeGuiTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         app.cfg["app"] = {"db_path": str(Path(self.temp.name) / "test.db")}
         app.prefs = {"message_keywords": [], "filters": {"blocked_senders": []}}
-        app.prefs_file = Path(self.temp.name) / "prefs.json"
+        app.prefs_file = Path(self.temp.name) / "prefs.yaml"
         app.events = queue.Queue()
         app.proc = object()
         app.status = tk.StringVar(master=self.root)
@@ -176,14 +177,14 @@ class RealtimeGuiTests(unittest.TestCase):
         editor.insert("1.0", "Codex\nre:额度|限流\nCodex\n\n")
         with patch.object(app, "_refresh_keyword_messages"):
             save.invoke()
-        saved = json.loads(app.prefs_file.read_text(encoding="utf-8"))
+        saved = prefs.load_raw(app.prefs_file)
         self.assertEqual(saved["message_keywords"], ["Codex", "re:额度|限流"])
         self.assertEqual(saved["filters"], app.prefs["filters"])
         self.assertIn("保存成功", app.status.get())
         editor.delete("1.0", "end")
         save.invoke()
         self.assertEqual(app.rt_keywords.get_children(), ())
-        self.assertEqual(json.loads(app.prefs_file.read_text(encoding="utf-8"))["message_keywords"], [])
+        self.assertEqual(prefs.load_raw(app.prefs_file)["message_keywords"], [])
 
     def test_keyword_pagination_and_failure_preserve_results(self):
         app = self.app
