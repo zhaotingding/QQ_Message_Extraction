@@ -154,6 +154,7 @@ v0.8.8 起，新输入的密钥会显示「尚未保存」；点击保存后，�
 凭据管理器能避免配置、Git 和普通日志泄露，不能防御已控制当前 Windows 账号的恶意程序。
 `store=false` 也不代表服务商完全不保留安全审计数据。
 旧配置的环境变量方式仅为兼容保留；启用 `[api]` 后不读取旧版明文或环境变量密钥。
+程序不自动加载 `.env` 文件；兼容环境变量的名称及说明统一见 `config.toml`。
 DeepSeek 第一次切换时需单独输入并保存其密钥；初版 0.7.0 已保存的 OpenAI 安全密钥继续有效。
 消费明细新增「平台 / 模型」，按各自请求的费率记账，历史未记录的平台显示为「历史未记录」。
 
@@ -772,7 +773,6 @@ python tools/make_demo.py --post --reset
 │   └── preferences.json
 ├── QQ_Message_Extraction.exe ← ★ 主程序：双击即打开图形界面
 ├── config.toml               ← 配置文件（入库，团队共享）
-├── .env.example              ← 环境变量模板
 ├── CHANGELOG.md
 └── pyproject.toml            ← 唯一依赖配置：运行精确版本、构建工具、包元数据
 ```

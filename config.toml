@@ -29,6 +29,8 @@ enabled                 = true
 base_url                = "https://api.deepseek.com"
 model                   = "deepseek-flash"   # 文本模型
 vision_model            = "deepseek-flash"   # 仅解析消息附带文字的图片，不发送能力探测请求
+# 仅旧版配置兼容：读取同名系统环境变量，程序不会自动加载 .env 文件。
+# 当前 [api] 密钥由界面保存到 Windows 凭据管理器，不在此处填写真实密钥。
 api_key_env             = "DEEPSEEK_API_KEY"
 api_key                 = ""                 # 也可直接写在这里（不推荐，优先用环境变量）
 max_daily_cost_cny      = 10.0
