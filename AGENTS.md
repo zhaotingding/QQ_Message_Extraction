@@ -1,5 +1,6 @@
 # 消息萃取项目约定
 
+- 开发在独立分支进行；main 仅通过 PR 合入，由项目负责人审查。AGENTS.md、项目 Skill 与 CODEOWNERS 的改动同样适用。
 - 架构与功能契约以 [docs/重构开发规范.md](docs/重构开发规范.md) 为准；现用安装与测试入口见 [README.md](README.md)。
 - 应用配置统一 YAML，开发说明统一 Markdown；Python 打包、Git 和外部协议保留各自标准格式。
 - 版本唯一来源为 `src/msgx/__init__.py`；中文本地提交，远程 push 需要单独授权。
