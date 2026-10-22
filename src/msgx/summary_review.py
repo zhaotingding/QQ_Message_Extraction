@@ -55,6 +55,15 @@ def get_review(conn: sqlite3.Connection, summary_id: int, content: str) -> dict:
     return result
 
 
+def load_review(db_path: str | Path, summary_id: int, content: str) -> dict:
+    """后台只读入口；连接由当前工作线程创建和关闭，不创建空库。"""
+    conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+    try:
+        return get_review(conn, summary_id, content)
+    finally:
+        conn.close()
+
+
 def save_review(db_path: str | Path, summary_id: int, expected_hash: str, *,
                 read_state: str | None = None, annotations: list | None = None,
                 notes: str | None = None) -> dict:

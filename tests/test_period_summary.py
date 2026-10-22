@@ -7,10 +7,14 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from msgx.store import Store
-from msgx.summarize import BEIJING, MissingSummary, Summarizer, output_token_budget, period_parts
+from msgx import summarize as S
+from msgx.llm import IncompleteResponse
+from msgx.models import Msg
+from msgx.summarize import BEIJING, MissingSummary, Summarizer, output_token_budget, period_parts, summary_chars
 from msgx.summary_review import content_hash, get_review, save_review
 
 
@@ -22,6 +26,7 @@ class FakeLLM:
         self.error = None
         self.waiting = None
         self.release = None
+        self.replies = []  # 顺序模拟完整、空白、失败和分块响应。
 
     async def chat(self, system, body, **kwargs):
         self.calls.append((system, body, kwargs))
@@ -30,10 +35,23 @@ class FakeLLM:
             await self.release.wait()
         if self.error:
             raise self.error
+        if self.replies:
+            reply = self.replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
         return "# 周期报告\n\n**主题**\n完整归纳结果。"
 
 
 class PeriodPartsTests(unittest.TestCase):
+    def test_prompt_template_token_estimate_and_output_budget(self):
+        self.assertEqual(S.digest_system(4500, "约{{目标字数}}字 {custom}"), "约4500字 {custom}")
+        self.assertLess(output_token_budget(1000), output_token_budget(3000))
+        self.assertLess(output_token_budget(3000), output_token_budget(6000))
+        self.assertEqual(output_token_budget(3000), 10240)
+        self.assertGreater(S.estimate_tokens("1234中文😀"), S.estimate_tokens("abcd"))
+        self.assertEqual(summary_chars("# 标题\n\n**主题**\n内容。"), len("标题主题内容。"))
+
     def test_month_coverage_including_cross_year_and_leap_year(self):
         for start, end in [(date(2026, 8, 1), date(2026, 9, 1)),
                            (date(2026, 9, 1), date(2026, 10, 1)),
@@ -92,6 +110,15 @@ class PeriodSummaryTests(unittest.IsolatedAsyncioTestCase):
                                 (day.isoformat(), ts, text))
         self.store.conn.commit()
 
+    def add_messages(self, day, count, text="消息"):
+        stamp = self.sm._day_bounds(day)[0]  # 所有合成消息都在同一完整自然日内。
+        self.store.conn.executemany(
+            "INSERT INTO messages(group_id,msg_id,ts,text) VALUES('g',?,?,?)",
+            [(str(i), stamp, f"{text}【消息{i}】") for i in range(count)],
+        )
+        self.store.conn.commit()
+        return [int(row["id"]) for row in self.store.messages_between_all(stamp - 1, stamp)]
+
     def week(self, start):
         return [self.saved("daily", day, stop, f"# 日报 {day}\n当天已保存的归纳。")
                 for _, day, stop in period_parts("weekly", start, start + timedelta(days=7))]
@@ -109,6 +136,178 @@ class PeriodSummaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("下一天不得混入", body)
         self.assertEqual((await self.sm.run_period("daily", start, end))["id"], result["id"])
         self.assertEqual(len(self.llm.calls), 1)
+        changes = self.store.conn.total_changes  # 状态接口只读取已有报告与消息，不能触发生成或写库。
+        status = self.sm.daily_status(start.isoformat(), end.isoformat())
+        self.assertEqual([day["date"] for day in status["days"]], [start.isoformat(), end.isoformat()])
+        self.assertEqual([day["status"] for day in status["days"]], ["done", "missing"])
+        self.assertEqual(status["days"][0]["count"], 1)
+        self.assertEqual(self.store.conn.total_changes, changes)
+        self.assertEqual(len(self.llm.calls), 1)
+        page = Path(result["path"]).read_text(encoding="utf-8")
+        self.assertIn(f"{start} 00:00 — {end} 00:00", page)
+        self.assertIn("上限 2000 字", page)
+        self.assertEqual(result["chars"], summary_chars(result["content"]))
+
+    async def test_all_messages_over_8000_and_complete_report_are_preserved(self):
+        start, end = date(2026, 8, 3), date(2026, 8, 4)
+        ids = self.add_messages(start, 8005)
+        self.store.conn.execute("UPDATE messages SET media_state='filtered' WHERE id=?", (ids[4],))
+        self.store.conn.commit()
+        self.sm.scfg.update(target_chars=4500, prompt="请总结成{{目标字数}}字 {literal}")
+        complete = "# 总标题\n\n**主题**\n" + "完整内容。" * 1000 + "完整结尾标记。"
+        self.llm.replies = [complete]  # 超出目标字数也必须一次完整落库，不追加改写。
+        result = await self.sm.run_period("daily", start, end)
+        self.assertEqual(len(self.llm.calls), 1)
+        system, body, options = self.llm.calls[0]
+        self.assertEqual(result["count"], 8004)
+        self.assertIn("【消息0】", body)
+        self.assertIn("【消息8004】", body)
+        self.assertNotIn("【消息4】", body)
+        self.assertEqual(options["source_ids"], [rid for rid in ids if rid != ids[4]])
+        self.assertTrue(system.startswith("请总结成4500字 {literal}"))
+        self.assertEqual(options["max_tokens"], output_token_budget(4500))
+        self.assertTrue(options["require_complete"])
+        self.assertFalse(options["think"])
+        self.assertEqual(result["content"], complete)
+        self.assertEqual(self.store.summary_for_window("daily", *self.sm._day_bounds(start))["content"], complete)
+        page = Path(result["path"]).read_text(encoding="utf-8")
+        self.assertEqual(page.count("<h1>"), 1)
+        self.assertIn("<strong>主题</strong>", page)
+        self.assertIn("完整结尾标记。", page)
+        self.assertIn(f"全文 {result['chars']} 字 / 上限 4500 字", page)
+        self.assertTrue(Path(result["path"]).is_absolute())
+        self.assertFalse(self.sm._digest_lock.locked())
+
+    async def test_picture_material_requires_selection_and_prefers_saved_semantics(self):
+        cases = [(False, False, "手动语义", None), (True, False, "手动语义", "手动语义"),
+                 (False, True, "手动语义", None), (True, True, "手动语义", "手动语义"),
+                 (True, True, "", "本地OCR")]
+        for index, (include, filtered, vision, expected) in enumerate(cases):
+            with self.subTest(include=include, filtered=filtered, vision=vision):
+                day = date(2026, 8, 3) + timedelta(days=index)  # 每种选择使用独立日期，避免命中已完成摘要。
+                self.add_message(day, "图片讨论[图片]")
+                row = self.store.conn.execute("SELECT id FROM messages WHERE msg_id=?", (day.isoformat(),)).fetchone()
+                self.store.conn.execute("UPDATE messages SET has_media=1,ocr_text='本地OCR',vision_text=?,media_state=? WHERE id=?",
+                                        (vision, "filtered" if filtered else "done", row["id"]))
+                self.store.conn.commit()
+                self.store.set_vision_include(row["id"], include)
+                before = len(self.llm.calls)
+                result = await self.sm.run_period("daily", day, day + timedelta(days=1))
+                if filtered and not include:
+                    self.assertIsNone(result)
+                    self.assertEqual(len(self.llm.calls), before)
+                    continue
+                self.assertEqual(len(self.llm.calls), before + 1)
+                body = self.llm.calls[-1][1]
+                for material in ("本地OCR", "手动语义"):
+                    self.assertEqual(material in body, material == expected)
+
+    async def test_each_image_is_selected_independently_with_complete_ocr_fallback(self):
+        semantics = "第二张语义" * 200 + "语义尾部"  # 已存语义与 OCR 都应完整复用。
+        for index, (include, vision) in enumerate([(False, semantics), (True, semantics), (True, "")]):
+            with self.subTest(include=include, has_semantics=bool(vision)):
+                day = date(2026, 8, 3) + timedelta(days=index)
+                row_id = self.store.insert_message(Msg(
+                    msg_id=str(index), group_id="g", ts=self.sm._day_bounds(day)[0], text="两张截图[图片][图片]",
+                    image_urls=["https://a.invalid/1", "https://a.invalid/2"],
+                ))
+                images = self.store.conn.execute("SELECT id FROM message_images WHERE message_row=? ORDER BY image_index", (row_id,)).fetchall()
+                ocr = "第二张OCR" * 200 + "OCR尾部"  # 长结果不能在整理材料时被截断。
+                self.store.set_image_result(images[0]["id"], media_state="done", ocr_text="第一张OCR", vision_text="第一张语义")
+                self.store.set_image_result(images[1]["id"], media_state="done", ocr_text=ocr, vision_text=vision)
+                self.store.set_image_include(images[1]["id"], include)
+                await self.sm.run_period("daily", day, day + timedelta(days=1))
+                body = self.llm.calls[-1][1]
+                self.assertNotIn("第一张OCR", body)
+                self.assertNotIn("第一张语义", body)
+                self.assertEqual(semantics in body, include and bool(vision))
+                self.assertEqual(ocr in body, include and not vision)
+
+    async def test_daily_sends_body_in_time_order_without_sender_or_group(self):
+        day = date(2026, 8, 3)
+        stamp = self.sm._day_bounds(day)[0]
+        for index, (offset, body) in enumerate([(2, "第二时刻甲[图片]"), (1, "第一时刻"), (2, "第二时刻乙")]):
+            self.store.insert_message(Msg(msg_id=str(index), group_id="secret-group", sender_name="secret-sender",
+                                          ts=stamp + offset, text=body), "secret-name")
+        await self.sm.run_period("daily", day, day + timedelta(days=1))
+        self.assertEqual(self.llm.calls[0][1], "第一时刻\n\n第二时刻甲\n\n第二时刻乙")
+
+    async def test_picture_without_text_does_not_request_model(self):
+        day = date(2026, 8, 3)
+        self.add_message(day, "[图片]")
+        self.assertIsNone(await self.sm.run_period("daily", day, day + timedelta(days=1)))
+        self.assertEqual(self.sm.daily_status(day.isoformat(), day.isoformat())["days"][0]["status"], "empty")
+        self.assertFalse(self.llm.calls)
+
+    def test_legacy_partial_status_is_read_without_new_generation(self):
+        today = datetime.now(BEIJING).date()  # 旧版本已保存的当日部分报告仍可查询。
+        start = self.sm._day_bounds(today)[0]
+        self.store.add_summary("digest", start, int(datetime.now(BEIJING).timestamp()),
+                               1, "旧版部分报告", "daily_partial")
+        changes = self.store.conn.total_changes
+        status = self.sm.daily_status(today.isoformat(), today.isoformat())["days"][0]
+        self.assertEqual((status["status"], status["count"]), ("partial", 1))
+        self.assertEqual(self.store.conn.total_changes, changes)
+        self.assertFalse(self.llm.calls)  # 保留读取兼容，不恢复旧的部分报告生成入口。
+
+    async def test_daily_failure_never_saves_a_report_and_keeps_incomplete_draft(self):
+        day = date(2026, 8, 3)
+        self.add_message(day, "需要归纳的消息")
+        for failure in (RuntimeError("API unavailable"), "", IncompleteResponse("尚未结束的正文", "length", 10240, 10240)):
+            with self.subTest(failure=type(failure).__name__):
+                self.llm.replies = [failure]
+                before = len(self.llm.calls)
+                with self.assertRaises(RuntimeError) as raised:
+                    await self.sm.run_period("daily", day, day + timedelta(days=1))
+                self.assertEqual(len(self.llm.calls), before + 1)
+                self.assertIsNone(self.store.summary_for_window("daily", *self.sm._day_bounds(day)))
+                self.assertEqual(self.sm.progress["state"], "failed")
+                self.assertFalse(self.sm._digest_lock.locked())
+                if isinstance(failure, IncompleteResponse):
+                    drafts = list((self.sm.report_dir / "unfinished").glob("*.txt"))
+                    self.assertEqual(len(drafts), 1)
+                    self.assertEqual(drafts[0].read_text(encoding="utf-8"), failure.content)
+                    self.assertIn(str(drafts[0]), str(raised.exception))
+
+    async def test_chunk_retry_reuses_completed_parts_and_preserves_source_ids(self):
+        day = date(2026, 8, 3)
+        ids = self.add_messages(day, 12, "正文" * 500)
+        self.sm.scfg["target_chars"] = 500
+        self.llm.replies = ["# 第一批\n完整归纳。", RuntimeError("第二批失败")]
+        with patch.object(S, "model_limits", return_value=(12000, 10000)):
+            with self.assertRaisesRegex(RuntimeError, "第二批失败"):
+                await self.sm.run_period("daily", day, day + timedelta(days=1))
+            self.assertEqual(len(self.llm.calls), 2)
+            self.assertIsNone(self.store.summary_for_window("daily", *self.sm._day_bounds(day)))
+            first_body = self.llm.calls[0][1]
+            result = await self.sm.run_period("daily", day, day + timedelta(days=1))
+        self.assertEqual(sum(call[1] == first_body for call in self.llm.calls), 1)
+        self.assertEqual(self.llm.calls[-1][2]["source_ids"], ids)
+        self.assertEqual(result["count"], 12)
+        self.assertTrue(list((self.sm.report_dir / ".summary-cache").glob("*.json")))
+        for system, body, options in self.llm.calls:
+            self.assertEqual(options["purpose"], "摘要总结")
+            self.assertLessEqual(S.estimate_tokens(system) + S.estimate_tokens(body) + 128 + options["max_tokens"] + 2048, 12000)
+
+    async def test_single_long_message_keeps_tail_and_source_id_for_every_part(self):
+        day = date(2026, 8, 3)
+        ids = self.add_messages(day, 1, "长消息内容" * 3000 + "完整长消息尾部")
+        self.sm.scfg["target_chars"] = 500
+        with patch.object(S, "model_limits", return_value=(12000, 10000)):
+            await self.sm.run_period("daily", day, day + timedelta(days=1))
+        self.assertGreater(len(self.llm.calls), 1)
+        self.assertTrue(any("完整长消息尾部" in call[1] for call in self.llm.calls))
+        self.assertTrue(all(call[2]["source_ids"] == ids for call in self.llm.calls))
+
+    async def test_invalid_budget_and_excessive_prompt_fail_before_api(self):
+        day = date(2026, 8, 3)
+        self.add_message(day)
+        for target, prompt in [(-1, ""), (200000, ""), (5000, ""), (500, "巨大提示词" * 5000)]:
+            with self.subTest(target=target), patch.object(S, "model_limits", return_value=(12000, 10000)):
+                self.sm.scfg.update(target_chars=target, prompt=prompt)
+                with self.assertRaises(ValueError):
+                    await self.sm.run_period("daily", day, day + timedelta(days=1))
+                self.assertFalse(self.llm.calls)
 
     async def test_week_only_uses_saved_daily_and_preserves_finished_result(self):
         start, end = date(2026, 8, 3), date(2026, 8, 10)

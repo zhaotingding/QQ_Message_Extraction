@@ -19,7 +19,8 @@ import urllib.request
 from pathlib import Path
 
 PROJ = Path(__file__).resolve().parent.parent
-PY = PROJ / ".venv" / "Scripts" / "python.exe"
+sys.path.insert(0, str(PROJ / "src"))  # 运行时校验只取本仓库标准库辅助模块。
+from msgx import conda_runtime
 
 fails: list[str] = []
 
@@ -38,14 +39,18 @@ def free_port() -> int:
 
 
 def main() -> int:
-    if not PY.exists():
-        print(f"找不到项目虚拟环境：{PY}")
-        print("请先执行：py -3.13 -m venv .venv")
-        print("          .venv\\Scripts\\python.exe -m pip install -e .")
+    try:
+        conda_runtime.require_environment()  # 拒绝公共 base、全局 Python 或用户 site 借包。
+    except RuntimeError as exc:
+        print(str(exc))
         return 1
 
-    ws_port, http_port = free_port(), free_port()
-    tmp = Path(tempfile.mkdtemp(prefix="msgx_test_"))
+    with tempfile.TemporaryDirectory(prefix="msgx_test_") as folder:  # 服务退出后回收本组配置、日志和数据库。
+        return check_service(Path(folder))
+
+
+def check_service(tmp: Path) -> int:
+    ws_port, http_port = free_port(), free_port()  # 仅本次服务使用系统分配的空闲端口。
     stop_path = tmp / "stop.signal"
     cfg_path = tmp / "config.yaml"
     cfg_path.write_text(
@@ -64,6 +69,10 @@ def main() -> int:
                 "",
                 "llm:",
                 "  enabled: false",  # 不调模型、不花钱
+                "watchdog:",
+                "  enabled: false",  # 本组验证接收生命周期，不检查本机真实 QQ。
+                "napcat:",
+                f'  dir: "{(tmp / "not-installed-NapCat").as_posix()}"',  # 协议目录限定为测试路径。
                 "",
             ]
         ),
@@ -73,12 +82,17 @@ def main() -> int:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(PROJ / "src")
     env["PYTHONUTF8"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
+    env["MSGX_CONDA_ENV"] = conda_runtime.environment_name()
+    env["MSGX_ROOT"] = str(tmp)  # 包括相对日志目录在内，全部服务数据限定到本组临时根。
+    for name in ("MSGX_PREFS", "DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+        env.pop(name, None)  # 不让外层窗口的偏好或 API 密钥覆盖隔离配置。
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
         env.pop(var, None)
 
     print(f"=== 启动服务（端口 {ws_port}/{http_port}）===")
     proc = subprocess.Popen(
-        [str(PY), "-u", "-m", "msgx.main", "-c", str(cfg_path), "run", "--stop-file", str(stop_path)],
+        conda_runtime.command("-u", "-m", "msgx.main", "-c", str(cfg_path), "run", "--stop-file", str(stop_path)),
         cwd=str(PROJ),
         env=env,
         stdout=subprocess.PIPE,
@@ -223,7 +237,7 @@ def main() -> int:
 
     def spawn_holder() -> subprocess.Popen:
         return subprocess.Popen(
-            [str(PY), "-u", "-c", holder_code, f"ws://127.0.0.1:{ws_port}/onebot/ws"],
+            [sys.executable, "-s", "-u", "-c", holder_code, f"ws://127.0.0.1:{ws_port}/onebot/ws"],
             cwd=str(PROJ),
             env=env,
             stdout=subprocess.PIPE,
@@ -283,7 +297,11 @@ def main() -> int:
             check("持有活动 WS 时仍能快速退出（<8s）", elapsed < 8, f"{elapsed:.1f}s")
         except subprocess.TimeoutExpired:
             check("创建停止文件后服务自行退出", False, "25 秒内未退出")
-            proc.kill()
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True,
+                               timeout=10, creationflags=0x08000000)  # 连同本测试的 Conda 子树回收。
+            else:
+                proc.kill()
             proc.wait(timeout=10)
     else:
         check("服务不应提前退出", False, f"提前退出，码 {proc.poll()}")
@@ -300,7 +318,8 @@ def main() -> int:
                 hout = holder.stdout.read()
             except Exception:  # noqa: BLE001
                 hout = ""
-            check("持有连接的过程确实建立过 WS", "HOLDING" in hout or holder.poll() is not None)
+            check("持有连接的过程确实建立过 WS", "HOLDING" in hout)  # 只接受客户端已连入的输出，退出本身不算成功。
+            holder.stdout.close()  # 临时目录回收前释放连接进程的输出管道。
 
     out = ""
     if proc.stdout:
@@ -308,6 +327,7 @@ def main() -> int:
             out = proc.stdout.read()
         except Exception:  # noqa: BLE001
             pass
+        proc.stdout.close()  # 全部日志已读取，测试结束不再持有服务管道。
     check("日志明确记录了停止信号", "停止信号" in out,
           [ln for ln in out.splitlines() if "停止信号" in ln][:1] or "(未找到)")
 

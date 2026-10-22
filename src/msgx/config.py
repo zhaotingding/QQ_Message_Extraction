@@ -130,7 +130,11 @@ def _merge(base: dict, override: dict) -> dict:
 
 
 def load(path: str | Path | None = None) -> dict:
-    cfg_path = Path(path) if path else ROOT / "config.yaml"
+    local_path = ROOT / ".ui/config.local.yaml"  # 本机主配置独立于 Git 共享默认配置。
+    if path:
+        cfg_path = Path(path)  # 显式路径优先，保留缺文件时使用内置默认值的既有行为。
+    else:
+        cfg_path = local_path if local_path.exists() else ROOT / "config.yaml"  # 本机文件完整替代共享文件，不按字段叠加。
     user: dict = {}
     if cfg_path.exists():
         user = yaml_config.read(cfg_path)

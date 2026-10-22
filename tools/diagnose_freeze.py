@@ -49,7 +49,12 @@ from pathlib import Path
 from urllib.request import ProxyHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = "http://127.0.0.1:6700"
+sys.path.insert(0, str(ROOT / "src"))
+from msgx import config as config_mod, napcat as napcat_mod
+
+BASE = "http://127.0.0.1:6701"
+DB_FILE = ROOT / "data" / "msgx.db"
+NAPCAT_DIR: Path | None = None
 INJECTOR = "NapCatWinBootMain.exe"
 # 固定 id / 固定文本：探针可以反复跑，第二次起会被判为 duplicate 而不再入库。
 PROBE_MSG_ID = 990001
@@ -126,10 +131,8 @@ def section(title: str) -> None:
 #   2. 枚举窗口看不到 QQ 窗口**不能**当结论——缩到托盘时 IsWindowVisible 也是 False。
 #   3. 「这个点群本来就没说话」要先自己排掉（按小时聚合历史消息），别让用户去证伪。
 # ---------------------------------------------------------------------------
-QQ_DATA_ROOTS = [
-    Path(r"D:\App\QQ\QQ聊天消息\Tencent Files"),
-    Path.home() / "Documents" / "Tencent Files",
-]
+# 与运行服务复用 QQ 数据目录候选；用户标准目录适用于默认安装。
+QQ_DATA_ROOTS = (*napcat_mod.QQ_DATA_ROOTS, Path.home() / "Documents" / "Tencent Files")
 CLASH_DIR = Path(os.environ.get("APPDATA", "")) / "io.github.clash-verge-rev.clash-verge-rev"
 
 
@@ -178,7 +181,7 @@ def qq_db_report(verdicts: list[tuple[str, str]]) -> str:
     wals = _find_qq_msg_wal()
     lines: list[str] = []
     if not wals:
-        lines.append("没找到 QQ 的消息库（检查 QQ 数据目录是否在 D:\\App\\QQ\\QQ聊天消息\\Tencent Files）。")
+        lines.append("没找到 QQ 的消息库；请检查 QQ 自己的消息保存目录。")
         lines.append("→ 这一步没做成，**不要**据此认为「QQ 侧没问题」。")
         lines.append(f"Clash 里的 QQ 直连规则：{_clash_qq_direct()}")
         return "\n".join(lines)
@@ -199,7 +202,7 @@ def qq_db_report(verdicts: list[tuple[str, str]]) -> str:
     lines.append("说明：`nt_msg.db-wal` 的 mtime 就是「桌面 QQ 最后一次把消息写进本地库」的时间。")
 
     # 拿自己库里的最新消息做对照
-    db = ROOT / "data" / "msgx.db"
+    db = DB_FILE
     db_last = db_latest_real(db)
     rhythm: list[tuple[str, int]] = []
     if db.exists():
@@ -261,7 +264,7 @@ def db_latest_real(db: Path | None = None) -> int | None:
     2. 与 QQ 库做时间差对照。**必须排除探针**，否则「最新一条」永远是探针那一刻，
        时间差永远对不上。
     """
-    db = db or (ROOT / "data" / "msgx.db")
+    db = db or DB_FILE
     if not db.exists():
         return None
     try:
@@ -325,9 +328,22 @@ def probe() -> tuple[str, str]:
 
 
 def main() -> int:
+    global BASE, DB_FILE, NAPCAT_DIR
     ap = argparse.ArgumentParser(description="诊断「消息不来了」")
+    ap.add_argument("--config", default=None, help="配置文件路径（默认本仓库 config.yaml）")
     ap.add_argument("--no-probe", action="store_true", help="不向服务注入探针事件（纯只读）")
     args = ap.parse_args()
+    try:
+        cfg = config_mod.load(args.config)
+    except (OSError, ValueError) as exc:
+        print(f"配置读取失败：{exc}", file=sys.stderr)
+        return 2
+    # 自定义端口、数据目录和 NapCat 路径必须与接收服务一致。
+    host = cfg["onebot"]["host"]
+    host = "127.0.0.1" if host == "0.0.0.0" else host
+    BASE = f"http://{host}:{cfg['onebot']['http_port']}"
+    DB_FILE = config_mod.abs_path(cfg, "db_path")
+    NAPCAT_DIR = napcat_mod.resolve_dir(cfg)
 
     print("=" * 62)
     print("消息冻结诊断  ", time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -336,14 +352,14 @@ def main() -> int:
 
         print("代码版本      ", __version__)
     except Exception:  # noqa: BLE001
-        print("代码版本       (无法导入 msgx —— 不在项目 venv 里跑？)")
+        print("代码版本       (无法导入 msgx，请使用项目 Conda 环境并按 README 安装)")
     print("=" * 62)
 
     verdicts: list[tuple[str, str]] = []
 
     # 先取「本库最新一条真实消息」：它既能判断链路是否其实正常（见 ③），
     # 又是 ⑤ 与 QQ 库做时间差对照的基准。**排除探针行**。
-    db_file = ROOT / "data" / "msgx.db"
+    db_file = DB_FILE
     db_last = db_latest_real(db_file)
     link_fresh = db_last is not None and (time.time() - db_last) < 600
 
@@ -431,8 +447,8 @@ def main() -> int:
 
     # ---------- 4. 二维码 ----------
     section("④ 二维码：是不是卡在扫码界面？")
-    qr = Path(r"D:\App\NapCat\cache\qrcode.png")
-    if qr.exists():
+    qr = NAPCAT_DIR / "cache" / "qrcode.png" if NAPCAT_DIR else None
+    if qr and qr.exists():
         a = qr.stat().st_mtime
         time.sleep(6)
         b = qr.stat().st_mtime
@@ -443,8 +459,10 @@ def main() -> int:
             verdicts.append(("协议端正停在扫码界面",
                              "登录态已经丢了（QQ 未登录时 NapCat 不会转发任何消息）。"
                              "扫一次码即可；若二维码刚扫完就被换掉，说明有多份实例在互相覆盖。"))
+    elif qr:
+        print(f"{qr} 不存在；未发现二维码文件，不能据此确认 QQ 登录状态。")
     else:
-        print(f"{qr} 不存在（没有实例在等扫码）")
+        print("未配置或发现 NapCat 目录，无法检查二维码；请设置自己的目录或 NAPCAT_HOME。")
 
     # ---------- 5. 上游 QQ：它自己到底收到消息了没有 ----------
     section("⑤ 上游：桌面 QQ 客户端自己收到消息了吗（第 4 种形态）")
@@ -452,7 +470,7 @@ def main() -> int:
 
     # ---------- 6. 数据库 ----------
     section("⑥ 数据库：最后一条消息是什么时候")
-    db = ROOT / "data" / "msgx.db"
+    db = DB_FILE
     if db.exists():
         try:
             conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)

@@ -16,7 +16,9 @@ from msgx.pipeline import Pipeline
 
 class RelatedTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.store = Store(":memory:", filters={"blocked_senders": []})
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = Store(Path(self.temp.name) / "related.db", filters={"blocked_senders": []})
         self.addCleanup(self.store.close)
         self.seq = 0
 

@@ -1,30 +1,28 @@
-"""群列表的「属主」与清理（v0.5.4）。
-
-背景：`groups` 原先只记 (id, name, added_at)，于是群列表是**历次登录的并集** ——
-谁登进来一次，它的全部群就永久留在库里。实测误登一次主号，33 个群（其中 30 个
-一条消息都没有）灌了进来，用户在下拉框里再也找不到自己关心的那 3 个群。
-
-这里锁死三件事，都是「错了会静默出事」的：
-  1. 迁移：老库（没有 bot_uin）能平滑升上来，不丢数据；
-  2. 属主写入：空属主**不覆盖**已知属主（拿不到 get_login_info 时不能把已知信息抹掉）；
-  3. 清理的安全性：**有消息的群一律不删** —— groups 表是摘要调度的遍历源，
-     删掉一个有消息的群会让它的摘要静默失效；而一次 API 抖动返回空列表时，
-     照着删会把用户的群自己清光。
-"""
+"""群归属迁移、保留消息的清理规则与北京时间基线；仅用临时库和模拟协议。"""
 from __future__ import annotations
 
+import asyncio
+import atexit
 import sqlite3
 import sys
 import tempfile
 import time
+from contextlib import ExitStack, closing
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from msgx.models import Msg  # noqa: E402
 from msgx.store import SCHEMA, Store  # noqa: E402
+from msgx.protocol_session import ProtocolSession  # 当前协议群同步入口。
+from msgx.time_rules import BEIJING  # 合成数据采用生产代码约定的北京时间。
 
 fails: list[str] = []
+resources = ExitStack()  # 数据库先关闭，再回收包含 WAL/备份的临时目录。
+atexit.register(resources.close)  # 断言或异常提前终止脚本时也释放隔离资源。
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -34,8 +32,8 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def new_store() -> Store:
-    d = Path(tempfile.mkdtemp(prefix="msgx_grp_"))
-    return Store(d / "t.db")
+    d = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="msgx_grp_")))
+    return resources.enter_context(closing(Store(d / "t.db")))  # 后注册的连接先关闭。
 
 
 def msg(gid: str, mid: str, text: str = "内容够长的一条消息") -> Msg:
@@ -43,7 +41,7 @@ def msg(gid: str, mid: str, text: str = "内容够长的一条消息") -> Msg:
 
 
 print("=== 老库迁移：没有 bot_uin 也要能升上来 ===")
-d = Path(tempfile.mkdtemp(prefix="msgx_grp_old_"))
+d = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="msgx_grp_old_")))
 db = d / "old.db"
 # 造一个「v0.5.3 的表」：groups 只有 id/name/added_at，且已有数据
 raw = sqlite3.connect(str(db))
@@ -60,7 +58,7 @@ raw.execute(
 raw.commit()
 raw.close()
 
-st = Store(db)  # 构造时应自动补列
+st = resources.enter_context(closing(Store(db)))  # 构造时应自动补列，结束时关闭连接。
 cols = {c[1] for c in st.conn.execute("PRAGMA table_info(groups)")}
 check("补齐 bot_uin 列", "bot_uin" in cols, str(sorted(cols)))
 check("老群还在（迁移不丢数据）", st.group_names().get("111") == "老群")
@@ -114,11 +112,11 @@ st = new_store()
 st.upsert_group("1", "有消息的群", "111")
 st.upsert_group("2", "空群", "222")
 st.insert_message(msg("1", "m1"), "有消息的群", "111")
-# pipeline.refresh_group_names 只在 keep 非空时才调 prune —— 这里直接验 store 的护栏
-d, p = st.prune_groups({"1"})
-check("keep 非空时按属主删", d == ["2"], str(d))
-check("（约定）keep 为空时调用方不调 prune，见 pipeline 的 `if prune and keep`",
-      True)
+pipe = SimpleNamespace(store=st, target_account="111", login_uin=AsyncMock(return_value="111"),
+                       call_action=AsyncMock(return_value=[]))  # 模拟协议暂时返回空群列表。
+result = asyncio.run(ProtocolSession.refresh_group_names(pipe, prune=True))
+check("空协议列表不会删除任何已有群", set(st.group_names()) == {"1", "2"})
+check("空协议列表如实返回零个群且无删除", result["count"] == 0 and result["deleted"] == [])
 
 print("\n=== messages_since / hour_baseline：看门狗的判据 ===")
 st = new_store()
@@ -137,11 +135,8 @@ check("未来的起点数不到东西", st.messages_since(now + 3600) == 0)
 
 # hour_baseline：造 3 天，同一小时分别 0/2/10 条 ⇒ 中位数 2
 st = new_store()
-lt = time.localtime()
-hour = lt.tm_hour
-# 以「当前这个小时的起点」为基准，保证三天都落在同一个本地小时里
-# （直接减 86400 在无夏令时的时区是安全的；本机 UTC+8）
-hour_start = int(time.time()) - lt.tm_min * 60 - lt.tm_sec
+hour = 12  # 使用固定北京时间，避免克隆者的系统时区影响用例。
+hour_start = int(datetime(2026, 10, 10, hour, tzinfo=BEIJING).timestamp())
 for off, n in ((0, 0), (86400, 2), (2 * 86400, 10)):
     for i in range(n):
         st.conn.execute(
@@ -149,10 +144,12 @@ for off, n in ((0, 0), (86400, 2), (2 * 86400, 10)):
             (f"{off}-{i}", hour_start - off + 60),
         )
 st.conn.commit()
-base = st.hour_baseline(hour, days=7)
+with patch("msgx.message_store.time.time", return_value=hour_start + 1800), \
+        patch("time.localtime", side_effect=AssertionError("小时基线不得读取主机时区")):
+    base = st.hour_baseline(hour, days=7)  # 冻结当前时间，让三天样本始终在查询窗口中。
+    empty_hour = st.hour_baseline((hour + 5) % 24)
 check("取中位数（不被某天刷屏抬高）", base == 2, str(base))
-check("其它小时没有基线 ⇒ 0（深夜不误报的前提）", st.hour_baseline((hour + 5) % 24) == 0,
-      str(st.hour_baseline((hour + 5) % 24)))
+check("其它小时没有基线 ⇒ 0（深夜不误报的前提）", empty_hour == 0, str(empty_hour))
 
 print("\n=== 协议端脚本解析：重启脚本 ===")
 from msgx import napcat  # noqa: E402
@@ -181,9 +178,8 @@ check("NapCat 目录里没有 launcher.bat ⇒ 拒绝（宁可报错，也不能
 print("\n=== 上游健康：qq_msg_db_age 不猜 ===")
 import os  # noqa: E402
 
-empty = Path(tempfile.mkdtemp(prefix="msgx_noqq_"))
-os.environ["QQ_DATA_ROOT"] = str(empty)
-try:
+empty = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="msgx_noqq_")))
+with patch.dict(os.environ, {"QQ_DATA_ROOT": str(empty)}):  # 结束后还原原环境变量。
     check("找不到 QQ 数据目录时返回 None（而不是 0 或极大值）",
           napcat.qq_msg_db_age() is None, repr(napcat.qq_msg_db_age()))
     # 造一个假的账号目录与 -wal 文件
@@ -196,9 +192,8 @@ try:
     os.utime(wal, (old, old))
     age2 = napcat.qq_msg_db_age()
     check("一小时前写过 ⇒ 年龄约 3600 秒", age2 is not None and 3590 < age2 < 3700, repr(age2))
-finally:
-    os.environ.pop("QQ_DATA_ROOT", None)
 
+resources.close()  # 检查结果输出前回收所有测试目录，避免开发测试持续积累数据。
 print()
 if fails:
     print(f"有 {len(fails)} 项失败：")

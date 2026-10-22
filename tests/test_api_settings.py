@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from datetime import date
 import aiohttp
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -356,11 +357,13 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("base64", str(raised.exception))
 
     async def test_rejected_manual_image_preserves_ocr_without_auto_retry(self):
+        import hashlib
         from PIL import Image
-        from msgx.media import MediaWorker
+        from msgx.media import DownloadedImage, MediaWorker
         from msgx.models import Msg
         image = Path(self.tmp.name) / "image.png"
         Image.new("RGB", (16, 16), "white").save(image)
+        downloaded = DownloadedImage(image, hashlib.sha256(image.read_bytes()).hexdigest()[:32])
         self.cfg["app"]["media_dir"] = str(Path(self.tmp.name) / "media")
         worker = MediaWorker(self.cfg, self.store, self.llm)
         session = Mock()
@@ -371,7 +374,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             image_id = self.store.conn.execute("SELECT id FROM message_images WHERE message_row=?", (row_id,)).fetchone()[0]
             with patch.object(self.llm, "snapshot", return_value=self.llm), \
                     patch.object(self.llm, "session", AsyncMock(return_value=session)), \
-                    patch.object(worker, "_download", AsyncMock(return_value=image)), \
+                    patch.object(worker, "_download", AsyncMock(return_value=downloaded)), \
                     patch.object(worker, "_ocr_sync", return_value="本地文字"):
                 await worker.process_pending()
                 self.assertEqual(session.post.call_count, 0)
@@ -387,7 +390,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.store.failed_vision(), [])
             duplicate = self.store.insert_message(Msg(msg_id="duplicate", group_id="g", text="相同报错[图片]",
                                                       image_urls=[image.as_uri()], msg_type="mixed"))
-            with patch.object(worker, "_download", AsyncMock(return_value=image)), \
+            with patch.object(worker, "_download", AsyncMock(return_value=downloaded)), \
                     patch.object(worker, "_ocr_sync", return_value="本地文字"):
                 await worker.process_pending()
             self.assertEqual(self.store.get_message(duplicate)["vision_state"], "skipped")
@@ -466,8 +469,8 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_cross_provider_billing_or_old_price_backfill(self):
         pipe = Pipeline(self.cfg)
         try:
-            with patch("msgx.pipeline.billing.fetch_balance", AsyncMock()) as balance, \
-                    patch("msgx.pipeline.billing.fetch_platform_cost", AsyncMock()) as platform:
+            with patch("msgx.billing_coordinator.billing.fetch_balance", AsyncMock()) as balance, \
+                    patch("msgx.billing_coordinator.billing.fetch_platform_cost", AsyncMock()) as platform:
                 result = await pipe.billing_snapshot()
             balance.assert_not_called()
             platform.assert_not_called()
@@ -574,15 +577,16 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             used.append(worker.cfg["api"]["model"])
             return {"content": "完成"}
-        with patch.dict(os.environ, {prefs.ENV_PREFS: str(path)}), patch.object(Summarizer, "_run_digest", fake_run):
-            task = asyncio.create_task(summary.run_digest())
+        period = ("daily", date(2026, 8, 3), date(2026, 8, 4))  # 通过当前调度入口验证配置快照和互斥。
+        with patch.dict(os.environ, {prefs.ENV_PREFS: str(path)}), patch.object(Summarizer, "_run_period", fake_run):
+            task = asyncio.create_task(summary.run_period(*period))
             await asyncio.wait_for(ready.wait(), 2)
             prefs.save({"api_profiles": profiles, "active_api_profile": "deepseek"}, path)
             with self.assertRaisesRegex(RuntimeError, "已有摘要"):
-                await summary.run_digest()
+                await summary.run_period(*period)
             release.set()
             await task
-            await summary.run_digest()
+            await summary.run_period(*period)
         self.assertEqual(used, ["gpt-6-luna", "gpt-6-luna", "deepseek-flash", "deepseek-flash"])
         self.assertEqual(summary.progress["state"], "done")
 

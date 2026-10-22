@@ -57,6 +57,10 @@ summary:
 napcat:
   start_script: tools/start_napcat.bat
   restart_script: tools/重启协议端.bat
+  dir: ''                  # 在设置页填写本机安装目录，不提交个人路径
+  hidden: true
+  log_file: data/logs/napcat.log
+  qq_path: ''
 
 # 检查消息接收状态；保持现有恢复规则。
 watchdog:
@@ -65,10 +69,6 @@ watchdog:
   stale_minutes: 30
   busy_min_messages: 5
   baseline_days: 7
-  dir: D:\App\NapCat
-  hidden: true
-  log_file: data/logs/napcat.log
-  qq_path: ''
 
 # 旧 DeepSeek 平台账单；platform_token 属于本机凭证，不应写入共享配置。
 billing:

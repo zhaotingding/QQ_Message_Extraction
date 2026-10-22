@@ -8,7 +8,7 @@ name = "msgx"
 dynamic = ["version"]
 description = "QQ 群消息萃取服务：接收 → 落库 → 带配文图片解析 → 摘要"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "Proprietary" }
 
 # 保留当前运行环境的全部 21 个精确版本；升级时一起验证兼容性。

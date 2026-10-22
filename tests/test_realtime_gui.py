@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import queue
 import sys
+import threading
 import tempfile
 import tkinter as tk
 import unittest
@@ -16,6 +17,7 @@ from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from msgx.service_process import ServiceProcess
 from msgx import prefs
 from msgx.gui import App
 from msgx.message_keywords import compile_rules
@@ -64,13 +66,14 @@ def sample_payload():
 
 class RealtimeGuiTests(unittest.TestCase):
     def setUp(self):
-        guard = patch("msgx.gui.urllib.request.build_opener", side_effect=AssertionError("test must not access network"))
+        guard = patch("msgx.local_client.urllib.request.build_opener", side_effect=AssertionError("test must not access network"))
         guard.start()
         self.addCleanup(guard.stop)
         self.root = tk.Tk()
         self.root.withdraw()
         ttk.Style(self.root).theme_use("clam")
         self.app = App.__new__(App)
+        self.app.service = ServiceProcess()
         app = self.app
         app.root = self.root
         app.cfg = {"onebot": {"http_port": 1}}
@@ -80,7 +83,7 @@ class RealtimeGuiTests(unittest.TestCase):
         app.prefs = {"message_keywords": [], "filters": {"blocked_senders": []}}
         app.prefs_file = Path(self.temp.name) / "prefs.yaml"
         app.events = queue.Queue()
-        app.proc = object()
+        app.service.proc = object()
         app.status = tk.StringVar(master=self.root)
         app.nb = ttk.Notebook(self.root)
         app.nb.pack(fill="both", expand=True)
@@ -214,7 +217,7 @@ class RealtimeGuiTests(unittest.TestCase):
             ident = store.insert_message(msg)
         finally:
             store.close()
-        app.proc = None
+        app.service.proc = None
         app._rt_keyword_rules = compile_rules(["关键"])
         app.refresh_messages()
         self.assertIn("正在检索", app.v_rt_keywords.get())
@@ -397,7 +400,7 @@ class RealtimeGuiTests(unittest.TestCase):
             refresh.assert_called_once()
         self.render(payload)
         current_rows = app.rt.get_children()
-        app.proc = object()
+        app.service.proc = object()
         with patch.object(app, "refresh_messages") as refresh:
             app._accept_messages(app._rt_request_key(), old_proc, sample_payload())
             refresh.assert_called_once()
@@ -412,15 +415,42 @@ class RealtimeGuiTests(unittest.TestCase):
         context.__exit__ = Mock(return_value=False)
         opener = Mock()
         opener.open.return_value = context
-        with patch("msgx.gui.urllib.request.build_opener", return_value=opener):
+        with patch("msgx.local_client.urllib.request.build_opener", return_value=opener):
             app._fetch_messages(13, True, "1002", app.proc)
-        url = opener.open.call_args.args[0]
+        url = opener.open.call_args.args[0].full_url
         self.assertEqual(parse_qs(urlsplit(url).query), {"limit": ["13"], "images": ["1"], "group_id": ["1002"]})
         kind, (key, proc, payload) = app.events.get_nowait()
         self.assertEqual(kind, "messages")
         self.assertEqual(key, (13, True, "1002"))
         self.assertIs(proc, app.proc)
         self.assertEqual(payload, sample_payload())
+
+    def test_incremental_refresh_keeps_selection_scroll_and_only_updates_changed_row(self):
+        app = self.app
+        first = sample_payload()["items"][0]
+        rows = [{**first, "id": i, "text": f"消息 {i}"} for i in range(200, 0, -1)]
+        app._render_messages(rows)
+        self.root.geometry("1100x650")
+        self.root.deiconify()
+        self.root.update()
+        app.rt.selection_set("100")
+        app.rt.yview_moveto(0.4)
+        self.root.update()
+        scroll = app.rt.yview()
+        with patch.object(app.rt, "delete", wraps=app.rt.delete) as deleted, \
+                patch.object(app.rt, "insert", wraps=app.rt.insert) as inserted, \
+                patch.object(app.rt, "item", wraps=app.rt.item) as changed:
+            app._render_messages(rows)
+            self.assertEqual(deleted.call_count, 0)
+            self.assertEqual(inserted.call_count, 0)
+            self.assertEqual(changed.call_count, 0)
+            app._render_messages([{**row, "text": "更新后的正文"} if row["id"] == 100 else row for row in rows])
+            self.assertEqual(changed.call_count, 1)
+        self.assertEqual(app.rt.selection(), ("100",))
+        self.assertAlmostEqual(app.rt.yview()[0], scroll[0], delta=1 / len(rows))
+        app._render_messages([{**first, "id": 201, "text": "新消息"}, *rows[:-1]])
+        self.assertEqual(app.rt.selection(), ("100",))
+        self.assertEqual(app.rt.get_children()[0], "201")
 
     def test_small_window_keeps_readable_body_width_and_complete_time_column(self):
         self.root.deiconify()

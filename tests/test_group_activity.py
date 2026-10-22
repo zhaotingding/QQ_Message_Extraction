@@ -1,13 +1,14 @@
-"""实时群筛选与北京时间入库榜：内存数据库及离线接口，不调用 QQ 或模型。"""
+"""实时群筛选与北京时间入库榜：隔离数据库及离线接口，不调用 QQ 或模型。"""
 from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from msgx.models import Msg
@@ -23,7 +24,9 @@ END = START + 86400
 
 class ActivityFixture:
     def setUp(self):
-        self.store = Store(":memory:")
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = Store(Path(self.temp.name) / "activity.db")
         self.addCleanup(self.store.close)
         self.sequence = 0
 
@@ -48,9 +51,7 @@ class GroupActivityTests(ActivityFixture, unittest.TestCase):
         self.assertEqual([r["id"] for r in self.store.recent_messages(1)], [normal])
         self.assertEqual([r["id"] for r in self.store.recent_messages(1, True, "1")], [normal])
         self.assertEqual([r["id"] for r in self.store.messages_between_all(START - 1, END, 1)], [normal])
-        self.assertEqual([r["id"] for r in self.store.messages_between("1", START - 1, END)], [normal])
-        self.assertEqual(self.store.first_ts("1"), START + 10)
-        self.assertEqual(self.store.first_ts_all(), START + 10)
+        self.assertEqual([r["id"] for r in self.store.recent_messages(group_id="1")], [normal])  # 群筛选仍隐藏管家。
         self.assertEqual(self.activity()["groups"][0]["count"], 1)
         self.assertEqual(self.activity()["groups"][0]["last_ts"], START + 10)
         self.assertEqual(list(self.store.conn.execute("SELECT * FROM messages ORDER BY id")), before)
@@ -173,11 +174,11 @@ class GroupActivityRouteTests(ActivityFixture, unittest.IsolatedAsyncioTestCase)
         self.add_message("1", ts=START + 2)
         self.add_message("2", ts=START + 3)
         self.store.upsert_group("empty", "零消息群")
-        original_activity = self.store.group_activity
-        self.store.group_activity = Mock(side_effect=lambda: original_activity(NOW))
         pipe = SimpleNamespace(store=self.store, llm=Mock(), media=Mock(), bot=Mock())
-        response = await _messages_recent(SimpleNamespace(
-            query={"limit": "1", "images": "1", "group_id": "1"}, app={"pipe": pipe}))
+        with patch("msgx.message_store.datetime", wraps=datetime) as clock:
+            clock.now.return_value = NOW
+            response = await _messages_recent(SimpleNamespace(
+                query={"limit": "1", "images": "1", "group_id": "1"}, app={"pipe": pipe}))
         data = json.loads(response.text)
         self.assertEqual(response.status, 200)
         self.assertTrue(data["ok"])
@@ -185,7 +186,6 @@ class GroupActivityRouteTests(ActivityFixture, unittest.IsolatedAsyncioTestCase)
         self.assertEqual(data["activity"]["date"], "2026-09-30")
         self.assertEqual({row["group_id"]: row["count"] for row in data["activity"]["groups"]},
                          {"1": 1, "2": 1, "empty": 0})
-        self.store.group_activity.assert_called_once_with()
         for service in (pipe.llm, pipe.media, pipe.bot):
             self.assertEqual(service.mock_calls, [])
 
@@ -194,7 +194,8 @@ class GroupActivityRouteTests(ActivityFixture, unittest.IsolatedAsyncioTestCase)
         pipe = SimpleNamespace(store=fake_store)
         for value, expected in (("bad", 60), ("0", 1), ("999", 300)):
             with self.subTest(limit=value):
-                response = await _messages_recent(SimpleNamespace(query={"limit": value}, app={"pipe": pipe}))
+                with patch("msgx.onebot._read_store", side_effect=lambda source, query: query(source)):
+                    response = await _messages_recent(SimpleNamespace(query={"limit": value}, app={"pipe": pipe}))
                 self.assertEqual(response.status, 200)
                 fake_store.recent_messages.assert_called_with(expected, images_only=False, group_id="", account="")
 

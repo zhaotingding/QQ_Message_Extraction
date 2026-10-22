@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import sys
+import threading
 import unittest
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from msgx.service_process import ServiceProcess
 from msgx.usage_chart import daily_series, day_description, draw_daily_costs
 
 
@@ -106,6 +108,7 @@ class UsageChartTests(unittest.TestCase):
         root.withdraw()
         self.addCleanup(root.destroy)
         app = App.__new__(App)
+        app.service = ServiceProcess()
         app.refresh_usage = lambda: None
         app._usage_sort = {}
         app.cfg = {"onebot": {"http_port": 6701}}
@@ -119,7 +122,7 @@ class UsageChartTests(unittest.TestCase):
         app.usage_table.insert("", "end", iid="1")
         app.usage_table.selection_set("1")
         # 只验证选中行为，禁止后台线程执行关联消息请求。
-        with patch("msgx.gui.threading.Thread") as thread:
+        with patch("threading.Thread") as thread:
             app._usage_selected()
         thread.return_value.start.assert_called_once()
         self.assertEqual(app.usage_bottom.select(), str(app.usage_detail_tab))
@@ -146,6 +149,7 @@ class UsageChartTests(unittest.TestCase):
         book = ttk.Notebook(outer)
         book.pack(fill="both", expand=True)
         app = App.__new__(App)
+        app.service = ServiceProcess()
         app.refresh_usage = lambda: None
         app._usage_sort = {}
         app._build_usage_tab(book)

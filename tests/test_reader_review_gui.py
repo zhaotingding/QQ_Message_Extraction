@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import queue
+import gc
 import sqlite3
 import sys
+import threading
 import tempfile
 import time
 import tkinter as tk
@@ -15,6 +17,7 @@ from tkinter import ttk
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from msgx.service_process import ServiceProcess
 from msgx.gui import App, FONT
 from msgx import summary_review
 from msgx.summarize import BEIJING
@@ -28,6 +31,7 @@ class ReaderReviewTests(unittest.TestCase):
         self.root.withdraw()
         ttk.Style(self.root).theme_use("clam")
         self.app = App.__new__(App)
+        self.app.service = ServiceProcess()
         app = self.app
         app.root = self.root
         app.cfg = {"app": {"db_path": str(self.db)}}
@@ -62,6 +66,9 @@ class ReaderReviewTests(unittest.TestCase):
     def tearDown(self):
         self.root.destroy()
         self.tmp.cleanup()
+        self.app = None
+        self.root = None
+        gc.collect()  # Tk 变量终结留在主线程，不能让下一个后台查询触发它们的循环 GC。
 
     def add_summary(self, conn, ident, kind, content, created):
         start = int(datetime(2026, 9, 25, tzinfo=BEIJING).timestamp())
@@ -71,13 +78,21 @@ class ReaderReviewTests(unittest.TestCase):
 
     def refresh(self):
         self.app.refresh_report_history()
-        deadline = time.time() + 5
-        while self.app._report_history_busy and time.time() < deadline:
-            kind, value = self.app.events.get(timeout=5)
-            self.assertEqual(kind, "report_history")
-            self.app._render_report_history(*value)
-            self.root.update()
+        self.wait_events()
         self.assertFalse(self.app._report_history_busy)
+
+    def wait_events(self):
+        deadline = time.time() + 10
+        while (self.app._report_history_busy or self.app._report_save_busy
+               or not self.app.events.empty()) and time.time() < deadline:
+            try:
+                kind, value = self.app.events.get(timeout=0.1)
+            except queue.Empty:
+                self.root.update()
+                continue
+            self.app._dispatch_event(kind, value)
+            self.root.update()
+        self.assertFalse(self.app._report_save_busy)
 
     def show_daily(self):
         self.refresh()
@@ -157,37 +172,48 @@ class ReaderReviewTests(unittest.TestCase):
         self.show_daily()
         self.app.v_report_read_state.set("skimmed")
         self.app._set_report_read_state()
+        self.wait_events()
         self.assertEqual(self.review()["read_state"], "skimmed")
         self.assertEqual(self.app.report_history.item("1", "tags"), ("skimmed",))
         self.app.v_report_read_state.set("deep")
         self.app._set_report_read_state()
+        self.wait_events()
         self.assertEqual(self.app.report_history.item("1", "values"), ("深读",))
         self.app._show_report(self.app._report_items["2"])
+        self.wait_events()
         self.app._show_report(self.app._report_items["1"])
+        self.wait_events()
         self.assertEqual(self.app.v_report_read_state.get(), "deep")
         self.assertEqual(self.review(2, "# 多日结果\n## 主题\n汇总正文。")["read_state"], "unread")
         self.app.v_report_read_state.set("unread")
         self.app._set_report_read_state()
+        self.wait_events()
         self.assertEqual(self.review()["read_state"], "unread")
 
     def test_annotations_keep_exact_display_text_and_split_overlap(self):
         self.show_daily()
         self.select_text("甲段🙂相同词，乙段相同词。")
         self.app._mark_report("blue")
+        self.wait_events()
         self.assertEqual(self.review()["annotations"][0]["text"], "甲段🙂相同词，乙段相同词。")
         self.select_text("乙段相同词")
         self.app._mark_report("red")
+        self.wait_events()
         self.app._mark_report("underline")
+        self.wait_events()
         marks = self.review()["annotations"]
         self.assertEqual([m["text"] for m in marks if m["level"] == "red"], ["乙段相同词"])
         self.assertTrue(any(m["level"] == "blue" and "甲段🙂" in m["text"] for m in marks))
         self.assertTrue(any(m["level"] == "underline" for m in marks))
         self.app._show_report(self.app._report_items["2"])
+        self.wait_events()
         self.app._show_report(self.app._report_items["1"])
+        self.wait_events()
         self.assertTrue(self.app.report_text.tag_ranges("review_red"))
         self.assertTrue(self.app.report_text.tag_ranges("review_underline"))
         self.select_text("乙段相同词")
         self.app._mark_report("")
+        self.wait_events()
         self.assertTrue(all(m["level"] == "blue" for m in self.review()["annotations"]))
         with closing(sqlite3.connect(self.db)) as conn, conn:
             self.assertEqual(conn.execute("SELECT content FROM summaries WHERE id=1").fetchone()[0], self.content)
@@ -204,46 +230,92 @@ class ReaderReviewTests(unittest.TestCase):
         self.assertEqual(self.app.report_outline.curselection(), (1,))
         self.app.report_notes.insert("end", "继续思考。")
         self.app._show_report(self.app._report_items["2"])
+        self.wait_events()
         self.assertTrue(self.review()["notes"].endswith("继续思考。"))
         self.assertEqual(self.app.report_notes_frame.winfo_manager(), "pack")
         self.app.report_notes.insert("1.0", "周报心得")
         self.app._show_report(self.app._report_items["3"])
+        self.wait_events()
         self.assertEqual(self.review(2, "# 多日结果\n## 主题\n汇总正文。")["notes"], "周报心得")
         self.app.report_notes.insert("1.0", "月报心得")
         self.app._show_report(self.app._report_items["1"])
+        self.wait_events()
         self.assertEqual(self.review(3, "# 月报\n月报正文。")["notes"], "月报心得")
         self.assertEqual(self.app.report_notes.get("1.0", "end-1c"), self.review()["notes"])
 
     def test_save_failure_keeps_current_draft_and_rolls_back_state(self):
         self.show_daily()
         self.app.report_notes.insert("1.0", "未保存心得")
-        with patch("msgx.gui.summary_review.save_review", side_effect=sqlite3.OperationalError("database is locked")):
+        with patch("msgx.ui.reader.summary_review.save_review", side_effect=sqlite3.OperationalError("database is locked")):
             self.assertFalse(self.app._show_report(self.app._report_items["2"]))
+            self.wait_events()
             self.assertEqual(self.app._report_current["id"], 1)
             self.assertEqual(self.app.report_notes.get("1.0", "end-1c"), "未保存心得")
             self.app.v_report_read_state.set("deep")
             self.app._set_report_read_state()
+            self.wait_events()
             self.assertEqual(self.app.v_report_read_state.get(), "unread")
             self.select_text("甲段")
             self.app._mark_report("red")
+            self.wait_events()
             self.assertFalse(self.app.report_text.tag_ranges("review_red"))
-        self.assertTrue(self.app._save_report_notes())
+        self.assertFalse(self.app._save_report_notes())
+        self.wait_events()
 
     def test_new_content_does_not_inherit_old_annotations(self):
         self.show_daily()
         self.select_text("甲段")
         self.app._mark_report("red")
+        self.wait_events()
         self.app.v_report_read_state.set("deep")
         self.app._set_report_read_state()
+        self.wait_events()
         with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute("UPDATE summaries SET content=? WHERE id=1", ("# 新的日报\n完全不同。",))
         self.app.v_report_read_state.set("skimmed")
         self.app._set_report_read_state()
+        self.wait_events()
         self.assertIn("正文已变化", self.app.v_report_review.get())
         self.refresh()
         self.assertEqual(self.app.v_report_read_state.get(), "unread")
         self.assertFalse(self.app.report_text.tag_ranges("review_red"))
         self.assertEqual(self.review()["read_state"], "deep")  # 旧版本元数据仍在。
+
+    def test_write_lock_keeps_tk_responsive_and_switch_waits_for_saved_notes(self):
+        self.show_daily()
+        self.app.report_notes.insert("1.0", "等待写锁也不能丢失的草稿")
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            started = time.perf_counter()
+            self.assertFalse(self.app._show_report(self.app._report_items["2"]))
+            self.assertLess(time.perf_counter() - started, 0.2)
+            self.assertTrue(self.app._report_save_busy)
+            self.assertEqual(self.app._report_current["id"], 1)
+            fired = []
+            self.root.after(0, lambda: fired.append(True))
+            self.root.update()
+            self.assertEqual(fired, [True])
+            # 未收到落库成功前，程序不能先清空草稿或关闭窗口。
+            self.assertEqual(self.app.report_notes.get("1.0", "end-1c"), "等待写锁也不能丢失的草稿")
+        finally:
+            conn.rollback()
+            conn.close()
+        self.wait_events()
+        self.assertEqual(self.review()["notes"], "等待写锁也不能丢失的草稿")
+        self.assertEqual(self.app._report_current["id"], 2)
+
+    def test_failed_async_save_prevents_close_and_retains_draft(self):
+        self.show_daily()
+        self.app.report_notes.insert("1.0", "无法保存的草稿")
+        with patch("msgx.ui.reader.summary_review.save_review", side_effect=sqlite3.OperationalError("database is locked")), \
+                patch.object(self.root, "destroy") as destroyed:
+            self.app.on_close()
+            self.wait_events()
+            destroyed.assert_not_called()
+        self.assertEqual(self.app._report_current["id"], 1)
+        self.assertEqual(self.app.report_notes.get("1.0", "end-1c"), "无法保存的草稿")
+        self.assertIn("保存失败", self.app.v_report_review.get())
 
     def test_old_partial_and_multi_are_hidden_and_empty_filter_clears_reader(self):
         with closing(sqlite3.connect(self.db)) as conn, conn:
@@ -266,8 +338,10 @@ class ReaderReviewTests(unittest.TestCase):
         old_items = list(self.app._report_items.values())
         self.app._report_history_busy = True
         self.app._show_report({"path": str(Path(self.tmp.name) / "new.html"), "content": "# 刚生成"})
+        self.wait_events()
         self.app.refresh_report_history(preferred_path=str(Path(self.tmp.name) / "new.html"))
         self.app._render_report_history(self.app._report_history_seq, old_items, "")
+        self.wait_events()
         self.assertIn("刚生成", self.app.report_text.get("1.0", "end"))
         self.refresh()
 
@@ -276,8 +350,10 @@ class ReaderReviewTests(unittest.TestCase):
         stale_items = [dict(item) for item in self.app._report_items.values()]
         self.app.v_report_read_state.set("deep")
         self.app._set_report_read_state()
+        self.wait_events()
         self.app.report_notes.insert("1.0", "后台读取期间的新心得")
         self.app._render_report_history(self.app._report_history_seq, stale_items, "")
+        self.wait_events()
         self.assertEqual(self.app.report_history.item("1", "tags"), ("deep",))
         self.assertEqual(self.app.v_report_read_state.get(), "deep")
         self.assertEqual(self.app.report_notes.get("1.0", "end-1c"), "后台读取期间的新心得")
@@ -317,15 +393,15 @@ class ReaderReviewTests(unittest.TestCase):
                 "summary_schedule": {"state": "done", "kind": "weekly", "message": "周报已完成",
                                      "next_runs": {"daily": "2026-09-29T00:00:00+08:00"}},
             })
-            self.assertEqual(refresh.call_count, 1)
-            kind, value = self.app.events.get(timeout=5)
-            self.assertEqual(kind, "report_history")
-            self.app._render_report_history(*value)
+            self.wait_events()
+            count = refresh.call_count  # 保存后的继续动作可以再次进入刷新入口，但同一报告不得再触发新刷新。
+            self.assertGreaterEqual(count, 1)
             self.assertEqual(self.app._report_current["id"], 1)
             self.assertEqual(self.app.report_text.yview(), before_scroll)
             self.assertEqual(self.app.report_notes.get("1.0", "end-1c"), "自动报告到达时保留我的编辑")
             self.app._apply_summary_schedule({"latest_reports": {"weekly": weekly}})
-            self.assertEqual(refresh.call_count, 1)
+            self.wait_events()
+            self.assertEqual(refresh.call_count, count)
         self.assertIn("已完成 1200 字", self.app.v_latest_reports["weekly"].get())
 
 

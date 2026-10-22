@@ -1,21 +1,7 @@
-"""LLM 调用层的回归测试（v0.5.1）。
+"""LLM 请求、预算、完整响应、用量记录与共享会话的离线回归。
 
-这个文件锁的是**两个已经踩过、且不看注释就会改回去的坑**：
-
-1. **think=True 时的预算下限。**
-   思考 token 与正文**共用** max_tokens。预算给小了，思考把额度吃光 →
-   `finish_reason=length` 且 `content` 为空 —— 调用方拿到空串还以为是模型没内容。
-   实测思考量在 0~290 之间波动（tools/probe_think_budget.py），而打分调用原来只给
-   400，余量仅 110。所以 think=True 的调用有 THINK_MIN_TOKENS 下限兜底。
-
-2. **重试时绝不重置共享会话。**
-   `LLM` 只有一个共享 session，调用方是并发的（media 的 Semaphore(2)、scorer、
-   summarizer）。v0.5.0 在重试路径里调了 `session.close()`「换掉半死的连接池」，
-   实测（tools/probe_session_cascade.py）会把**并发的在途请求一起掐死** ——
-   4 并发全灭，而且不是快速报错，是**挂到 60 秒超时**。于是 1 次真实抖动被放大成
-   一片失败。现在改成连接不复用（force_close），池里没有陈旧连接可踩。
-
-全部离线：`_post` / `_post_once` 都被替换成假的，不发任何网络请求。
+模拟请求覆盖思考预算下限和有界重试；重试不能关闭共享会话、打断并行请求。
+这些底层行为仍被摘要与图片语义调用复用，不访问真实模型。
 """
 from __future__ import annotations
 

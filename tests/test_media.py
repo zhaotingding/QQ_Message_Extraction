@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 import json
+import hashlib
 import time
 from io import BytesIO
 from pathlib import Path
@@ -166,6 +167,47 @@ from msgx.media import MediaWorker  # noqa: E402
 from msgx.models import parse_onebot_event  # noqa: E402
 import copy  # noqa: E402
 
+
+async def digest_reuse_tests():
+    """真实本机 HTTP 下载不重读文件；file: 来源恰好读取一次计算 digest。"""
+    from unittest.mock import patch
+    from types import SimpleNamespace
+
+    with tempfile.TemporaryDirectory() as directory:
+        cfg = copy.deepcopy(DEFAULTS)
+        cfg["app"]["media_dir"] = str(Path(directory) / "media")
+        store = Store(Path(directory) / "digest.db")
+        worker = MediaWorker(cfg, store, SimpleNamespace())
+        worker._ocr_sync = lambda path: "已有 OCR"
+        data = png("green")
+        local = Path(directory) / "source.png"
+        local.write_bytes(data)
+        runner = web.AppRunner(make_app(data, 20, False))
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        original_read = Path.read_bytes
+        try:
+            for label, url, expected_reads in (("HTTP", f"http://127.0.0.1:{port}/img", 0),
+                                                ("file", local.as_uri(), 1)):
+                parent = store.insert_message(Msg(group_id="g", msg_id=label, ts=1, image_urls=[url]))
+                child = store.pending_images()[0]
+                with patch.object(Path, "read_bytes", autospec=True, side_effect=original_read) as read:
+                    await worker._process_image(child)
+                image = store.get_image(child["id"])
+                check(f"{label} 下载和 OCR 去重不重复读文件", read.call_count == expected_reads,
+                      f"实际文件读取 {read.call_count} 次")
+                check(f"{label} 保存正确的 digest 和 OCR", image["media_hash"] == hashlib.sha256(data).hexdigest()[:32]
+                      and image["ocr_text"] == "已有 OCR" and store.get_message(parent)["media_path"])
+        finally:
+            await worker.close()
+            store.close()
+            await runner.cleanup()
+
+
+asyncio.run(digest_reuse_tests())
+
 async def manual_image_tests():
     with tempfile.TemporaryDirectory() as directory:
         cfg = copy.deepcopy(DEFAULTS)
@@ -191,7 +233,8 @@ async def manual_image_tests():
         downloaded = []
         async def download(url):
             downloaded.append(url)
-            return image
+            from msgx.media import DownloadedImage
+            return DownloadedImage(image, hashlib.sha256(image.read_bytes()).hexdigest()[:32])
         worker._download = download
         worker._ocr_sync = lambda path: "本地 OCR 文字"
         def insert(mid, text, filtered=False):

@@ -1,8 +1,9 @@
 """v0.8.8 操作反馈回归；隔离配置、合成凭据、本机无服务。"""
 import copy
+import os
 import json
-import queue
 import sys
+import threading
 import tempfile
 import tkinter as tk
 import unittest
@@ -11,6 +12,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from msgx import local_client, service_process
+from msgx.ui import settings, login
 from msgx import gui, prefs, api_settings
 from msgx.config import DEFAULTS
 from msgx.store import Store
@@ -22,18 +25,26 @@ class FeedbackTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         cfg = copy.deepcopy(DEFAULTS)
         cfg["app"]["db_path"] = str(Path(self.tmp.name) / "test.db")
+        cfg["app"]["report_dir"] = str(Path(self.tmp.name) / "reports")
+        cfg["napcat"]["dir"] = str(Path(self.tmp.name) / "nonexistent-napcat")
+        cfg["onebot"].update(http_port=1, ws_port=1)  # 偶发刷新也不会访问已运行的接收服务。
         Store(cfg["app"]["db_path"]).close()
         self.root = tk.Tk()
         self.addCleanup(self.close_root)
         self.patches = ExitStack()
         self.addCleanup(self.patches.close)
+        self.patches.enter_context(patch.object(gui, "ROOT", Path(self.tmp.name)))  # 初始化也不能读取真实图标。
+        self.patches.enter_context(patch.dict(os.environ, {"MSGX_PREFS": str(Path(self.tmp.name) / "prefs.yaml")}))
+        self.patches.enter_context(patch.object(local_client.urllib.request, "build_opener",
+                                               side_effect=AssertionError("测试禁止真实网络请求")))
         for method in ("read", "save", "delete"):
-            self.patches.enter_context(patch.object(gui.credentials, method, return_value=""))
+            self.patches.enter_context(patch.object(settings.credentials, method, return_value=""))
         with ExitStack() as setup:
             setup.enter_context(patch.object(gui, "load", return_value=cfg))
             setup.enter_context(patch.object(prefs, "load", return_value=copy.deepcopy(prefs.DEFAULTS)))
             setup.enter_context(patch.object(prefs, "load_raw", return_value={}))
-            for method in ("refresh_groups", "refresh_report_history", "_tick_health", "_tick_realtime", "_trace_gui"):
+            for method in ("refresh_groups", "refresh_report_history", "_refresh_keyword_messages",
+                           "_tick_health", "_tick_realtime", "_trace_gui"):
                 setup.enter_context(patch.object(gui.App, method))
             self.app = gui.App(self.root)
         self.app.prefs_file = Path(self.tmp.name) / "prefs.yaml"
@@ -46,12 +57,57 @@ class FeedbackTests(unittest.TestCase):
             self.root.tk.call("after", "cancel", callback)
         self.root.destroy()
 
+    def test_unconfigured_status_does_not_start_or_save_anything(self):
+        app = self.app
+        app.prefs["qq_account"] = ""
+        app.v_qq_account.set("123")  # 尚未保存的输入不能让状态提前变成已配置。
+        with patch.object(app, "napcat_dir", return_value=None), patch.object(app.root, "after"), \
+                patch.object(app.service, "spawn") as spawn, patch.object(prefs, "save") as save:
+            app._tick_health()
+            self.assertEqual(app.v_service.get(), "待配置")
+            self.assertIn("目标 QQ 号", app.v_protocol_detail.get())
+            self.assertIn("NapCat 目录", app.v_protocol_detail.get())
+            self.assertIsNone(app._login_config())
+            spawn.assert_not_called()
+            save.assert_not_called()
+        self.assertIsNone(app.proc)
+
+    def test_saved_settings_and_discovered_directory_clear_setup_hint(self):
+        app = self.app
+        app.prefs["qq_account"] = "123"
+        with patch.object(app, "napcat_dir", return_value=Path(self.tmp.name)), \
+                patch.object(app.root, "after"):
+            app._tick_health()
+        self.assertEqual(app.v_service.get(), "未运行")
+        self.assertNotIn("待配置", app.v_protocol_detail.get())
+        self.assertIsNone(app.proc)  # 设置齐全也不会自动启动后台。
+        with patch.object(app, "napcat_dir", return_value=None), patch.object(app.root, "after"):
+            app._tick_health()
+        self.assertEqual(app.v_service.get(), "待配置")
+        self.assertNotIn("目标 QQ 号", app.v_protocol_detail.get())
+        self.assertIn("NapCat 目录", app.v_protocol_detail.get())
+
+    def test_missing_protocol_directory_does_not_mask_live_connection(self):
+        app = self.app
+        app.prefs["qq_account"] = "123"
+        app.cfg["napcat"]["start_script"] = "tools/start_napcat.bat"
+        with patch.object(app, "napcat_dir", return_value=None), \
+                patch.object(app, "_apply_summary_schedule"):
+            app._apply_health({"protocol": {"state": "waiting"}})
+            self.assertEqual(app.v_service.get(), "运行中")
+            self.assertIn("待配置", app.v_peer.get())
+            app._apply_health({"protocol": {"state": "connected"}, "ws_peers": ["127.0.0.1"]})
+        self.assertEqual(app.v_service.get(), "运行中")
+        self.assertIn("已连接", app.v_peer.get())
+        self.assertIn("等待新消息验证", app.v_peer.get())
+        self.assertNotIn("待配置", app.v_protocol_detail.get())
+
     def test_forced_restart_recovers_receiver_before_restarting_qq(self):
         app = self.app
         old, new = Mock(stdout=None), Mock(stdout=None)
         old.poll.return_value = None
         new.poll.return_value = None
-        app.proc = old
+        app.service.proc = old
         cfg = {**app.cfg, "napcat": {"account": "100"}}
         order = []
         def stop(proc):
@@ -60,7 +116,7 @@ class FeedbackTests(unittest.TestCase):
             old.returncode = 0
             order.append("stop")
         def start():
-            app.proc = new
+            app.service.proc = new
             order.append("start")
             return True
         with patch.object(gui.messagebox, "askyesno", return_value=True), \
@@ -68,8 +124,8 @@ class FeedbackTests(unittest.TestCase):
                 patch.object(app, "_wait_receiver_ready", side_effect=[False, True]), \
                 patch.object(app, "_stop_unresponsive_receiver", side_effect=stop), \
                 patch.object(app, "start_service", side_effect=start), \
-                patch.object(gui.napcat_mod, "restart_target", side_effect=lambda c: order.append("qq") or {"ok":False,"note":"扫码待验证"}), \
-                patch.object(gui.threading, "Thread") as thread:
+                patch.object(login.napcat_mod, "restart_target", side_effect=lambda c: order.append("qq") or {"ok":False,"note":"扫码待验证"}), \
+                patch.object(threading, "Thread") as thread:
             app.restart_napcat()
             thread.call_args.kwargs["target"]()
             while not app.events.empty():
@@ -85,30 +141,30 @@ class FeedbackTests(unittest.TestCase):
         app = self.app
         proc = Mock(pid=12345, stdout=None)
         proc.poll.return_value = None
-        proc.wait.side_effect = [gui.subprocess.TimeoutExpired("test", 5), 0]
-        app.proc = proc
-        app._restart_cancelled = False
-        with patch.object(gui.subprocess, "run") as run, patch.object(gui.os, "name", "nt"):
+        proc.wait.side_effect = [service_process.subprocess.TimeoutExpired("test", 5), 0]
+        app.service.proc = proc
+        app.service.restart_cancelled = False
+        with patch.object(service_process.subprocess, "run") as run, patch.object(gui.os, "name", "nt"):
             app._stop_unresponsive_receiver(proc)
             self.assertEqual(run.call_args.args[0], ["taskkill", "/PID", "12345", "/T", "/F"])
             run.reset_mock()
-            app.proc = Mock()
+            app.service.proc = Mock()
             app._stop_unresponsive_receiver(proc)
             run.assert_not_called()
-        app.proc = proc
-        app._restart_cancelled = True
+        app.service.proc = proc
+        app.service.restart_cancelled = True
         with patch.object(app, "start_service") as start:
             app._dispatch_event("receiver_recovered", (proc, app.cfg))
             start.assert_not_called()
 
     def test_rebuilt_receiver_failure_does_not_loop_or_restart_qq(self):
         app = self.app
-        app.proc = Mock()
-        app._restart_cancelled = False
+        app.service.proc = Mock()
+        app.service.restart_cancelled = False
         with patch.object(app, "_wait_receiver_ready", return_value=False), \
                 patch.object(app, "_stop_unresponsive_receiver") as stop, \
-                patch.object(gui.napcat_mod, "restart_target") as restart, \
-                patch.object(gui.threading, "Thread") as thread:
+                patch.object(login.napcat_mod, "restart_target") as restart, \
+                patch.object(threading, "Thread") as thread:
             app._restart_with_receiver(app.cfg, recover=False)
             thread.call_args.kwargs["target"]()
             kind, result = app.events.get_nowait()
@@ -121,7 +177,7 @@ class FeedbackTests(unittest.TestCase):
         from PIL import Image
         source = Path(self.tmp.name) / "source.png"
         Image.new("RGBA", (64, 48), "red").save(source)
-        with patch.object(gui.filedialog, "askopenfilename", return_value=str(source)):
+        with patch.object(settings.filedialog, "askopenfilename", return_value=str(source)):
             self.app.choose_app_icon()
         saved = prefs.load(self.app.prefs_file)
         icon = Path(saved["ui"]["icon_path"])
@@ -130,7 +186,7 @@ class FeedbackTests(unittest.TestCase):
         self.app.prefs = saved
         self.app._apply_app_icon()
         self.assertIn("已应用", self.app.v_icon_status.get())
-        with patch.object(gui.filedialog, "askopenfilename", return_value=""):
+        with patch.object(settings.filedialog, "askopenfilename", return_value=""):
             self.app.choose_app_icon()
         self.assertIn("已取消", self.app.status.get())
         self.assertTrue(icon.is_file())
@@ -142,7 +198,7 @@ class FeedbackTests(unittest.TestCase):
         frames = [Image.new("RGBA", size, (index*20, 50, 200, 255)) for index, size in enumerate(sizes)]
         frames[-1].save(source, sizes=sizes, append_images=frames[:-1])
         original = source.read_bytes()
-        with patch.object(gui.filedialog, "askopenfilename", return_value=str(source)):
+        with patch.object(settings.filedialog, "askopenfilename", return_value=str(source)):
             self.app.choose_app_icon()
         target = Path(self.app.prefs["ui"]["icon_path"])
         self.assertEqual(target.read_bytes(), original)
@@ -150,7 +206,7 @@ class FeedbackTests(unittest.TestCase):
             self.assertEqual(icon.ico.sizes(), set(sizes))
             self.assertEqual(icon.ico.getimage((24, 24)).getpixel((0, 0)), (40, 50, 200, 255))
         # 再选已保存的图标也不能破坏它。
-        with patch.object(gui.filedialog, "askopenfilename", return_value=str(target)):
+        with patch.object(settings.filedialog, "askopenfilename", return_value=str(target)):
             self.app.choose_app_icon()
         self.assertEqual(target.read_bytes(), original)
 
@@ -162,7 +218,7 @@ class FeedbackTests(unittest.TestCase):
         for offset in range(0, 1024, 7):
             draw.line((offset, 0, 0, offset), fill=(0, 120, 255, 255), width=3)
         original.save(source)
-        with patch.object(gui.filedialog, "askopenfilename", return_value=str(source)):
+        with patch.object(settings.filedialog, "askopenfilename", return_value=str(source)):
             self.app.choose_app_icon()
         with Image.open(self.app.prefs["ui"]["icon_path"]) as icon:
             for side in (16, 20, 24, 32, 40, 48, 64, 128, 256):
@@ -200,7 +256,7 @@ class FeedbackTests(unittest.TestCase):
         self.assertNotIn(self.key, app.v_api_feedback.get())
         app.status.set("后台状态更新")
         self.assertIn("保存成功", app.v_api_feedback.get())
-        with patch.object(prefs, "save"), patch.object(gui.credentials, "save") as save_key:
+        with patch.object(prefs, "save"), patch.object(settings.credentials, "save") as save_key:
             self.assertTrue(app.save_prefs())
             save_key.assert_not_called()
         self.assertIn("密钥未更改", app.v_api_feedback.get())
@@ -209,13 +265,13 @@ class FeedbackTests(unittest.TestCase):
         app = self.app
         app.v_api_key.set(self.key)
         app.v_summary_chars.set("invalid")
-        with patch.object(gui.credentials, "save") as save:
+        with patch.object(settings.credentials, "save") as save:
             self.assertFalse(app.save_prefs())
             save.assert_not_called()
         self.assertIn("未保存", app.v_api_feedback.get())
         self.assertEqual(app.v_api_key.get(), self.key)
         app.v_summary_chars.set("2000")
-        with patch.object(gui.credentials, "save", side_effect=OSError(self.key)):
+        with patch.object(settings.credentials, "save", side_effect=OSError(self.key)):
             self.assertFalse(app.save_prefs())
         self.assertIn("保存失败", app.v_api_feedback.get())
         self.assertNotIn(self.key, app.v_api_feedback.get())
@@ -226,10 +282,10 @@ class FeedbackTests(unittest.TestCase):
 
     def test_cancel_import_export_duplicate_sender_and_log_refresh(self):
         app = self.app
-        with patch.object(gui.filedialog, "askopenfilename", return_value=""):
+        with patch.object(settings.filedialog, "askopenfilename", return_value=""):
             app.import_api_config()
         self.assertIn("已取消导入", app.v_api_feedback.get())
-        with patch.object(gui.filedialog, "asksaveasfilename", return_value=""):
+        with patch.object(settings.filedialog, "asksaveasfilename", return_value=""):
             app.export_api_config()
         self.assertIn("已取消导出", app.v_api_feedback.get())
         app.v_blocked_sender.set("")
@@ -265,7 +321,7 @@ class FeedbackTests(unittest.TestCase):
         app.reload_prefs()
         self.assertIn("重新加载失败", app.v_api_feedback.get())
         self.assertEqual(app.v_summary_chars.get(), "3456")
-        app.proc = object()
+        app.service.proc = object()
         app.qr_watching = True
         app.v_rt_auto.set(True)
         with patch.object(gui.messagebox, "askyesno", return_value=False):
@@ -280,30 +336,54 @@ class FeedbackTests(unittest.TestCase):
 
     def test_group_refresh_does_not_block_tk_and_has_failure_completion(self):
         app = self.app
-        app.proc = object()
-        with patch.object(gui.threading, "Thread") as thread:
+        app.service.proc = object()
+        with patch.object(threading, "Thread") as thread:
             app.refresh_groups()
             self.assertTrue(app.btn_groups_refresh.instate(["disabled"]))
             self.assertIn("正在刷新", app.status.get())
             app.refresh_groups()
             self.assertEqual(thread.call_count, 1)
             work = thread.call_args.kwargs["target"]
-        with patch.object(gui.urllib.request, "build_opener", side_effect=OSError("offline")):
+        with patch.object(local_client.urllib.request, "build_opener", side_effect=OSError("offline")):
             work()
         kind, value = app.events.get_nowait()
         app._dispatch_event(kind, value)
         self.assertFalse(app._groups_busy)
         self.assertTrue(app.btn_groups_refresh.instate(["!disabled"]))
         self.assertIn("本地库", app.status.get())
-        app._dispatch_event("groups_done", ({}, True))
+        app._dispatch_event("groups_done", ({}, True, [], ""))
         self.assertIn("未确认", app.status.get())
-        app._dispatch_event("groups_done", ({"uin": "123", "deleted": [], "protected": []}, True))
+        app._dispatch_event("groups_done", ({"uin": "123", "deleted": [], "protected": []}, True, [], ""))
         self.assertIn("清理完成", app.status.get())
+
+    def test_local_napcat_paths_save_only_in_preferences_and_cancel_has_feedback(self):
+        app = self.app
+        folder = Path(self.tmp.name) / "NapCat"
+        folder.mkdir()
+        qq = Path(self.tmp.name) / "QQ.exe"
+        qq.touch()
+        original = copy.deepcopy(app.cfg)
+        with patch.object(settings.filedialog, "askdirectory", return_value=str(folder)):
+            app.choose_napcat_dir()
+        with patch.object(settings.filedialog, "askopenfilename", return_value=str(qq)):
+            app.choose_qq_path()
+        self.assertIn("保存设置后生效", app.v_api_feedback.get())
+        self.assertTrue(app.save_prefs())
+        saved = prefs.load_raw(app.prefs_file)
+        self.assertEqual(saved["napcat_dir"], str(folder))
+        self.assertEqual(saved["qq_path"], str(qq))
+        effective = prefs.apply_to_config(app.cfg, saved)
+        self.assertEqual(effective["napcat"]["dir"], str(folder))
+        self.assertEqual(effective["napcat"]["qq_path"], str(qq))
+        self.assertEqual(app.cfg, original)
+        with patch.object(settings.filedialog, "askdirectory", return_value=""):
+            app.choose_napcat_dir()
+        self.assertIn("已取消", app.v_api_feedback.get())
 
     def test_usage_refresh_and_rt_busy_have_visible_feedback(self):
         app = self.app
-        app.proc = object()
-        with patch.object(gui.threading, "Thread") as thread:
+        app.service.proc = object()
+        with patch.object(threading, "Thread") as thread:
             app.refresh_usage()
             app.refresh_usage()
             self.assertEqual(thread.call_count, 1)
@@ -318,14 +398,14 @@ class FeedbackTests(unittest.TestCase):
 
     def test_vision_wait_matches_flex_and_completion_is_not_assumed(self):
         app = self.app
-        with patch.object(gui.threading, "Thread") as thread:
+        with patch.object(threading, "Thread") as thread:
             app._start_rt_action("1", "vision", {})
             app._start_rt_action("1", "vision", {})
             self.assertEqual(thread.call_count, 1)
             work = thread.call_args.kwargs["target"]
         opener = Mock()
         opener.open.side_effect = TimeoutError("fixture timeout")
-        with patch.object(gui.urllib.request, "build_opener", return_value=opener):
+        with patch.object(local_client.urllib.request, "build_opener", return_value=opener):
             work()
         self.assertEqual(opener.open.call_args.kwargs["timeout"], 960)
         kind, value = app.events.get_nowait()

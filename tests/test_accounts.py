@@ -56,7 +56,7 @@ class AccountTests(unittest.TestCase):
         first = st.insert_message(Msg(msg_id='42', group_id='g', sender_id='10', ts=1, text='小号内容'), bot_uin='111')
         second = st.insert_message(Msg(msg_id='42', group_id='g', sender_id='20', ts=2, text='大号内容'), bot_uin='222')
         self.assertNotEqual(first, second)
-        self.assertEqual(len(st.messages_between('g', 0, 3)), 2)
+        self.assertEqual({row['id'] for row in st.recent_messages(group_id='g')}, {first, second})  # 两账号内容都可查询。
         self.assertEqual(st.get_message(first)['text'], '小号内容')
 
     def test_failed_table_migration_rolls_back_original_messages(self):
@@ -102,7 +102,7 @@ class AccountTests(unittest.TestCase):
         self.assertIsNone(st.insert_message(msg, bot_uin='222'))
         self.assertTrue(st.has_receipt('111', 'g', '42'))
         self.assertTrue(st.has_receipt('222', 'g', '42'))
-        self.assertEqual(len(st.messages_between('g', 0, 2)), 1)
+        self.assertEqual([row['id'] for row in st.messages_between_all(0, 2)], [first])  # 摘要材料不重复计入共享消息。
         self.assertEqual(st.get_message(first)['vision_text'], '图像解读')
         self.assertEqual(set(st.recent_messages()[0]['receiver_accounts'].split(',')), {'111', '222'})
         self.assertEqual({r[0] for r in st.conn.execute("SELECT account FROM group_accounts")}, {'111','222'})
@@ -134,7 +134,7 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(pipe.last_protocol_message['self_id'], '222')
         self.assertEqual(pipe.store.recent_messages()[0]['received_by'], '222')
 
-    def test_online_other_account_cannot_enable_quick_login_or_restart(self):
+    def test_online_other_account_cannot_refresh_or_restart(self):
         client = Mock()
         client.call.side_effect = lambda path, data=None: {
             '/QQLogin/CheckLoginStatus': {'isLogin':True,'coreReady':True},
@@ -143,24 +143,11 @@ class AccountTests(unittest.TestCase):
         }[path]
         cfg = {'napcat':{'dir':'mock','account':'222'}}
         with patch.object(napcat, '_WebUI', return_value=client), patch.object(napcat, '_shell_execute_runas') as launch:
-            self.assertFalse(napcat.quick_login(cfg, wait_seconds=0)['ok'])
             self.assertFalse(napcat.refresh_login_qrcode(cfg)['ok'])
             self.assertFalse(napcat.restart_target(cfg)['ok'])
             self.assertFalse(napcat.recover_worker(cfg, '111')['ok'])
         launch.assert_not_called()
         self.assertFalse(any('Set' in c.args[0] or 'Restart' in c.args[0] for c in client.call.call_args_list))
-
-    def test_offline_quick_login_selects_target_not_previous_account(self):
-        client = Mock()
-        def call(path, data=None):
-            return {'/QQLogin/CheckLoginStatus': {'loginPhase':'waiting_qrcode'},
-                    '/QQLogin/GetQuickLoginList': ['111','222'],
-                    '/QQLogin/GetQuickLoginQQ': '111'}.get(path)
-        client.call.side_effect = call
-        with patch.object(napcat, '_WebUI', return_value=client):
-            napcat.quick_login({'napcat':{'dir':'mock','account':'222'}}, wait_seconds=0)
-        client.call.assert_any_call('/QQLogin/SetQuickLogin', {'uin':'222'})
-        self.assertFalse(any(c.args[-1] == {'uin':'111'} for c in client.call.call_args_list))
 
     def test_manual_restart_does_not_use_automatic_worker_recovery(self):
         client = Mock()

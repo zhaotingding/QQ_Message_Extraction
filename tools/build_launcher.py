@@ -7,7 +7,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from msgx import prefs, yaml_config
+from msgx import conda_runtime, prefs, yaml_config
 
 
 def selected_icon(root: Path) -> Path | None:
@@ -32,11 +32,13 @@ def refresh_shell_icon(target: Path) -> None:
 
 
 def main() -> int:
+    conda_runtime.require_environment()  # 构建依赖也必须来自本项目 Conda 环境。
     work = ROOT / ".ui" / "launcher-build"
     work.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile", "--noconsole",
+    command = conda_runtime.command("-m", "PyInstaller", "--noconfirm", "--onefile", "--noconsole",
                "--name", "QQ_Message_Extraction", "--distpath", str(work / "dist"),
-               "--workpath", str(work / "build"), "--specpath", str(work), str(ROOT / "tools" / "exe_main.py")]
+               "--workpath", str(work / "build"), "--specpath", str(work), "--paths", str(ROOT / "src"),
+               str(ROOT / "tools" / "exe_main.py"))  # 仅共享标准库环境选择器，不收集业务模块。
     icon = selected_icon(ROOT)
     if icon:
         command.extend(["--icon", str(icon)])

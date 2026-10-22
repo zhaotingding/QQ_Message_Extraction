@@ -13,6 +13,15 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TextIO
 
+from .conda_runtime import require_environment
+
+if __name__ == "__main__":  # CLI 先拒绝错误环境，避免缺依赖掩盖实际启动原因。
+    try:
+        require_environment()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2)
+
 from aiohttp import web
 
 from .config import abs_path, load
@@ -226,6 +235,11 @@ async def cmd_prune(cfg: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        require_environment()  # 空 Conda 环境即使找到了全局 Python，也不能运行业务。
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     ap = argparse.ArgumentParser(prog="msgx", description="QQ 群消息萃取服务")
     ap.add_argument("-c", "--config", default=None, help="配置文件路径（默认 config.yaml）")
     sub = ap.add_subparsers(dest="cmd", required=True)

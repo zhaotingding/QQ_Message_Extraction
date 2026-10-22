@@ -1,3 +1,4 @@
+"""日、周、月摘要：统一周期入口、材料归纳、完整成稿与已接受请求恢复。"""
 from __future__ import annotations
 
 import html
@@ -8,18 +9,18 @@ import logging
 import math
 import re
 import time
-from datetime import date, datetime, time as day_time, timedelta, timezone
+from datetime import date, datetime, time as day_time, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .config import abs_path
 from .llm import IncompleteResponse, LLM
 from .summary_review import get_review
+from .time_rules import BEIJING
 
 log = logging.getLogger("msgx.summarize")
 
 DIGEST_DEFAULT_CHARS = 3000
-BEIJING = timezone(timedelta(hours=8))
 PERIOD_LABELS = {"daily": "日报", "weekly": "周报", "monthly": "月报"}
 
 
@@ -289,37 +290,9 @@ class Summarizer:
             raise ValueError("一次最多选择 31 天")
         return start, end
 
-    async def run_dates(self, start_date: str, end_date: str,
-                        target_chars: int | None = None, prompt: str | None = None,
-                        force: bool = False) -> dict | None:
-        start, end = self._validate_dates(start_date, end_date)
-        if start != end:
-            raise ValueError("手动多日汇总已停用，请查看自动生成的周报、月报")
-        if self._digest_lock.locked():
-            raise RuntimeError("已有摘要正在生成，请等待完成，避免重复请求")
-        worker = self
-        if isinstance(self.llm, LLM):
-            llm = self.llm.snapshot()
-            worker = Summarizer(llm.cfg, self.store, llm)
-        default = int(worker.scfg.get("target_chars", DIGEST_DEFAULT_CHARS))
-        limit = int(target_chars if target_chars is not None else default)
-        if not 1 <= limit <= 100000:
-            raise ValueError("目标字数必须是 1 到 100000 的整数")
-        async with self._digest_lock:
-            self.progress = {"state": "running", "message": "正在检查每日摘要", "started_at": time.time()}
-            log.info("开始生成 %s 至 %s 摘要，目标约 %d 字", start_date, end_date, limit)
-            try:
-                worker.progress = self.progress
-                row = await worker._run_day(start, limit, prompt, force)
-                result = self._saved_result(row) if row else None
-                self.progress.update(state="done", message="摘要已生成" if result else "所选日期没有可总结的消息")
-                return result
-            except Exception as exc:
-                self.progress.update(state="failed", message=f"摘要生成失败：{exc}")
-                raise
-
     async def run_period(self, kind: str, start: date, end: date) -> dict | None:
-        period_parts(kind, start, end)
+        """在服务事件循环中生成已结束的 [start, end) 周期；返回成稿或空，失败保留可恢复材料并抛错。"""
+        period_parts(kind, start, end)  # 日周月共用日期形状校验。
         if end > datetime.now(BEIJING).date():
             raise ValueError("只能生成已经结束的完整自然周期")
         if self._digest_lock.locked():
@@ -379,8 +352,7 @@ class Summarizer:
         if kind == "daily":
             if self.store.count_messages_window(start_ts, end_ts) == 0:
                 return None
-            row = await self._run_day(start, limit, None, False)
-            return self._saved_result(row) if row else None
+            return await self._run_day(start, limit)  # 复用周期入口的锁、快照与成稿检查。
         blocks, reports = [], []
         for child_kind, child_start, child_end in period_parts(kind, start, end):
             row = self._period_source(child_kind, child_start, child_end)
@@ -442,19 +414,11 @@ class Summarizer:
             self.store.clear_summary_request(self._request_key)
         return self._saved_result(self.store.summary_for_window(info["kind"], info["start"], info["end"]))
 
-    async def _run_day(self, day: date, limit: int, prompt: str | None, force: bool):
-        start, end = self._day_bounds(day)
-        today = datetime.now(BEIJING).date()
-        kind = "daily_partial" if day == today else "daily"
-        if kind == "daily" and not force:
-            existing = self.store.summary_for_window(kind, start, end)
-            if existing:
-                self._progress(f"{day.isoformat()} 已有完整日报，直接复用")
-                return existing
+    async def _run_day(self, day: date, limit: int) -> dict | None:
+        start, end = self._day_bounds(day)  # 调用方已确认自然日结束，且尚无成稿。
         if not self.llm.available:
             raise RuntimeError("LLM 未配置，无法补做缺失的日报")
-        actual_end = int(time.time()) if day == today else end
-        rows = self.store.messages_between_all(start - 1, actual_end - 1)
+        rows = self.store.messages_between_all(start - 1, end - 1)  # 将存储的左开右闭查询转换为自然日左闭右开。
         blocks = []
         for row in rows:
             body = _rows_to_text_multi([row])
@@ -463,7 +427,7 @@ class Summarizer:
         if not blocks:
             self._progress(f"{day.isoformat()} 没有可总结的正文或已选择的图片文字")
             return None
-        system = digest_system(limit, prompt if prompt is not None else self.scfg.get("prompt"))
+        system = digest_system(limit, self.scfg.get("prompt"))  # 只读取本任务已冻结的配置。
         system += length_rule(limit)
         system += (f"\n\n本次只总结北京时间 {day.isoformat()} 的已入库消息。"
                    "保留重要事实、数字、讨论进展、分歧和未解决问题，供多日归纳复用。")
@@ -474,88 +438,17 @@ class Summarizer:
         input_limit = context_tokens - output_tokens - max(2048, math.ceil(context_tokens * 0.01))
         input_tokens = estimate_tokens(system) + estimate_tokens("\n\n".join(part for part, _ in blocks)) + 128
         self._progress(f"{day.isoformat()}：已读取 {len(blocks)} 条有效消息，预估输入 {input_tokens} Token")
-        title = f"日摘要（{day.isoformat()}{'，截至当前' if day == today else ''}）"
-        info = self._prepare_period_request(kind, title, start, actual_end, len(blocks), limit, "",
+        title = f"日摘要（{day.isoformat()}）"
+        info = self._prepare_period_request("daily", title, start, end, len(blocks), limit, "",
                                             system, blocks, output_tokens, input_limit)
         content = await self._summarize_blocks(system, blocks, "", output_tokens, input_limit)
         if summary_chars(content) > limit:
             log.warning("模型返回的日摘要超过篇幅上限：%d / %d 字；全文保留，未截断或追加请求",
                         summary_chars(content), limit)
         result = self._save_period_content(content, info)
-        saved = self.store.summary_for_window(kind, start, actual_end)
         log.info("%s 已生成（%d 条有效消息 / %d 字 / 上限 %d 字）：%s",
                  title, len(blocks), summary_chars(content), limit, result["path"])
-        return saved
-
-    async def run_digest(self, full: bool = False, hours: int = 24,
-                         target_chars: int | None = None, prompt: str | None = None) -> dict | None:
-        if self._digest_lock.locked():
-            raise RuntimeError("已有摘要正在生成，请等待完成，避免重复请求")
-        limit = int(target_chars if target_chars is not None else self.scfg.get("target_chars", DIGEST_DEFAULT_CHARS))
-        if limit <= 0 or hours <= 0:
-            raise ValueError("目标字数和统计小时数必须大于 0")
-        system = digest_system(limit, prompt if prompt is not None else self.scfg.get("prompt"))
-        async with self._digest_lock:
-            self.progress = {"state": "running", "message": "正在读取消息", "started_at": time.time()}
-            log.info("开始生成摘要，目标约 %d 字", limit)
-            try:
-                worker = self
-                if isinstance(self.llm, LLM):
-                    llm = self.llm.snapshot()
-                    worker = Summarizer(llm.cfg, self.store, llm)
-                    worker.progress = self.progress
-                result = await worker._run_digest(full, hours, limit, system)
-                self.progress.update(state="done", message="摘要已生成" if result else "没有可总结的新消息")
-                return result
-            except Exception as exc:
-                self.progress.update(state="failed", message=f"摘要生成失败：{exc}")
-                raise
-
-    async def _run_digest(self, full: bool, hours: int, limit: int, system: str) -> dict | None:
-        if not self.llm.available:
-            raise RuntimeError("LLM 未配置，无法生成摘要")
-        now = int(time.time())
-        first = self.store.first_ts_all()
-        if not first:
-            return None
-        start = max(first - 1, now - hours * 3600) if full else (
-            self.store.window_end_by_kind("digest") or (first - 1)
-        )
-        rows = self.store.messages_between_all(start, now)
-        if not rows:
-            return None
-        context_tokens, max_output = model_limits(self.cfg)
-        output_tokens = output_token_budget(limit)
-        if output_tokens > max_output:
-            raise ValueError(f"目标字数对应的输出额度 {output_tokens} Token 超过模型上限 {max_output}，请降低目标字数")
-        # 输入预估外再留 1% 上下文余量，并计入消息封装开销。
-        input_limit = context_tokens - output_tokens - max(2048, math.ceil(context_tokens * 0.01))
-        header = ""
-        blocks = [(_rows_to_text_multi([row]), [int(row["id"])]) for row in rows]
-        input_tokens = estimate_tokens(system) + estimate_tokens(header + "\n\n".join(b[0] for b in blocks)) + 128
-        self._progress(
-            f"已读取 {len(rows)} 条消息；预估输入 {input_tokens} Token；"
-            f"目标 {limit} 字，含冗余的 max_tokens={output_tokens}；上下文 {context_tokens} Token"
-        )
-        content = await self._summarize_blocks(system, blocks, header, output_tokens, input_limit)
-        self._progress("已收到完整摘要，正在保存全文")
-        kind_label = "全量纪要" if full else "群消息纪要"
-        span = f"近 {hours // 24} 天" if full and hours >= 24 else (
-            f"近 {hours} 小时" if full else "增量"
-        )
-        title = (
-            f"{kind_label}（{span}） {time.strftime('%m-%d %H:%M', time.localtime(start))}"
-            f"~{time.strftime('%H:%M', time.localtime(now))}"
-        )
-        path = self._write_report(title, content, "全部", start, now, len(rows))
-        sid = self.store.add_summary("digest", start, now, len(rows), content, "digest", str(path))
-        log.info("%s 已生成（%d 条消息 / %d 字 / 目标 %d 字）：%s",
-                 kind_label, len(rows), len(content), limit, path)
-        return {
-            "id": sid, "group_id": "digest", "title": title, "path": str(path),
-            "content": content, "count": len(rows), "chars": len(content),
-            "target_chars": limit, "hours": hours if full else None,
-        }
+        return result  # 保存入口已返回完整结果，避免再次查询同一成稿。
 
     async def _request(self, system: str, body: str, source_ids: list[int],
                        output_tokens: int, purpose: str, checkpoint: bool) -> str:

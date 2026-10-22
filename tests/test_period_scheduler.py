@@ -269,7 +269,7 @@ class PeriodSchedulerTests(IsolatedAsyncioTestCase):
             visited.set()
         self.pipe._catch_up_summaries = AsyncMock(side_effect=check)
         self.store.save_summary_job("daily", "2026-10-03", "2026-10-04", "blocked", now=100)
-        with patch("msgx.pipeline.asyncio.sleep", new=AsyncMock()), patch("msgx.pipeline.datetime", wraps=datetime) as clock:
+        with patch("msgx.pipeline.asyncio.sleep", new=AsyncMock()), patch("msgx.summary_scheduler.datetime", wraps=datetime) as clock:
             clock.now.return_value = self.clock("2026-10-05", 10)
             loop = asyncio.create_task(self.pipe._summary_loop())
             try:

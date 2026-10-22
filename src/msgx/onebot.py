@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import logging
 from datetime import date
 
 from aiohttp import WSMsgType, web
+
+from .store import Store
 
 log = logging.getLogger("msgx.onebot")
 
@@ -79,14 +83,8 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
     await ws.prepare(request)
     pipe = request.app["pipe"]
     peer = str(request.remote)
-    pipe.ws_peers.add(peer)
-    # 同时登记连接对象：退出时要靠它主动关闭，否则 runner.cleanup() 会
-    # 一直等 WS 处理器返回（NapCat 不断线就永远不返回）。
-    pipe.ws_conns.add(ws)
-    pipe.ws_online[ws] = None
-    pipe.ws_addresses[ws] = peer
+    pipe.register_ws(ws, peer)
     log.info("协议端已连接: %s", request.remote)
-    pipe.on_peer_connected()
     accepted = 0
     try:
         async for raw in ws:
@@ -111,13 +109,12 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
                     if event.get("meta_event_type") == "heartbeat" and isinstance(status, dict):
                         online = status.get("online")
                         if isinstance(online, bool):
-                            pipe.ws_online[ws] = online
-                            pipe._protocol_checked = 0.0
+                            pipe.note_ws_online(ws, online)
                     continue
                 if event.get("post_type") in ("notice", "request"):
                     continue
                 if event.get("post_type") == "message":
-                    pipe.ws_online[ws] = True
+                    pipe.note_ws_online(ws, True)
                 if await pipe.submit(event):
                     pipe.note_protocol_message(event)
                 accepted += 1
@@ -126,16 +123,8 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
                 break
     finally:
         # 必须在 finally 里移除，否则断线后 /health 会一直显示「已连接」
-        pipe.ws_conns.discard(ws)
-        pipe.ws_online.pop(ws, None)
-        pipe.ws_addresses.pop(ws, None)
-        # 多条连接可能来自同一个 IP；其中一条断开不能抹掉仍在线的连接。
-        pipe.ws_peers.clear()
-        pipe.ws_peers.update(addr for conn, addr in pipe.ws_addresses.items() if not conn.closed)
-        reason = "服务主动停止" if pipe._closing_ws or pipe._stop.is_set() else "连接关闭"
-        pipe.ws_last_close = f"{reason}，关闭码 {ws.close_code}，错误 {ws.exception() or '无'}"
-        log.info("协议端断开（本次接收 %s 条事件；%s）", accepted, pipe.ws_last_close)
-        pipe.on_peer_disconnected()
+        reason = pipe.unregister_ws(ws)
+        log.info("协议端断开（本次接收 %s 条事件；%s）", accepted, reason)
     return ws
 
 
@@ -187,13 +176,34 @@ async def _messages_recent(request: web.Request) -> web.Response:
     limit = max(1, min(limit, 300))
     images_only = request.query.get("images", "") == "1"
     group_id = request.query.get("group_id", "")
-    store = request.app["pipe"].store
-    account = str(getattr(request.app["pipe"], "target_account", "") or getattr(request.app["pipe"], "bot_uin", ""))
-    rows = store.recent_messages(limit, images_only=images_only, group_id=group_id, account=account)
-    return web.json_response({"ok": True, "items": [dict(r) for r in rows],
-                              "related": store.recent_messages(limit, group_id=group_id, account=account, related_only=True) if account else [],
-                              "related_account": account,
-                              "activity": store.group_activity()})
+    pipe = request.app["pipe"]
+    account = str(getattr(pipe, "target_account", "") or getattr(pipe, "bot_uin", ""))
+
+    def query(store):
+        # 一个只读事务让消息、本人关联和群统计使用相同快照；不借用接收线程的连接。
+        return {"ok": True,
+                "items": [dict(row) for row in store.recent_messages(limit, images_only=images_only,
+                           group_id=group_id, account=account)],
+                "related": store.recent_messages(limit, group_id=group_id, account=account,
+                            related_only=True) if account else [],
+                "related_account": account, "activity": store.group_activity()}
+
+    return web.json_response(await _read_store(pipe.store, query))
+
+
+async def _read_store(source: Store, query):
+    """耗时只读查询在线程内独占连接，避免历史筛选阻塞 WS 接收与健康响应。"""
+    path, filters = source.db_path, copy.deepcopy(source.filters)
+
+    def read():
+        store = Store(path, filters=filters, readonly=True)
+        try:
+            store.conn.execute("BEGIN")
+            return query(store)
+        finally:
+            store.close()
+
+    return await asyncio.to_thread(read)
 
 
 def _local_edit_allowed(request: web.Request) -> bool:
@@ -238,11 +248,14 @@ async def _billing(request: web.Request) -> web.Response:
 
 
 async def _usage_details(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, **request.app["pipe"].store.api_usage_details(active_only=True)})
+    data = await _read_store(request.app["pipe"].store, lambda store: store.api_usage_details(active_only=True))
+    return web.json_response({"ok": True, **data})
 
 
 async def _usage_sources(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, **request.app["pipe"].store.api_call_sources(int(request.match_info["call_id"]))})
+    call_id = int(request.match_info["call_id"])
+    data = await _read_store(request.app["pipe"].store, lambda store: store.api_call_sources(call_id))
+    return web.json_response({"ok": True, **data})
 
 
 async def _groups_refresh(request: web.Request) -> web.Response:

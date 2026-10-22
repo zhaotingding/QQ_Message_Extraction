@@ -46,6 +46,52 @@ class YamlTests(unittest.TestCase):
             self.assertEqual(config.load()["summary"]["target_chars"], 3456)
             self.assertEqual(config.load(explicit)["summary"]["target_chars"], 4567)
 
+    def test_local_main_config_replaces_shared_without_writing_it(self):
+        shared = self.write("config.yaml", {"summary": {"target_chars": 3456},
+                                          "onebot": {"http_port": 7654}})  # 共享端口不能泄漏到本机配置。
+        original = shared.read_bytes()  # 读取配置不得改写共享文件。
+        local = self.write(".ui/config.local.yaml", {"summary": {"target_chars": 4567}})
+        local_original = local.read_bytes()  # 本机文件也只能读取，不能自动补写默认值。
+        with patch.object(config, "ROOT", self.root), patch.dict(os.environ, {prefs.ENV_PREFS: ""}):
+            loaded = config.load()  # 未传路径时选用完整本机主配置。
+        self.assertEqual(loaded["summary"]["target_chars"], 4567)
+        self.assertEqual(loaded["onebot"]["http_port"], config.DEFAULTS["onebot"]["http_port"])
+        self.assertEqual(shared.read_bytes(), original)
+        self.assertEqual(local.read_bytes(), local_original)
+
+    def test_explicit_main_config_takes_priority_and_missing_path_keeps_defaults(self):
+        self.write("config.yaml", {"summary": {"target_chars": 3456}})
+        self.write(".ui/config.local.yaml", {"summary": {"target_chars": 4567}})
+        explicit = self.write("custom.yaml", {"summary": {"target_chars": 5678}})
+        with patch.object(config, "ROOT", self.root), patch.dict(os.environ, {prefs.ENV_PREFS: ""}):
+            self.assertEqual(config.load(explicit)["summary"]["target_chars"], 5678)
+            missing = config.load(self.root / "missing.yaml")  # 显式缺文件不能转而采用本机或共享配置。
+        self.assertEqual(missing["summary"]["target_chars"], config.DEFAULTS["summary"]["target_chars"])
+
+    def test_corrupt_local_main_config_reports_error_without_shared_fallback(self):
+        self.write("config.yaml", {"summary": {"target_chars": 3456}})
+        local = self.write(".ui/config.local.yaml", {})
+        explicit = self.write("custom.yaml", {"summary": {"target_chars": 5678}})
+        for text in ("summary: [", "onebot: 6701"):  # 同时覆盖语法损坏和配置段类型错误。
+            with self.subTest(text=text):
+                local.write_text(text, encoding="utf-8")
+                with patch.object(config, "ROOT", self.root), patch.dict(os.environ, {prefs.ENV_PREFS: ""}):
+                    with self.assertRaises(ValueError):
+                        config.load()  # 不得把损坏本机配置悄悄替换成共享配置。
+                    self.assertEqual(config.load(explicit)["summary"]["target_chars"], 5678)
+                self.assertEqual(local.read_text(encoding="utf-8"), text)
+
+    def test_preferences_overlay_selected_local_main_config(self):
+        self.write("config.yaml", {"summary": {"target_chars": 3456}})
+        self.write(".ui/config.local.yaml", {"summary": {"target_chars": 4567},
+                                           "onebot": {"http_port": 7654}})
+        preference_path = self.write(".ui/preferences.yaml", {"summary_target_chars": 5678})
+        with patch.object(config, "ROOT", self.root), \
+                patch.dict(os.environ, {prefs.ENV_PREFS: str(preference_path)}):
+            loaded = config.load()  # 选定主配置之后，仍由已保存偏好覆盖 GUI 管理字段。
+        self.assertEqual(loaded["summary"]["target_chars"], 5678)
+        self.assertEqual(loaded["onebot"]["http_port"], 7654)
+
     def test_empty_document_and_invalid_mapping(self):
         self.assertEqual(yaml_config.loads("# 空配置\n"), {})
         for text in ("- item", "plain string", "summary: [", "value: !!python/object/apply:os.system []"):

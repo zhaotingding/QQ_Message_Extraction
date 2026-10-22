@@ -4,19 +4,23 @@
 「属性名写错」这类只在运行时才暴露的问题 —— 而那恰恰是界面最常见的故障。
 本测试会真正构建全部控件、走一遍取值逻辑、再用假数据刷新显示。
 
-不会写盘，也不会真的启动服务。
+仅在临时目录写日志、偏好和合成图片，不启动真实服务或访问凭据。
 需要 tkinter。若当前解释器没有 tkinter，会明确提示而不是直接报错。
 """
 from __future__ import annotations
 
 import sys
+import os
+import atexit
 import copy
 import json
 import time
 import sqlite3
 import tempfile
-from contextlib import closing
+from contextlib import ExitStack, closing
 from pathlib import Path
+from unittest.mock import MagicMock, Mock, patch
+from types import SimpleNamespace
 
 PROJ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJ / "src"))
@@ -30,14 +34,32 @@ except ImportError:
     print("  说明：python.org 的官方安装版自带 tkinter；某些精简发行版不带。")
     raise SystemExit(1)
 
+resources = ExitStack()  # 统一回收临时目录、窗口与补丁，包括断言中途失败。
+atexit.register(resources.close)
+TEST_ROOT = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="msgx-gui-")))
+resources.enter_context(patch.dict(os.environ, {
+    "MSGX_ROOT": str(TEST_ROOT),  # 模块导入前隔离根目录，日志和 VBS 都写入测试目录。
+    "MSGX_PREFS": str(TEST_ROOT / ".ui" / "preferences.yaml"),
+    "NAPCAT_HOME": "",
+}))
+(TEST_ROOT / "config.yaml").write_bytes((PROJ / "config.yaml").read_bytes())
+
 from msgx import prefs, yaml_config
 from msgx.gui import App  # noqa: E402
-from unittest.mock import Mock, patch
+from msgx import napcat as N
+from msgx.config import load
+
+test_config = load(TEST_ROOT / "config.yaml")  # 读取公共默认值，数据与协议端路径单独隔离。
+test_config["app"]["db_path"] = str(TEST_ROOT / "history.db")
+test_config["napcat"]["dir"] = str(TEST_ROOT / "nonexistent-napcat")
+test_config["onebot"].update(http_port=1, ws_port=1)
+resources.enter_context(patch("msgx.gui.load", side_effect=lambda *args: copy.deepcopy(test_config)))
 
 # 测试界面不得接触用户的真实凭据存储。
-patch("msgx.gui.credentials.read", return_value="").start()
-patch("msgx.gui.credentials.save").start()
-patch("msgx.gui.credentials.delete").start()
+for method in ("read", "save", "delete"):
+    resources.enter_context(patch(f"msgx.ui.settings.credentials.{method}", return_value=""))
+resources.enter_context(patch("msgx.local_client.urllib.request.build_opener",
+                              side_effect=AssertionError("测试禁止真实网络请求")))
 
 fails: list[str] = []
 
@@ -50,12 +72,19 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 print("=== 构建界面 ===")
 root = tk.Tk()
+
+
+def close_root() -> None:
+    for callback in root.tk.call("after", "info"):
+        root.after_cancel(callback)  # 先撤销刷新，再销毁窗口和临时文件。
+    root.destroy()
+
+
+resources.callback(close_root)
 # 用默认偏好验证界面，避免本机自定义发言人、API 和所选页面改变测试预期。
 with patch("msgx.gui.prefs_mod.load", return_value=copy.deepcopy(prefs.DEFAULTS)), \
         patch("msgx.gui.prefs_mod.load_raw", return_value={}):
     app = App(root)
-_reader_temp = tempfile.TemporaryDirectory(prefix="msgx-reader-")
-app.cfg["app"]["db_path"] = str(Path(_reader_temp.name) / "history.db")
 app.prefs["qq_account"] = "123"
 app.v_qq_account.set("123")
 root.update()  # 强制完成一次几何计算，布局错误会在这时抛出
@@ -98,22 +127,20 @@ print("\n=== 失败摘要确认恢复（无网络） ===")
 _retry_job = dict(kind="daily", start_date="2026-10-03", end_date="2026-10-04",
                   state="blocked", updated_at=100, error="结果未知")
 _retry_proc = app.proc
-app.proc = object()
+app.service.proc = object()
 app._apply_summary_schedule({"summary_schedule": {**_retry_job, "failures": [_retry_job]}})
 check("失败状态显示具体日期", "2026-10-03 — 2026-10-04" in app.v_summary_schedule.get())
 check("补生成列表显示具体失败任务", "2026-10-03" in app.cb_summary_retry.get())
-with patch("msgx.gui.messagebox.askyesno", return_value=False), patch("msgx.gui.threading.Thread") as _thread:
+with patch("msgx.gui.messagebox.askyesno", return_value=False), patch("threading.Thread") as _thread:
     app.retry_summary()
     check("取消确认不提交请求", not _thread.called and not app._summary_retry_busy)
-from unittest.mock import MagicMock
-from types import SimpleNamespace
 _retry_response = MagicMock()
 _retry_response.__enter__.return_value.read.return_value = b'{"ok":true,"state":"pending"}'
 _retry_opener = Mock()
 _retry_opener.open.return_value = _retry_response
 with patch("msgx.gui.messagebox.askyesno", return_value=True), \
-        patch("msgx.gui.urllib.request.build_opener", return_value=_retry_opener), \
-        patch("msgx.gui.threading.Thread", side_effect=lambda target, daemon: SimpleNamespace(start=target)):
+        patch("msgx.local_client.urllib.request.build_opener", return_value=_retry_opener), \
+        patch("threading.Thread", side_effect=lambda target, daemon: SimpleNamespace(start=target)):
     app.retry_summary()
     app.retry_summary()
     check("提交期间连续点击只发一次", _retry_opener.open.call_count == 1)
@@ -124,7 +151,7 @@ app._dispatch_event("summary_retry_done", (app.proc, {"ok": True, "state": "pend
 check("队列确认不冒充生成成功", "队列" in app.status.get() and not app._summary_retry_busy)
 app._apply_summary_retry_jobs([])
 check("无失败任务隐藏补生成行", not app.summary_retry_row.winfo_manager())
-app.proc = _retry_proc
+app.service.proc = _retry_proc
 
 print("\n=== 设置页可滚动（窗口矮时「保存设置」不再被切掉）===")
 allw: list = []
@@ -192,13 +219,13 @@ check("实时消息表格列齐全",
 check("内容筛选默认显示全部消息", app.v_rt_filter.get() == "全部消息")
 check("实时消息默认请求200条", app.v_rt_limit.get() == "200" and app._rt_limit == 200)
 old_proc = app.proc
-app.proc = object()
+app.service.proc = object()
 app.v_rt_filter.set("仅看图片")
-with patch("msgx.gui.threading.Thread") as thread:
+with patch("threading.Thread") as thread:
     app.refresh_messages()
     check("仅看图片筛选发送到服务端查询", thread.call_args.kwargs["args"] == (200, True, "", app.proc))
 app._rt_busy = False
-app.proc = old_proc
+app.service.proc = old_proc
 app.v_rt_filter.set("全部消息")
 app._render_messages(None)
 check("拉取失败时给出说明", "失败" in app.v_rt_status.get(), app.v_rt_status.get())
@@ -219,55 +246,26 @@ check("被 @ 的行按普通消息呈现", "atme" not in app.rt.item(rows[0], "t
 check("语义失败的行有专属标记", "failed" in app.rt.item(rows[1], "tags"), str(app.rt.item(rows[1], "tags")))
 check("保留原图、识别和纳入摘要操作", vals[1][5] == "打开" and vals[1][6] == "□ 识别"
       and vals[1][7] == "☑", str(vals[1]))
-app.rt.selection_set("2")
-app._on_rt_select()
-check("统一详情显示文字消息原文", "第二条" in app.rt_detail.get("1.0", "end"))
-app.rt.selection_set("1")
-app._on_rt_select()
-check("选中行显示完整 OCR 与语义", "报错截图" in app.rt_detail.get("1.0", "end"))
-from types import SimpleNamespace  # noqa: E402
 event = SimpleNamespace(x=1, y=1)
 with patch.object(app.rt, "identify_row", return_value="1"), patch.object(app.rt, "identify_column", return_value="#6"), \
         patch("msgx.gui.open_path") as opened:
     app._on_rt_click(event)
     check("点击图片链接打开当前行文件", opened.call_count == 1)
-with patch.object(app.rt, "identify_row", return_value="1"), patch.object(app.rt, "identify_column", return_value="#7"), \
-        patch.object(app, "_start_rt_action") as action:
-    app._on_rt_click(event)
-    check("点击识别勾选提交当前行", action.call_args.args == ("1", "vision", {}))
-with patch.object(app.rt, "identify_row", return_value="1"), patch.object(app.rt, "identify_column", return_value="#8"), \
-        patch.object(app, "_start_rt_action") as action:
-    app._on_rt_click(event)
-    check("纳入摘要单独切换", action.call_args.args == ("1", "summary-include", {"include": False}))
-app._render_messages([{"id": 3, "ts": 1700000000, "text": "[图片]", "media_state": "filtered",
-                       "ocr_text": "报错截图", "vision_text": "", "has_media": 1, "include_vision": 0,
-                       "media_path": str(PROJ / "README.md")}])
-check("过滤图片直接显示 OCR 预览", app.rt.item("3", "values")[3] == "[图片] OCR:报错截图")
-app._render_messages([{"id": 4, "ts": 1700000000, "text": "两张图[图片][图片]", "media_state": "done",
-                       "images": [{"id": 41, "image_index": 0, "ocr_text": "第一张", "vision_text": "语义甲",
-                                   "media_path": str(PROJ / "README.md"), "include_vision": 1, "media_state": "done"},
-                                  {"id": 42, "image_index": 1, "ocr_text": "第二张", "vision_text": "语义乙",
-                                   "media_path": str(PROJ / "README.md"), "include_vision": 0, "media_state": "done"}]}])
-app.rt.selection_set("4:41")
-app._on_rt_select()
-first_detail = app.rt_detail.get("1.0", "end")
-app.rt.selection_set("4:42")
-app._on_rt_select()
-check("同条消息的两张图片独立展示", app.rt.exists("4:41") and app.rt.exists("4:42")
-      and "语义甲" in first_detail and "语义乙" in app.rt_detail.get("1.0", "end"))
+# 完整 OCR、逐图详情与识别操作由 test_realtime_gui 专项验证。
 
 print("\n=== 图片状态标注 ===")
-labels = {
-    app._media_label({"media_state": "none"}): "—",
-    app._media_label({"media_state": "pending"}): "待处理",
-    app._media_label({"media_state": "failed"}): "下载失败",
-    app._media_label({"media_state": "done", "vision_state": "failed"}): "图片未识别",
-    app._media_label({"media_state": "done", "vision_state": "rejected"}): "请求被拒绝",
-    app._media_label({"media_state": "done", "vision_state": "skipped", "ocr_text": "旧记录文字"}): "仅 OCR",
-    app._media_label({"media_state": "done", "vision_state": "skipped"}): "已跳过",
-    app._media_label({"media_state": "done", "vision_state": "ok"}): "完成",
-}
-for got, want in labels.items():
+labels = [  # 输入逐项检查；错误地返回相同标签也不能覆盖另一个用例。
+    ({"media_state": "none"}, "—"),
+    ({"media_state": "pending"}, "待处理"),
+    ({"media_state": "failed"}, "下载失败"),
+    ({"media_state": "done", "vision_state": "failed"}, "图片未识别"),
+    ({"media_state": "done", "vision_state": "rejected"}, "请求被拒绝"),
+    ({"media_state": "done", "vision_state": "skipped", "ocr_text": "旧记录文字"}, "仅 OCR"),
+    ({"media_state": "done", "vision_state": "skipped"}, "已跳过"),
+    ({"media_state": "done", "vision_state": "ok"}, "完成"),
+]
+for message, want in labels:
+    got = app._media_label(message)
     check(f"状态 {want}", got == want, got)
 
 print("\n=== 显示刷新（用假数据）===")
@@ -410,7 +408,7 @@ check("未配置 start_script 时返回 None", app.napcat_script() is None, str(
 app.cfg["napcat"] = {"start_script": "tools/whatever.bat"}
 check(
     "相对路径拼到项目根",
-    app.napcat_script() == PROJ / "tools" / "whatever.bat",
+    app.napcat_script() == TEST_ROOT / "tools" / "whatever.bat",
     str(app.napcat_script()),
 )
 app.cfg["napcat"] = {"start_script": r"D:\App\NapCat\start-napcat.bat"}
@@ -420,21 +418,22 @@ check(
     str(app.napcat_script()),
 )
 # v0.5.7：启动器能自动找到目录时，GUI 必须监听同一个目录。
-from unittest.mock import patch
-
 app.cfg["napcat"] = {"dir": ""}
-with patch("msgx.gui.napcat_mod.resolve_dir", return_value=Path("D:/App/NapCat")):
+with patch("msgx.ui.login.napcat_mod.resolve_dir", return_value=Path("D:/App/NapCat")):
     check("未填目录时复用启动器自动发现结果", app.napcat_dir() == Path("D:/App/NapCat"))
-with patch("msgx.gui.napcat_mod.resolve_dir", return_value=None):
+with patch("msgx.ui.login.napcat_mod.resolve_dir", return_value=None):
     check("启动器也找不到目录时返回 None", app.napcat_dir() is None)
 app.cfg["napcat"] = {"dir": "NapCat"}
-check("相对目录拼到项目根", app.napcat_dir() == PROJ / "NapCat", str(app.napcat_dir()))
+app.prefs["napcat_dir"] = "NapCat"
+check("相对目录拼到项目根", app.napcat_dir() == TEST_ROOT / "NapCat", str(app.napcat_dir()))
 app.cfg["napcat"] = {"dir": r"D:\App\NapCat"}
+app.prefs["napcat_dir"] = r"D:\App\NapCat"
 check(
     "绝对目录原样返回",
     app.napcat_dir() == Path(r"D:\App\NapCat"),
     str(app.napcat_dir()),
 )
+app.prefs.pop("napcat_dir", None)  # 后续旧配置入口回归不携带本机设置覆盖。
 
 print("\n=== 日志区 ===")
 app._log_ui("测试日志行\n")
@@ -535,15 +534,10 @@ check("界面 token 覆盖 config", merged["billing"]["platform_token"] == "ui-t
 merged2 = P.apply_to_config(base, {"platform_token": ""})
 check("token 留空 = 沿用 config（不是清空）",
       merged2["billing"]["platform_token"] == "cfg-token", merged2["billing"]["platform_token"])
-check("load_raw 不填默认值", P.load_raw(PROJ / ".ui" / "__not_exist__.yaml") == {},
-      str(P.load_raw(PROJ / ".ui" / "__not_exist__.yaml")))
+check("load_raw 不填默认值", P.load_raw(TEST_ROOT / ".ui" / "__not_exist__.yaml") == {},
+      str(P.load_raw(TEST_ROOT / ".ui" / "__not_exist__.yaml")))
 
 print("\n=== 协议端隐藏启动器 ===")
-import os  # noqa: E402
-import tempfile  # noqa: E402
-
-from msgx import napcat as N  # noqa: E402
-
 vbs = N.vbs_path()
 check("VBS 已生成", vbs is not None and vbs.exists(), str(vbs))
 if vbs is not None:
@@ -552,30 +546,23 @@ if vbs is not None:
     check("VBS 用隐藏窗口样式 0", ", 0, True)" in src, src[-140:].replace("\n", " "))
 
 # 关键安全性质：目录不完整 / 路径写错时必须**拒绝启动**，而不是静默换个目录启动。
-tmpd = tempfile.mkdtemp()
+tmpd = resources.enter_context(tempfile.TemporaryDirectory(dir=TEST_ROOT))
 bad = {"napcat": {"dir": r"Z:\__msgx_nope__", "log_file": os.path.join(tmpd, "n.log")}}
 res = N.launch(bad, visible=False)
 check("目录不存在时拒绝启动", res.get("ok") is False, str(res))
 check("拒绝原因指向配置路径", "__msgx_nope__" in str(res.get("error")), str(res.get("error"))[:120])
 check("写下了启动记录（便于排障）", os.path.exists(os.path.join(tmpd, "n.log")))
 
-r = N.preflight(PROJ, {"napcat": {}})
+r = N.preflight(TEST_ROOT, {"napcat": {}})
 check("预检能列出缺失文件", isinstance(r["missing"], list) and bool(r["missing"]), str(r["missing"]))
 check("文件不齐时 ok = False", r["ok"] is False, str(r))
-check("没配目录时 resolve_dir 不瞎猜", N.resolve_dir({"napcat": {"dir": ""}}) is None
-      or (N.resolve_dir({"napcat": {"dir": ""}}) or Path()).name == "NapCat",
-      str(N.resolve_dir({"napcat": {"dir": ""}})))
+with patch.object(Path, "exists", return_value=False):
+    check("未安装时返回 None", N.resolve_dir({"napcat": {"dir": ""}}) is None)
 check("明确配了目录就原样返回（不猜测）",
       N.resolve_dir({"napcat": {"dir": r"Z:\__msgx_nope__"}}) == Path(r"Z:\__msgx_nope__"),
       str(N.resolve_dir({"napcat": {"dir": r"Z:\__msgx_nope__"}})))
 
-# ---------------------------------------------------------------------------
-# v0.5.2：点一次「启动协议端」= 注入一份 NapCat **并且再拉起一份 QQ**。
-# 用户看到「没反应」很容易反复点 → 多份实例并存、各自写 cache/qrcode.png 互相覆盖
-# → 扫哪一次都被覆盖，谁也登不上，表现恰好是「点了很多次、消息一直不来」。
-# 所以：① 启动前要能查「是不是已经在跑了」；② 界面要拦一下；③ 日志页不能再拿
-# 「logs 目录是空的」当成「协议端从未启动过」的证据（这个错误结论真的误导过用户）。
-# ---------------------------------------------------------------------------
+# 进程检测用于避免重复启动；日志目录为空不能代表协议端未运行。
 print("\n=== 检测「协议端是否已在运行」（v0.5.2）===")
 import subprocess as _sp  # noqa: E402
 
@@ -611,20 +598,21 @@ _sp.run = _orig_sp_run  # type: ignore[assignment]
 
 print("\n=== 日志页：不得把「logs 空着」当成「协议端没启动」的证据 ===")
 N.running_instances = lambda: {"injectors": 0, "qq": 0, "any": False}  # type: ignore[assignment]
-_empty = tempfile.mkdtemp()
+_empty = resources.enter_context(tempfile.TemporaryDirectory(dir=TEST_ROOT))
 os.makedirs(os.path.join(_empty, "logs"), exist_ok=True)
 _txt = N.log_tail({"napcat": {"dir": _empty, "log_file": os.path.join(tmpd, "n2.log")}})
 check("不再断言「协议端可能从未成功启动过」", "从未成功启动" not in _txt, _txt[-160:])
 check("解释「看不到日志 ≠ 没启动」", "不等于" in _txt, _txt[-200:])
 check("给出当前进程实况（重复启动一眼可见）", "当前进程" in _txt, _txt[-260:])
 check("区分「空目录」这一情形", "空目录" in _txt, _txt[-200:])
-_gone = os.path.join(tempfile.mkdtemp(), "__nope__")
+_gone = str(TEST_ROOT / "__nope__")
 _txt2 = N.log_tail({"napcat": {"dir": _gone, "log_file": os.path.join(tmpd, "n3.log")}})
 check("目录不存在时说的是「目录不存在」而不是「空目录」",
       "目录不存在" in _txt2 and "空目录" not in _txt2, _txt2[-200:])
 # 注意：dir 留空时 resolve_dir 会去探测常见安装位置，所以这里不一定是「未配置」分支。
 # 要保证的只是「给出可读说明」且「不把日志缺失当成没启动的证据」。
-_txt3 = N.log_tail({"napcat": {"dir": "", "log_file": os.path.join(tmpd, "n4.log")}})
+with patch.object(N, "resolve_dir", return_value=None):  # 不读取本机已安装 NapCat 的日志。
+    _txt3 = N.log_tail({"napcat": {"dir": "", "log_file": os.path.join(tmpd, "n4.log")}})
 check("dir 留空时仍给出可读说明且不下否定结论",
       ("未配置" in _txt3 or "logs" in _txt3) and "从未成功启动" not in _txt3, _txt3[-160:])
 N.running_instances = _orig_running  # type: ignore[assignment]
@@ -632,13 +620,7 @@ N.running_instances = _orig_running  # type: ignore[assignment]
 import tkinter.messagebox as _mb  # noqa: E402
 app.cfg["napcat"] = {"dir": "tests/nonexistent-napcat"}  # 不碰真实协议端的二维码
 
-# ---------------------------------------------------------------------------
-# v0.5.6：「重启协议端后二维码从不弹出」的三处修复。
-# 复盘（napcat.log + 冻结形态推演）：冻结 = 「连着但不推」，点重置的瞬间旧连接还挂在
-# ws_peers 上；_apply_health 每 2 秒看一眼「已连接」就把 qr_watching 置 False ——
-# 刚武装的监视线程 2 秒内被掐死，而 bat（UAC→清场→重登→写码）20~60 秒后才写新码，
-# 等真要扫码时已经没人在盯文件。用户连点 4 次重置全部哑火，就是这个死循环。
-# ---------------------------------------------------------------------------
+# 旧连接仍在线时也要等待本轮新码和目标账号的新消息。
 print("\n=== 二维码监视：旧连接不能关闭（v0.7.8）===")
 app.qr_watching = True
 app._apply_health({
@@ -664,10 +646,9 @@ check("武装后监视为开启态", app.qr_watching is True, str(app.qr_watchin
 app.qr_watching = False
 
 print("\n=== 二维码弹窗：展示成功才推进基线（v0.5.6）===")
-import tempfile as _tf  # noqa: E402
 from PIL import Image as _Img  # noqa: E402
 
-_qrd = _tf.mkdtemp()
+_qrd = resources.enter_context(tempfile.TemporaryDirectory(dir=TEST_ROOT))
 _ok_png = os.path.join(_qrd, "ok.png")
 _Img.new("RGB", (20, 20), "blue").save(_ok_png)
 _ok_mtime = os.stat(_ok_png).st_mtime
@@ -705,7 +686,7 @@ check("坏事件被兜住且记了日志", "事件处理异常" in app.log.get("
 check("坏事件之后的事件仍被处理（事件泵未死）", app.status.get() == "泵还活着", app.status.get())
 
 print("\n=== 重启到扫码窗口的完整链路（v0.5.7）===")
-with _tf.TemporaryDirectory() as _tmp:
+with tempfile.TemporaryDirectory(dir=TEST_ROOT) as _tmp:
     _nc = Path(_tmp)
     (_nc / "cache").mkdir()
     (_nc / "launcher.bat").touch()  # 仅用于目录发现，不执行脚本
@@ -727,7 +708,7 @@ with _tf.TemporaryDirectory() as _tmp:
     _receiver.poll.return_value = None
 
     def _fake_start_receiver():
-        app.proc = _receiver
+        app.service.proc = _receiver
         return True
 
     with patch.dict(os.environ, {"NAPCAT_HOME": str(_nc)}), \
@@ -792,7 +773,7 @@ with _tf.TemporaryDirectory() as _tmp:
         app.qr_watching = False
         app.qr_gen += 1
         app._close_qrcode()
-    app.proc = _before_restart_proc
+    app.service.proc = _before_restart_proc
 
 print("\n=== 0.7.8 只有本轮目标账号新消息才能关闭二维码 ===")
 app.qr_shown_mtime = 0.0
@@ -824,7 +805,7 @@ app._close_qrcode()
 check("图片列明确显示已过滤", App._media_label({"media_state": "filtered"}) == "已过滤")
 check("普通无图消息仍显示横线", App._media_label({"media_state": "none", "text": "普通文字"}) == "—")
 
-_trace = (PROJ / "data" / "logs" / "gui.log").read_text(encoding="utf-8")
+_trace = (TEST_ROOT / "data" / "logs" / "gui.log").read_text(encoding="utf-8")
 check("持久日志包含版本与进程", "启动 version=" in _trace and f"pid={os.getpid()}" in _trace)
 check("持久日志能定位检测与展示环节", "检测到二维码" in _trace and "已弹出扫码窗口" in _trace)
 
@@ -832,7 +813,7 @@ print("\n=== 生成进度、完整摘要与消费明细（v0.6.0）===")
 check("消费明细紧邻设置，全文有独立页", [app.nb.tab(t, "text") for t in app.nb.tabs()] ==
       ["运行状态", "实时消息", "设置", "消费明细", "摘要全文"])
 _saved_proc = app.proc
-app.proc = object()  # 仅模拟已启动；拦截线程，禁止真实请求。
+app.service.proc = object()  # 仅模拟已启动；拦截线程，禁止真实请求。
 _saved_prefs = dict(app.prefs)
 _saved_prompt = app.txt_summary_prompt.get("1.0", "end").strip()
 _saved_chars = app.v_summary_chars.get()
@@ -850,14 +831,14 @@ app.txt_summary_prompt.delete("1.0", "end")
 app.txt_summary_prompt.insert("1.0", "尚未保存的内容")
 app.v_summary_chars.set("9000")
 _full_text = "# 本期讨论总览\n\n**工具进展**\n\n" + "完整保留的内容。" * 400 + "\n\n**后续事项**\n\n全文最后一句。"
-_report_path = str((Path(_reader_temp.name) / "gui-test-full.html").resolve())
+_report_path = str((TEST_ROOT / "gui-test-full.html").resolve())
 Path(_report_path).write_text("<html>本地假摘要</html>", encoding="utf-8")
 app._show_report({"path": _report_path, "content": _full_text, "chars": len(_full_text)})
 check("本地阅读完整展示全文及末尾内容", "全文最后一句。" in app.report_text.get("1.0", "end")
       and len(app.report_text.get("1.0", "end")) > 3000)
 check("总标题和主题小标题使用加粗样式", bool(app.report_text.tag_ranges("title")) and bool(app.report_text.tag_ranges("heading")))
 check("完整文件路径显示在页面且可打开", app.v_report_path.get() == _report_path and app.btn_open_report.instate(["!disabled"]))
-with patch("msgx.gui.threading.Thread"):
+with patch("threading.Thread"):
     app._render_usage({"recorded_cost_cny": 0.001, "historical_unattributed_cny": 0.25,
         "groups": [{"purpose": "图片理解", "source_type": "纯图片", "calls": 2,
                     "in_tokens": 100, "out_tokens": 20, "cost_cny": 0.001, "unknown_calls": 1}],
@@ -875,7 +856,7 @@ with patch("msgx.gui.threading.Thread"):
     app._dispatch_event("usage_sources", ("8", "旧选择的过期响应"))
     check("切换记录后不混入过期来源响应", "过期响应" not in app.usage_detail.get("1.0", "end"))
     app.usage_table.selection_remove("7")
-app.proc = _saved_proc
+app.service.proc = _saved_proc
 
 app.reset_summary_prompt()
 from msgx.summarize import DEFAULT_DIGEST_PROMPT  # noqa: E402
@@ -907,16 +888,16 @@ with patch.object(_mb, "showinfo") as _info, patch.object(_mb, "showerror") as _
               and "测试保存失败" in app.log.get("1.0", "end"))
 
     with patch.object(app, "save_prefs", return_value=True), patch.object(Path, "unlink"), \
-            patch("msgx.gui.subprocess.Popen", side_effect=OSError("测试服务启动失败")):
+            patch("msgx.service_process.subprocess.Popen", side_effect=OSError("测试服务启动失败")):
         app.start_service()
     check("服务启动失败留在状态栏和日志", app.proc is None and "测试服务启动失败" in app.status.get()
           and "测试服务启动失败" in app.log.get("1.0", "end"))
-    app.proc = object()
+    app.service.proc = object()
     with patch.object(Path, "touch", side_effect=OSError("测试服务停止失败")):
         app.stop_service()
     check("服务停止失败留在状态栏和日志", "测试服务停止失败" in app.status.get()
           and "测试服务停止失败" in app.log.get("1.0", "end"))
-    app.proc = _saved_proc
+    app.service.proc = _saved_proc
 
     app._login_finished({"ok": False, "note": "测试协议端启动失败"})
     check("协议端失败留在状态栏和日志", "测试协议端启动失败" in app.status.get()
@@ -933,7 +914,7 @@ check("登录失效不能因 WS 仍存在就显示在线", "登录失效" in app
 check("运行状态给出明确恢复入口", bool(app.btn_relogin.grid_info()) and "重新扫码" in app.v_protocol_detail.get())
 with patch.object(N, "refresh_login_qrcode", return_value={"ok": False, "scan": True,
         "qr_since": time.time(), "note": "已刷新二维码"}) as _refresh, \
-        patch("msgx.gui.threading.Thread") as _thread, patch.object(app.events, "put") as _put, \
+        patch("threading.Thread") as _thread, patch.object(app.events, "put") as _put, \
         patch.object(app, "_start_qrcode_watch") as _watch, patch.object(app, "restart_napcat") as _restart:
     app._login_busy = False
     app.relogin_napcat()
@@ -970,8 +951,8 @@ with patch.dict(app.prefs, {"api": {"base_url": "https://custom.invalid/v1"}}), 
     app._open_billing_platform()
     check("自定义接口不误开其他平台", not _open_platform.called and "自定义接口" in app.status.get())
 _before_billing_proc = app.proc
-app.proc = object()
-with patch("msgx.gui.threading.Thread") as _thread, patch("msgx.gui.urllib.request.build_opener") as _opener, \
+app.service.proc = object()
+with patch("threading.Thread") as _thread, patch("msgx.local_client.urllib.request.build_opener") as _opener, \
         patch.object(app.events, "put") as _put, patch.object(app, "refresh_usage") as _usage:
     _opener.return_value.open.return_value.__enter__.return_value.read.return_value = json.dumps({
         "ok": True, "source": "estimate", "today_cny": 0.15, "total_cny": 0.3}).encode()
@@ -999,9 +980,9 @@ with patch("msgx.gui.threading.Thread") as _thread, patch("msgx.gui.urllib.reque
     app._billing_finished({"ok": False, "error": "Bearer secret-auth-token"})
     check("账单服务错误也脱敏", "secret-auth-token" not in app.v_billing_feedback.get()
           and "已隐藏密钥" in app.v_billing_feedback.get())
-app.proc = _before_billing_proc
+app.service.proc = _before_billing_proc
 _before_restart_proc = app.proc
-app.proc = None
+app.service.proc = None
 _receiver = Mock(stdout=None)
 _receiver.poll.return_value = None
 _restart_steps = []
@@ -1009,7 +990,7 @@ _restart_steps = []
 
 def _start_test_receiver():
     _restart_steps.append("start")
-    app.proc = _receiver
+    app.service.proc = _receiver
     return True
 
 
@@ -1023,7 +1004,7 @@ def _restart_test_target(cfg):
     return {"ok": False, "scan": True, "qr_since": time.time(), "account": "123", "note": "请扫码"}
 
 
-with patch("msgx.gui.threading.Thread") as _thread, patch.object(_mb, "askyesno", return_value=True), \
+with patch("threading.Thread") as _thread, patch.object(_mb, "askyesno", return_value=True), \
         patch.object(N, "restart_target", side_effect=_restart_test_target) as _restart, \
         patch.object(app, "start_service", side_effect=_start_test_receiver) as _start, \
         patch.object(app, "_wait_receiver_ready", side_effect=_ready_test_receiver) as _ready, \
@@ -1039,22 +1020,22 @@ with patch("msgx.gui.threading.Thread") as _thread, patch.object(_mb, "askyesno"
           and _watch.called and app._login_pending)
 
 print("\n=== 0.7.8 接收服务失败门禁和进程归属 ===")
-app.proc = None
+app.service.proc = None
 with patch.object(_mb, "askyesno", return_value=True), \
         patch.object(app, "start_service", return_value=False), \
         patch.object(N, "restart_target") as _restart, \
-        patch("msgx.gui.threading.Thread") as _thread:
+        patch("threading.Thread") as _thread:
     app.restart_napcat()
     check("接收服务启动失败不进入协议重启线程", not _restart.called and not _thread.called
           and not app._login_busy and app.btn_restart.instate(["!disabled"]))
 
-app.proc = _receiver
+app.service.proc = _receiver
 with patch.object(_mb, "askyesno", return_value=True), \
         patch.object(app, "start_service") as _start, \
         patch.object(app, "_wait_receiver_ready", return_value=False), \
         patch.object(app, "_stop_unresponsive_receiver", side_effect=OSError("测试旧进程无法退出")), \
         patch.object(N, "restart_target") as _restart, \
-        patch("msgx.gui.threading.Thread") as _thread, patch.object(app.events, "put") as _put:
+        patch("threading.Thread") as _thread, patch.object(app.events, "put") as _put:
     app.restart_napcat()
     _thread.call_args.kwargs["target"]()
     app._dispatch_event(*_put.call_args.args[0])
@@ -1067,15 +1048,15 @@ for _health_result, _socket_error, _expected in [
         ({"ok": True, "target_account": "456"}, None, False),
         ({"ok": False, "target_account": "123"}, None, False),
         ({"ok": True, "target_account": "123"}, OSError("测试 WS 端口未监听"), False)]:
-    with patch("msgx.gui.urllib.request.build_opener") as _opener, \
-            patch("msgx.gui.socket.create_connection", side_effect=_socket_error) as _socket, \
+    with patch("msgx.local_client.urllib.request.build_opener") as _opener, \
+            patch("msgx.ui.login.socket.create_connection", side_effect=_socket_error) as _socket, \
             patch("msgx.gui.time.monotonic", side_effect=[0, 0, 1]), \
             patch("msgx.gui.time.sleep"), patch.object(Path, "exists", return_value=False):
         _opener.return_value.open.return_value.__enter__.return_value.read.return_value = json.dumps(_health_result).encode()
         _ready_result = app._wait_receiver_ready(_receiver, _ready_cfg, timeout=1)
         check("就绪门禁同时核对健康结果、目标账号和 WS 端口", _ready_result is _expected,
               f"health={_health_result}, socket_error={bool(_socket_error)}, ready={_ready_result}")
-        check("健康检查仅请求本机端点", _opener.return_value.open.call_args.args[0]
+        check("健康检查仅请求本机端点", _opener.return_value.open.call_args.args[0].full_url
               == f"http://127.0.0.1:{app.cfg['onebot']['http_port']}/health")
         if _socket.called:
             check("WS 就绪检查使用已配置本机端口", _socket.call_args.args[0] == ("127.0.0.1", app.cfg["onebot"]["ws_port"]))
@@ -1083,8 +1064,8 @@ for _health_result, _socket_error, _expected in [
 for _case in ("进程退出", "关闭界面", "停止信号", "就绪超时"):
     _receiver.poll.return_value = 1 if _case == "进程退出" else None
     app.closing = _case == "关闭界面"
-    with patch("msgx.gui.urllib.request.build_opener") as _opener, \
-            patch("msgx.gui.socket.create_connection") as _socket, \
+    with patch("msgx.local_client.urllib.request.build_opener") as _opener, \
+            patch("msgx.ui.login.socket.create_connection") as _socket, \
             patch.object(Path, "exists", return_value=_case == "停止信号"):
         _ready_result = app._wait_receiver_ready(_receiver, _ready_cfg, timeout=0 if _case == "就绪超时" else 1)
         check(f"就绪等待遇到{_case}立即返回失败", not _ready_result and not _opener.return_value.open.called and not _socket.called)
@@ -1092,7 +1073,7 @@ app.closing = False
 _receiver.poll.return_value = None
 
 _old_receiver = Mock(stdout=Mock())
-app.proc = _receiver
+app.service.proc = _receiver
 app.v_service.set("新进程启动中")
 app._dispatch_event("health", (_old_receiver, {"ok": True}))
 check("旧进程健康响应不把新服务提前标成运行中", app.v_service.get() == "新进程启动中")
@@ -1103,9 +1084,9 @@ check("当前接收进程退出才恢复启动按钮", app.proc is None and app.
       and "服务异常退出" in app.status.get())
 app._dispatch_event("health", (_receiver, {"ok": True}))
 check("退出后的排队健康响应不会把服务改回运行中", app.v_service.get() == "未运行")
-app.proc = _before_restart_proc
+app.service.proc = _before_restart_proc
 
-with patch("msgx.gui.threading.Thread") as _thread, \
+with patch("threading.Thread") as _thread, \
         patch.object(N, "refresh_login_qrcode", return_value={"ok": False, "scan": True, "note": "请重新扫码"}) as _refresh, \
         patch.object(app, "_start_qrcode_watch") as _watch:
     app.relogin_napcat()
@@ -1179,7 +1160,7 @@ check("北京与平台UTC日期明确区分", "北京" in app.usage_table.headin
       and "1 次未知" in app.v_openai_utc.get() and "本地估算" in app.v_openai_utc.get())
 
 print("\n=== 0.7.0 API 配置与密钥隔离 ===")
-from msgx import api_settings, credentials
+from msgx import api_settings
 _fake_key = "sk-msgx-GUI-TEST-NOT-A-REAL-KEY"
 for _key, _value in api_settings.DEFAULTS.items():
     app.v_api[_key].set(str(_value))
@@ -1187,8 +1168,8 @@ app.v_summary_chars.set("3000")
 app.v_api["provider"].set("自定义服务")
 app.v_api["model"].set("future-model")
 app.v_api_key.set(_fake_key)
-with patch("msgx.gui.credentials.save") as _save_key, \
-        patch("msgx.gui.credentials.read", return_value=_fake_key), \
+with patch("msgx.ui.settings.credentials.save") as _save_key, \
+        patch("msgx.ui.settings.credentials.read", return_value=_fake_key), \
         patch("msgx.gui.prefs_mod.save") as _save_prefs:
     check("保存自定义 API 设置", app.save_prefs())
     _saved = _save_prefs.call_args.args[0]
@@ -1198,32 +1179,32 @@ with patch("msgx.gui.credentials.save") as _save_key, \
           and _saved["api"]["provider"] == "自定义服务" and "已配置" in app.v_api_key_status.get()
           and _fake_key not in app.v_api_key_status.get())
 app.v_api["base_url"].set("https://other.invalid/v1")
-with patch("msgx.gui.credentials.read", return_value="") as _read_key, \
-        patch("msgx.gui.credentials.save") as _save_key, patch("msgx.gui.prefs_mod.save"):
+with patch("msgx.ui.settings.credentials.read", return_value="") as _read_key, \
+        patch("msgx.ui.settings.credentials.save") as _save_key, patch("msgx.gui.prefs_mod.save"):
     app._api_key_status()
     check("切换地址不携带旧密钥", "未配置" in app.v_api_key_status.get() and app.save_prefs()
           and not _save_key.called and _read_key.call_args.args == ("https://other.invalid/v1",))
 app.v_api_key.set(_fake_key)
-with patch("msgx.gui.filedialog.asksaveasfilename", return_value="fake-api.yaml"), \
+with patch("msgx.ui.settings.filedialog.asksaveasfilename", return_value="fake-api.yaml"), \
         patch("msgx.gui.Path.write_text") as _write:
     app.export_api_config()
     _export = yaml_config.loads(_write.call_args.args[0])
     check("导出只含公开配置，不含未保存密钥", set(_export) == set(api_settings.DEFAULTS)
           and _fake_key not in _write.call_args.args[0])
-with patch("msgx.gui.filedialog.askopenfilename", return_value="fake-api.yaml"), \
+with patch("msgx.ui.settings.filedialog.askopenfilename", return_value="fake-api.yaml"), \
         patch("msgx.gui.Path.read_text", return_value=yaml_config.dumps(api_settings.DEFAULTS)):
     app.import_api_config()
     check("导入默认配置并清空待保存密钥", app.v_api["model"].get() == "gpt-6-luna"
           and app.v_api["base_url"].get() == "https://api.openai.com/v1" and not app.v_api_key.get())
-with patch("msgx.gui.filedialog.askopenfilename", return_value="fake-api.yaml"), \
+with patch("msgx.ui.settings.filedialog.askopenfilename", return_value="fake-api.yaml"), \
         patch("msgx.gui.Path.read_text", return_value=yaml_config.dumps({"api_key": _fake_key})):
     app.import_api_config()
     check("拒绝含密钥配置文件且错误不回显密钥", "导入失败" in app.status.get() and _fake_key not in app.status.get())
-with patch("msgx.gui.credentials.delete") as _delete:
+with patch("msgx.ui.settings.credentials.delete") as _delete:
     app.delete_api_key()
     check("删除仅作用于当前接口", _delete.call_args.args == ("https://api.openai.com/v1",))
 app.v_api["base_url"].set("http://other.invalid/v1")
-with patch("msgx.gui.credentials.save") as _save_key, patch("msgx.gui.prefs_mod.save") as _save_prefs:
+with patch("msgx.ui.settings.credentials.save") as _save_key, patch("msgx.gui.prefs_mod.save") as _save_prefs:
     check("无效地址禁止保存", not app.save_prefs() and not _save_key.called and not _save_prefs.called)
 
 print("\n=== 多 API 配置选择与独立保存 ===")
@@ -1232,7 +1213,7 @@ app.v_api["base_url"].set("https://api.openai.com/v1")
 app.v_api["model"].set("my-openai-model")
 app.v_api["service_tier"].set("flex")
 app.v_api_key.set(_fake_key)
-with patch("msgx.gui.prefs_mod.save") as _save_prefs, patch("msgx.gui.credentials.save") as _save_key:
+with patch("msgx.gui.prefs_mod.save") as _save_prefs, patch("msgx.ui.settings.credentials.save") as _save_key:
     app.api_selector.current(list(app._api_profiles).index("deepseek"))
     app._select_api_profile()
     check("下拉选择即切换并保存 DeepSeek", app._api_selected == "deepseek"
@@ -1262,7 +1243,7 @@ with patch("msgx.gui.prefs_mod.save") as _save_prefs, patch("msgx.gui.credential
     app.v_api_key.set(_fake_key)
     app.save_prefs()
     check("同地址的自定义配置密钥也独立", _save_key.call_args.kwargs == {"profile_id": "custom_1"})
-with patch("msgx.gui.credentials.delete") as _delete:
+with patch("msgx.ui.settings.credentials.delete") as _delete:
     app.delete_api_key()
     check("删除只作用于所选配置", _delete.call_args.kwargs == {"profile_id": "custom_1"})
 app._apply_health({"llm_available": True, "vision_enabled": True, "api_provider": "DeepSeek", "api_model": "test-model"})
@@ -1277,7 +1258,7 @@ with closing(sqlite3.connect(_history_db)) as _conn:
                   "kind TEXT,content TEXT,report_path TEXT,msg_count INTEGER,created_at INTEGER)")
     _conn.executemany("INSERT INTO summaries VALUES(?,?,?,?,?,?,?,?)", [
         (1, 1790179200, 1790265600, "daily", _older_text, "", 50, 100),
-        (2, 1790265600, 1790352000, "daily", _first_text, str(Path(_reader_temp.name) / "missing.html"), 120, 200),
+        (2, 1790265600, 1790352000, "daily", _first_text, str(TEST_ROOT / "missing.html"), 120, 200),
         (3, 1790179200, 1790265600, "periodic", "旧版摘要只隐藏", "", 50, 300),
     ])
     _conn.commit()
@@ -1288,8 +1269,8 @@ app._report_identity = None
 app._summary_path = ""
 app.report_history.selection_remove(*app.report_history.selection())
 app._report_history_busy = False
-with patch("msgx.gui.threading.Thread") as _thread, patch("msgx.gui.urllib.request.build_opener") as _network:
-    with patch("msgx.gui.sqlite3.connect", wraps=sqlite3.connect) as _connect:
+with patch("threading.Thread") as _thread, patch("msgx.local_client.urllib.request.build_opener") as _network:
+    with patch("msgx.ui.settings.sqlite3.connect", wraps=sqlite3.connect) as _connect:
         app.refresh_report_history()
         _thread.call_args.kwargs["target"]()
         _read_call = _connect.call_args
@@ -1349,7 +1330,7 @@ with patch("msgx.gui.threading.Thread") as _thread, patch("msgx.gui.urllib.reque
           and "读取失败" in app.v_report_history.get())
     _old_items = list(app._report_items.values())
     app._report_history_busy = True
-    _new_path = str(Path(_reader_temp.name) / "new.html")
+    _new_path = str(TEST_ROOT / "new.html")
     app._show_report({"path": _new_path, "content": "# 刚生成的假摘要\n\n## 新主题\n新的内容。"})
     app.refresh_report_history(preferred_path=_new_path)
     app._render_report_history(app._report_history_seq, _old_items, "")
@@ -1364,8 +1345,7 @@ check("最小窗口文件路径按正文宽度换行", int(app.report_path_label
       <= app.report_path_label.master.winfo_width() - 14)
 
 root.update()
-root.destroy()
-_reader_temp.cleanup()
+resources.close()
 
 print()
 if fails:

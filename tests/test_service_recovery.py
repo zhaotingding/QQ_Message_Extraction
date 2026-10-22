@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import copy
 import io
+import os
 import queue
 import subprocess
 import sys
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +17,9 @@ from unittest.mock import Mock, patch
 PROJ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJ / "src"))
 
+from msgx.service_process import ServiceProcess
+from msgx import conda_runtime, local_client, service_process
+from msgx.ui import settings, login
 from msgx import gui
 from msgx.config import DEFAULTS
 
@@ -62,6 +67,50 @@ def process(pid=123, code=None):
     return proc
 
 
+class ServiceEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        temp_root = PROJ / "data/test-temp"  # 沿用项目隔离目录，集中回收测试产物。
+        temp_root.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(prefix="msgx-service-env-", dir=temp_root)
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = Path(self.tmp.name)
+
+    def spawn(self, root):
+        manager = ServiceProcess()  # 仅检查交给子进程的参数，不启动真实服务。
+        conda = str(self.folder / "Conda/Scripts/conda.exe")
+        with patch.dict(os.environ, {"MSGX_CONDA_ENV": "msgx-test"}), \
+                patch.object(conda_runtime, "conda_executable", return_value=conda), \
+                patch.object(service_process.subprocess, "Popen", return_value=process()) as popen:
+            manager.spawn(root=root, prefs_file=self.folder / "prefs.yaml",
+                          stop_file=self.folder / "stop.signal")
+        self.assertEqual(popen.call_args.args[0][:7],
+                         [conda, "run", "-n", "msgx-test", "--no-capture-output", "python", "-s"])
+        self.assertEqual(popen.call_args.kwargs["env"]["MSGX_CONDA_ENV"], "msgx-test")
+        self.assertEqual(popen.call_args.kwargs["env"]["PYTHONNOUSERSITE"], "1")
+        return popen.call_args.kwargs
+
+    def test_spawn_discards_inherited_pythonpath(self):
+        foreign = str(self.folder / "other-project" / "src")  # 模拟另一项目注入的导入路径。
+        with patch.dict(os.environ, {"PYTHONPATH": foreign}):
+            kwargs = self.spawn(PROJ)
+        self.assertEqual(kwargs["env"]["PYTHONPATH"], str(PROJ / "src"))
+        self.assertNotIn(foreign, kwargs["env"]["PYTHONPATH"])
+
+    def test_spawn_uses_module_source_when_data_root_is_separate(self):
+        data_root = self.folder / "independent-data"  # 数据目录没有项目源码。
+        with patch.dict(os.environ, {"PYTHONPATH": ""}):
+            kwargs = self.spawn(data_root)
+        source_root = Path(service_process.__file__).resolve().parent.parent
+        self.assertEqual(kwargs["env"]["PYTHONPATH"], str(source_root))
+
+    def test_spawn_preserves_explicit_data_root(self):
+        data_root = self.folder / "independent-data"
+        with patch.dict(os.environ, {"MSGX_ROOT": str(data_root)}):
+            kwargs = self.spawn(data_root)
+        self.assertEqual(kwargs["env"]["MSGX_ROOT"], str(data_root))  # 显式数据根仍传给服务。
+        self.assertEqual(kwargs["cwd"], str(data_root))
+
+
 class ServiceRecoveryTests(unittest.TestCase):
     def setUp(self):
         folder = PROJ / "data/test-temp"
@@ -69,7 +118,11 @@ class ServiceRecoveryTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="service-recovery-", dir=folder)
         self.addCleanup(self.tmp.cleanup)
         self.folder = Path(self.tmp.name)
+        self.enterContext(patch.dict(os.environ, {"MSGX_CONDA_ENV": "msgx-test"}))
+        self.enterContext(patch.object(conda_runtime, "conda_executable",
+                                      return_value=str(self.folder / "Conda/Scripts/conda.exe")))
         app = gui.App.__new__(gui.App)
+        app.service = ServiceProcess()
         self.app = app
         app.root = Root()
         app.cfg = copy.deepcopy(DEFAULTS)
@@ -78,16 +131,16 @@ class ServiceRecoveryTests(unittest.TestCase):
         app.prefs_file = self.folder / "prefs.yaml"
         app.stop_file = self.folder / "stop.signal"
         app.prefs = {"qq_account": "100"}
-        app.proc = process()
+        app.service.proc = process()
         app.events = queue.Queue()
         app.closing = False
-        app._service_wanted = True
-        app._service_recoveries = 0
+        app.service.wanted = True
+        app.service.recoveries = 0
         app._service_restart_id = None
-        app._expected_service_exit = None
-        app._service_recovering = False
-        app._receiver_rebuilding = False
-        app._restart_cancelled = False
+        app.service.expected_exit = None
+        app.service.recovering = False
+        app.service.rebuilding = False
+        app.service.restart_cancelled = False
         app._login_busy = False
         app._login_pending = False
         app._login_verify_since = 0
@@ -102,6 +155,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         for name in ("_trace_gui", "_log_ui", "_verify_login_message", "_apply_summary_schedule"):
             setattr(app, name, Mock())
         app._save_report_notes = Mock(return_value=True)
+        app._report_save_busy = False
         app.save_prefs = Mock(return_value=True)
         app._login_config = Mock(return_value={"napcat": {"account": "100"}})
 
@@ -113,8 +167,8 @@ class ServiceRecoveryTests(unittest.TestCase):
 
     def test_abnormal_exit_recovers_after_delay_without_operating_qq(self):
         app = self.app
-        with patch.object(gui.napcat_mod, "restart_target") as restart, \
-                patch.object(gui.napcat_mod, "refresh_login_qrcode") as qr, \
+        with patch.object(login.napcat_mod, "restart_target") as restart, \
+                patch.object(login.napcat_mod, "refresh_login_qrcode") as qr, \
                 patch.object(app, "start_service", return_value=True) as start:
             self.exit()
             start.assert_not_called()
@@ -130,21 +184,21 @@ class ServiceRecoveryTests(unittest.TestCase):
                                          (1, True, False), (1, False, True)):
             with self.subTest(code=code, expected=expected, closing=closing):
                 app = self.app
-                app.proc = process(code=code)
-                app._service_wanted = True
-                app._expected_service_exit = app.proc if expected else None
+                app.service.proc = process(code=code)
+                app.service.wanted = True
+                app.service.expected_exit = app.proc if expected else None
                 app.closing = closing
                 self.exit(code)
                 self.assertIsNone(app._service_restart_id)
                 self.assertEqual(app.root.callbacks, {})
                 if code in (0, 2):
-                    self.assertFalse(app._service_wanted)
+                    self.assertFalse(app.service.wanted)
 
     def test_stale_exit_does_not_clear_new_process_or_schedule_recovery(self):
         app = self.app
         old, new = process(1, 1), process(2)
-        app.proc = new
-        app._expected_service_exit = old
+        app.service.proc = new
+        app.service.expected_exit = old
         app.status.set("新服务正常")
         app._dispatch_event("exit", (old, 1))
         self.assertIs(app.proc, new)
@@ -157,7 +211,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         self.exit()
         callback = app.root.callbacks[app._service_restart_id]
         app.stop_service()
-        self.assertFalse(app._service_wanted)
+        self.assertFalse(app.service.wanted)
         self.assertIsNone(app._service_restart_id)
         self.assertEqual(app.root.callbacks, {})
         self.assertIn("已取消自动恢复", app.status.get())
@@ -172,7 +226,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         app.on_close()
         self.assertTrue(app.closing)
         self.assertTrue(app.root.destroyed)
-        self.assertFalse(app._service_wanted)
+        self.assertFalse(app.service.wanted)
         self.assertIsNone(app._service_restart_id)
         with patch.object(app, "start_service") as start:
             callback()
@@ -183,52 +237,52 @@ class ServiceRecoveryTests(unittest.TestCase):
 
         def start(**kwargs):
             self.assertEqual(kwargs, {"automatic": True})
-            app.proc = process(123 + app._service_recoveries)
+            app.service.proc = process(123 + app.service.recoveries)
             return True
 
         with patch.object(app, "start_service", side_effect=start) as started:
             for attempt in range(1, 4):
                 self.exit()
-                self.assertEqual(app._service_recoveries, attempt)
+                self.assertEqual(app.service.recoveries, attempt)
                 app.root.fire(app._service_restart_id)
             self.exit()
             self.assertEqual(started.call_count, 3)
         self.assertEqual(app.root.delays, [5000, 15000, 30000])
-        self.assertFalse(app._service_wanted)
+        self.assertFalse(app.service.wanted)
         self.assertEqual(app.root.callbacks, {})
         self.assertIn("已停止自动恢复", app.status.get())
 
     def test_stable_uptime_resets_budget_but_first_health_does_not(self):
         app = self.app
-        app._service_recoveries = 3
-        app._service_recovering = True
+        app.service.recoveries = 3
+        app.service.recovering = True
         data = {"uptime_seconds": 299, "protocol": {"state": "disconnected"}}
         app._dispatch_event("health", (app.proc, data))
-        self.assertEqual(app._service_recoveries, 3)
+        self.assertEqual(app.service.recoveries, 3)
         self.assertIn("接收服务已重新启动", app.status.get())
         data["uptime_seconds"] = 300
         app._dispatch_event("health", (app.proc, data))
-        self.assertEqual(app._service_recoveries, 0)
+        self.assertEqual(app.service.recoveries, 0)
         self.exit()
         self.assertEqual(app.root.delays, [5000])
 
     def test_automatic_start_does_not_save_uncommitted_edits(self):
         app = self.app
-        app.proc = None
+        app.service.proc = None
         app.v_unsaved_key = Value("sk-SYNTHETIC-UNSAVED-KEY")
         app.save_prefs.side_effect = AssertionError("不能保存编辑中的字段")
         app._login_config.side_effect = AssertionError("不能验证未保存字段")
         spawned = process()
-        with patch.object(gui.subprocess, "Popen", return_value=spawned) as popen, \
-                patch.object(gui.threading, "Thread") as thread:
+        with patch.object(service_process.subprocess, "Popen", return_value=spawned) as popen, \
+                patch.object(threading, "Thread") as thread:
             self.assertTrue(app.start_service(automatic=True))
         app.save_prefs.assert_not_called()
         app._login_config.assert_not_called()
         self.assertEqual(app.v_unsaved_key.get(), "sk-SYNTHETIC-UNSAVED-KEY")
         self.assertFalse(app.prefs_file.exists())
         self.assertIs(app.proc, spawned)
-        self.assertTrue(app._service_recovering)
-        self.assertTrue(app._service_wanted)
+        self.assertTrue(app.service.recovering)
+        self.assertTrue(app.service.wanted)
         self.assertNotIn("sk-SYNTHETIC-UNSAVED-KEY", str(popen.call_args))
         thread.return_value.start.assert_called_once()
 
@@ -237,25 +291,25 @@ class ServiceRecoveryTests(unittest.TestCase):
         app.config_path = self.folder / "config.yaml"
         for automatic in (False, True):
             with self.subTest(automatic=automatic):
-                app.proc = None
-                with patch.object(gui.subprocess, "Popen", return_value=process()) as popen, \
-                        patch.object(gui.threading, "Thread"):
+                app.service.proc = None
+                with patch.object(service_process.subprocess, "Popen", return_value=process()) as popen, \
+                        patch.object(threading, "Thread"):
                     self.assertTrue(app.start_service(automatic=automatic))
                 args = popen.call_args.args[0]
-                self.assertEqual(args[4:], ["--config", str(app.config_path), "run",
+                self.assertEqual(args[args.index("--config"):], ["--config", str(app.config_path), "run",
                                             "--stop-file", str(app.stop_file)])
 
     def test_receiver_cleanup_is_expected_and_does_not_double_start(self):
         app = self.app
         old, new = app.proc, process(124)
-        app._receiver_rebuilding = True
+        app.service.rebuilding = True
         old.wait.side_effect = lambda **_: setattr(old, "returncode", 0) or 0
         app._stop_unresponsive_receiver(old)
-        self.assertIs(app._expected_service_exit, old)
+        self.assertIs(app.service.expected_exit, old)
 
         def start():
-            app.proc = new
-            app._service_wanted = True
+            app.service.proc = new
+            app.service.wanted = True
             return True
 
         with patch.object(app, "start_service", side_effect=start) as started, \
@@ -269,11 +323,11 @@ class ServiceRecoveryTests(unittest.TestCase):
 
     def test_rebuilding_suppresses_auto_but_plain_login_busy_does_not(self):
         app = self.app
-        app._receiver_rebuilding = True
+        app.service.rebuilding = True
         self.exit()
         self.assertEqual(app.root.callbacks, {})
-        app.proc = process()
-        app._receiver_rebuilding = False
+        app.service.proc = process()
+        app.service.rebuilding = False
         app._login_busy = True
         self.exit()
         self.assertEqual(app.root.delays, [5000])
@@ -282,8 +336,8 @@ class ServiceRecoveryTests(unittest.TestCase):
         app = self.app
         with patch.object(Path, "touch", side_effect=PermissionError("fixture write failure")):
             app.stop_service()
-        self.assertTrue(app._service_wanted)
-        self.assertIsNone(app._expected_service_exit)
+        self.assertTrue(app.service.wanted)
+        self.assertIsNone(app.service.expected_exit)
         self.assertIn("服务停止失败", app.status.get())
         self.exit()
         self.assertEqual(app.root.delays, [5000])
@@ -292,7 +346,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         app = self.app
         key = "sk-SYNTHETIC-SERVICE-OUTPUT-123456789"
         script = f"import sys; print('stdout fixture'); print('stderr {key}', file=sys.stderr); sys.exit(1)"
-        proc = subprocess.Popen([sys.executable, "-u", "-c", script],
+        proc = subprocess.Popen([sys.executable, "-s", "-u", "-c", script],
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace")
         try:
@@ -315,7 +369,7 @@ class ServiceRecoveryTests(unittest.TestCase):
         app = self.app
         proc = process(code=1)
         proc.stdout = io.StringIO("继续接收消息\n")
-        with patch.object(gui, "RotatingFileHandler", side_effect=PermissionError):
+        with patch.object(service_process, "RotatingFileHandler", side_effect=PermissionError):
             app._read_pipe(proc)
         events = list(app.events.queue)
         self.assertEqual(events[0][0], "note")

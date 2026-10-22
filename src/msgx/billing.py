@@ -27,9 +27,12 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime
 from typing import Any
 
 import aiohttp
+
+from .time_rules import BEIJING  # 与余额落库的自然日保持同一时区。
 
 log = logging.getLogger("msgx.billing")
 
@@ -286,11 +289,8 @@ def daily_from_readings(readings: list[dict], day: str, anchor_slack: int = 1800
     out["day"] = day
     from_ts = int(out.get("from_ts") or 0)
     if from_ts:
-        # 「距当地 00:00 多少秒」直接用 time-of-day 算，不走 mktime：
-        # mktime 在 Windows 上对 1970 附近的时刻会 OverflowError，而读数的时间戳
-        # 完全可能是构造出来的（测试里就是）。两者在无夏令时的时区等价。
-        lt = time.localtime(from_ts)
-        out["anchor_delay"] = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+        first = datetime.fromtimestamp(from_ts, BEIJING)  # 主机时区不改变北京时间当天的覆盖时长。
+        out["anchor_delay"] = first.hour * 3600 + first.minute * 60 + first.second
     else:
         out["anchor_delay"] = 0
     out["full_day"] = bool(from_ts) and out["anchor_delay"] <= int(anchor_slack)

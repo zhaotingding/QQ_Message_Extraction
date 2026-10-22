@@ -8,13 +8,11 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from msgx.config import DEFAULTS
-from msgx.onebot import _summary_now
 from msgx.pipeline import Pipeline
 
 fails: list[str] = []
@@ -40,6 +38,7 @@ async def main() -> None:
         pipe = Pipeline(cfg)
         pipe.llm.configure("test-key-no-network")
         pipe.llm._post = AsyncMock(side_effect=AssertionError("消息接收不得调用模型"))
+        pipe.call_action = AsyncMock(side_effect=AssertionError("消息接收不得向 QQ 发送动作"))  # 用行为阻止意外通知。
         pipe._billing_loop = AsyncMock()  # 账单网络独立，测试不访问真实服务。
         try:
             await pipe.start()
@@ -48,9 +47,6 @@ async def main() -> None:
             check("启动只创建统一自动周期摘要任务",
                   {task.get_name() for task in pipe._tasks} ==
                   {"ingest", "media", "prune", "billing", "watchdog", "summary-schedule"})
-            check("旧独立日报与通知循环已删除",
-                  not hasattr(pipe, "_daily_summary_loop") and not hasattr(pipe, "_daily_loop"))
-            check("评分器和通知器已从管道移除", not hasattr(pipe, "scorer") and not hasattr(pipe, "notifier"))
             for mid, message in enumerate([
                 [{"type": "at", "data": {"qq": "all"}}, {"type": "text", "data": {"text": "紧急通知"}}],
                 "[CQ:at,qq=all]紧急通知",
@@ -100,7 +96,8 @@ async def main() -> None:
                   len(stored) == 3 and sum(bool(json.loads(r["image_urls"])) for r in stored) == 2
                   and all(not r["raw"] for r in stored))
             end = int(time.time()) + 10
-            check("按群摘要排除过滤记录", len(pipe.store.messages_between("200", 0, end)) == 6)
+            check("按群实时列表保留过滤标记", sum(row["media_state"] == "filtered"
+                  for row in pipe.store.recent_messages(group_id="200")) == 3)  # UI 仍可查看被类型过滤的记录。
             check("跨群摘要排除过滤记录", len(pipe.store.messages_between_all(0, end)) == 6)
             again = await pipe.handle_event(event(12, [cases[2]]))
             check("重复的过滤消息不会新增一行", again.get("duplicate") is True and len(pipe.store.recent_messages()) == 9)
@@ -109,24 +106,9 @@ async def main() -> None:
             cfg["filters"].update(skip_face_only=False, skip_image_only=False)
             await pipe.handle_event(event(21, [cases[2]]))
             check("关闭入库过滤后纯图也执行本地 OCR", len(pipe.store.pending_images()) == 4)
+            pipe.call_action.assert_not_awaited()  # 普通接收与过滤都不能向群发送消息。
         finally:
             await pipe.stop()
-
-    print("\n=== 手动摘要入口已移除 ===")
-    summarizer = SimpleNamespace(run_digest=AsyncMock(), run_dates=AsyncMock())
-    for kind in ("digest", "full", "range", "by_date", "periodic", "daily", "typo"):
-        request = SimpleNamespace(
-            app={"pipe": SimpleNamespace(summarizer=summarizer)},
-            query={"kind": kind, "hours": "72"}, can_read_body=True,
-            json=AsyncMock(return_value={"force": True}),
-        )
-        response = await _summary_now(request)
-        check(f"入口 {kind} 返回 410，不能触发付费调用",
-              response.status == 410 and "自动计划" in json.loads(response.text)["error"])
-        request.json.assert_not_awaited()
-    summarizer.run_digest.assert_not_awaited()
-    summarizer.run_dates.assert_not_awaited()
-
 
 asyncio.run(main())
 if fails:

@@ -61,11 +61,9 @@ class SenderFilterTests(unittest.TestCase):
         self.assertEqual(store.recent_messages(images_only=True), [])
         activity = store.group_activity(DAY)["groups"][0]
         self.assertEqual((activity["count"], activity["last_ts"]), (1, START + 5))
-        self.assertEqual([r["id"] for r in store.messages_between("g", START, START + 86400)], [regular])
+        self.assertEqual([r["id"] for r in store.recent_messages(group_id="g")], [regular])  # 现用群筛选复用发言人规则。
         self.assertEqual([r["id"] for r in store.messages_between_all(START, START + 86400, 1)], [regular])
         self.assertEqual(store.count_messages_window(START, START + 86400), 1)
-        self.assertEqual(store.first_ts("g"), START + 5)
-        self.assertEqual(store.first_ts_all(), START + 5)
         self.assertEqual(store.pending_images(), [])
         filters["blocked_senders"] = []
         self.assertEqual(len(store.recent_messages()), count)
@@ -78,8 +76,7 @@ class SenderFilterTests(unittest.TestCase):
         store = Store(":memory:")
         self.addCleanup(store.close)
         store.insert_message(Msg(msg_id="1", group_id="g", ts=START + 1, sender_name="智能客服", text="签到"))
-        self.assertEqual(store.first_ts_all(), 0)
-        self.assertEqual(store.first_ts("g"), 0)
+        self.assertEqual(store.recent_messages(group_id="g"), [])  # 全被发言人规则隐藏时群列表也应为空。
         self.assertEqual(store.count_messages_window(START, START + 86400), 0)
         self.assertEqual(store.messages_between_all(START, START + 86400), [])
 

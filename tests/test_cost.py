@@ -1,26 +1,24 @@
-"""计费口径的单元测试（对齐 DeepSeek 官方账单）。
-
-官方对 deepseek-flash 实行三档计价：输入（缓存命中 / 未命中）+ 输出，
-且高峰时段各项为**空闲时段的 2 倍**。高峰定义：UTC 01:00-04:00 与 06:00-10:00
-的周一至周五，其余时段（含整个周末）为空闲。
-
-不联网：只验算价目表与时段判定本身。
-"""
+"""固定测试费率、预算与余额差值回归；不联网，不将样本费率视为当前官方报价。"""
 from __future__ import annotations
 
+import atexit
 import calendar
+from contextlib import ExitStack, closing
+from datetime import datetime
 import os
 import sqlite3
 import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 PROJ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJ / "src"))
 
 from msgx.llm import LLM  # noqa: E402
 from msgx.store import Store  # noqa: E402
+from msgx.time_rules import BEIJING, beijing_day  # 余额日期与覆盖时长统一按北京时间计算。
 
 fails: list[str] = []
 
@@ -43,8 +41,10 @@ CFG = {
     }
 }
 
-tmp = tempfile.mkdtemp()
-store = Store(os.path.join(tmp, "cost.db"))
+resources = ExitStack()  # 统一回收本文件的临时库、WAL 与升级备份。
+atexit.register(resources.close)  # 发生异常时仍按连接先于目录的顺序释放。
+tmp = resources.enter_context(tempfile.TemporaryDirectory(prefix="msgx_cost_"))
+store = resources.enter_context(closing(Store(os.path.join(tmp, "cost.db"))))
 llm = LLM(CFG, store)
 
 
@@ -103,7 +103,7 @@ conn.execute(
 conn.execute("INSERT INTO usage VALUES('2026-09-19', 19, 9093, 3769, 0.004488)")
 conn.commit()
 conn.close()
-old = Store(old_path)
+old = resources.enter_context(closing(Store(old_path)))  # 异常中断时也可关闭迁移测试库。
 cols = {c[1] for c in old.conn.execute("PRAGMA table_info(usage)")}
 check("补齐 cost_cny 列", "cost_cny" in cols)
 check("补齐 cache_hit_tokens 列", "cache_hit_tokens" in cols)
@@ -183,7 +183,7 @@ check("今日覆盖起点 = 当天第一条读数（界面据此标「自 HH:MM 
 
 
 def local_ts(y, m, d, hh, mm=0):
-    return int(time.mktime((y, m, d, hh, mm, 0, 0, 0, -1)))
+    return int(datetime(y, m, d, hh, mm, tzinfo=BEIJING).timestamp())  # 不依赖测试电脑时区。
 
 
 DAY = "2026-09-20"
@@ -205,6 +205,10 @@ full = [
 f = daily_from_readings(full, DAY)
 check("全天在跑（起点 00:05）→ 视为完整一天", f["full_day"] is True, f"delay={f['anchor_delay']}s")
 check("完整一天时今日消费即真实值", abs(f["spent"] - 1.0) < 1e-9, f"{f['spent']}")
+with patch("msgx.billing.time.localtime", side_effect=time.gmtime):  # 模拟系统设置为 UTC。
+    utc_host = daily_from_readings(full, DAY)  # 同一组北京时间余额应有相同覆盖口径。
+check("系统时区不影响北京时间零点锚点", utc_host["anchor_delay"] == 300 and utc_host["full_day"],
+      f"delay={utc_host['anchor_delay']}s")
 check("当天没有读数 → 不完整", daily_from_readings([], DAY)["full_day"] is False)
 check("完整性的宽限可调（给 20 小时宽限时半天也算满）",
       daily_from_readings(half, DAY, anchor_slack=20 * 3600)["full_day"] is True)
@@ -213,7 +217,7 @@ check("当天只有一条读数时也不算完整一天",
       daily_from_readings([{"ts": 300, "total": 17.5, "day": DAY}], DAY)["full_day"] is False)
 
 print("\n=== 把差值补成完整区间（否则首日「累计」会显示 ¥0.00）===")
-cb = Store(os.path.join(tmp, "prior.db"))
+cb = resources.enter_context(closing(Store(os.path.join(tmp, "prior.db"))))
 cb.add_usage("2026-09-18", 1000, 100, 0.5, 0, 1000)
 cb.add_usage("2026-09-19", 1000, 100, 0.25, 0, 1000)
 cb.add_usage("2026-09-20", 1000, 100, 0.9, 0, 1000)
@@ -229,7 +233,7 @@ check("累积口径：差值 + 起点前的估算 = 更完整的累计",
 cb.close()
 
 print("\n=== 读数落库（差值法的原料）===")
-bs = Store(os.path.join(tmp, "bal.db"))
+bs = resources.enter_context(closing(Store(os.path.join(tmp, "bal.db"))))
 check("首次写入成功", bs.record_balance(1000, 20.0, 20.0, 0.0) is True)
 check("同一秒重复写入被主键挡掉（幂等）", bs.record_balance(1000, 20.0, 20.0, 0.0) is False)
 bs.record_balance(2000, 19.4, 19.4, 0.0)
@@ -238,22 +242,12 @@ rl = bs.balance_readings()
 check("读数按时间升序返回", [r["ts"] for r in rl] == [1000, 2000, 3000], str([r["ts"] for r in rl]))
 check("落库后能直接算出消费", abs(consumption_from_readings(rl)["spent"] - 0.9) < 1e-9)
 check("balance_last 取最新一条", bs.balance_last()["ts"] == 3000)
-check("按天过滤可用", len(bs.balance_readings(time.strftime("%Y-%m-%d", time.localtime(1000)))) == 3)
+check("按北京时间日期过滤可用", len(bs.balance_readings(beijing_day(1000))) == 3)
 check("剪枝有返回且不报错", isinstance(bs.prune_balance(keep_days=400), int))
 bs.close()
 
-print("\n=== 摘要游标分轨（增量纪要的起点）===")
-s = Store(os.path.join(tmp, "cur.db"))
-check("初始游标为 0", s.window_end_by_kind("digest") == 0)
-s.add_summary("hotspot", 100, 200, 5, "x", "hotspot")
-s.add_summary("digest", 100, 300, 5, "y", "digest")
-check("热点轨道不受纪要影响", s.window_end_by_kind("hotspot") == 200)
-check("纪要轨道独立推进", s.window_end_by_kind("digest") == 300)
-s.add_summary("digest", 300, 400, 5, "z", "digest")
-check("纪要轨道取最新值", s.window_end_by_kind("digest") == 400)
-s.close()
-
 store.close()
+resources.close()  # 正常路径立即删除临时数据，atexit 仅作为异常退出的清理。
 
 print()
 if fails:

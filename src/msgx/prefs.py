@@ -45,6 +45,8 @@ DEFAULTS: dict = {
     # 它是界面上的勾选框，所以必须走偏好；界面不改写 config.yaml。
     "napcat_hidden": True,
     "qq_account": "",
+    "napcat_dir": "",        # 每台电脑的安装目录，不写入团队默认配置。
+    "qq_path": "",           # 可选 QQ.exe 路径；空值沿用 NapCat 自动查找。
     # DeepSeek 平台登录态 token（查真实消费用）。**留空 = 沿用 config.yaml**。
     # 说明：它是短期凭证，存在本地偏好文件里（.ui/ 不入版本库），不会进 Git。
     "platform_token": "",
@@ -174,6 +176,9 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
         out.setdefault("napcat", {})["hidden"] = bool(prefs.get("napcat_hidden"))
     if "qq_account" in prefs:
         out.setdefault("napcat", {})["account"] = str(prefs.get("qq_account") or "").strip()
+    for local, key in (("napcat_dir", "dir"), ("qq_path", "qq_path")):
+        if local in prefs:
+            out.setdefault("napcat", {})[key] = str(prefs.get(local) or "").strip()
 
     # 平台 token：留空 = 沿用 config.yaml。
     token = str(prefs.get("platform_token") or "").strip()

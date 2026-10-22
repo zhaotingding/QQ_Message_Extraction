@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
@@ -22,6 +23,14 @@ VISION_PROMPT = (
 )
 
 ERROR_HINTS = ("error", "exception", "traceback", "failed", "报错", "错误", "失败", "异常")
+
+
+@dataclass(frozen=True)
+class DownloadedImage:
+    """下载阶段已计算的 digest 随文件传递，后续 OCR 去重不再整文件读入。"""
+
+    path: Path
+    digest: str
 
 
 def _sniff_ext(data: bytes) -> str:
@@ -178,7 +187,7 @@ class MediaWorker:
             return data
         return None
 
-    async def _download(self, url: str) -> Path | None:
+    async def _download(self, url: str) -> DownloadedImage | None:
         cap = int(float(self.mcfg.get("max_download_mb", 20)) * 1024 * 1024)
         if url.startswith("file:"):
             from urllib.parse import unquote, urlparse
@@ -188,7 +197,7 @@ class MediaWorker:
             if not p.exists():
                 log.debug("本地文件不存在: %s", p)
                 return None
-            return p
+            return DownloadedImage(p, hashlib.sha256(p.read_bytes()).hexdigest()[:32])
         data = await self._fetch_complete(url, cap)
         if data is None:
             return None
@@ -200,7 +209,7 @@ class MediaWorker:
         path = d / f"{sha}{_sniff_ext(data)}"
         if not path.exists():
             path.write_bytes(data)
-        return path
+        return DownloadedImage(path, sha)
 
     # ---------- main ----------
 
@@ -225,12 +234,12 @@ class MediaWorker:
         return done
 
     async def _process_image(self, row) -> None:
-        path = await self._download(row["image_url"])
-        if path is None:
+        downloaded = await self._download(row["image_url"])
+        if downloaded is None:
             self.store.set_image_result(row["id"], media_state="failed", vision_state="download_failed")
             return
 
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:32]
+        path, digest = downloaded.path, downloaded.digest
         prev = self.store.find_image_by_hash(digest)
         ocr_text = (prev["ocr_text"] or "") if prev is not None else ""
         if not ocr_text and self.mcfg.get("ocr_enabled", True):

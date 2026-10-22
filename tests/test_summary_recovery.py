@@ -1,4 +1,4 @@
-"""只用内存库和模拟响应验证补生成，不访问真实服务。"""
+"""摘要只读接口、停用入口与确认恢复：只用内存库、隔离 HTTP 和模拟响应。"""
 import asyncio
 import json
 import sys
@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from aiohttp import web, ClientPayloadError
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -18,7 +18,40 @@ from msgx.pipeline import Pipeline
 from msgx.store import Store
 from msgx.config import DEFAULTS
 from msgx import api_settings
-from msgx.onebot import _summary_retry
+from msgx.onebot import _summary_dates, _summary_days, _summary_now, _summary_retry
+
+
+class SummaryReadEndpointTests(unittest.IsolatedAsyncioTestCase):
+    def test_date_validation(self):
+        self.assertEqual(_summary_dates("2026-09-24", "2026-09-24"),
+                         ("2026-09-24", "2026-09-24"))  # 同一天是有效查询范围。
+        for start, end in (("2026-09-25", "2026-09-24"), ("2026-09-24", "x"),
+                           ("20260924", "2026-09-24")):
+            with self.subTest(start=start, end=end), self.assertRaises(ValueError):
+                _summary_dates(start, end)  # 拒绝倒置范围与非标准日期。
+
+    async def test_manual_summary_is_gone_without_reading_body_or_accessing_pipeline(self):
+        for kind in ("digest", "full", "range", "by_date", "periodic", "daily", "typo"):
+            request = SimpleNamespace(
+                app={}, query={"kind": kind, "hours": "72"}, can_read_body=True,
+                json=AsyncMock(side_effect=AssertionError("已停用入口不能读取生成参数")),
+            )  # 不提供管道：任何尝试调度或生成都会立即失败。
+            response = await _summary_now(request)  # 验证实际注册的旧 HTTP 入口。
+            self.assertEqual(response.status, 410)
+            self.assertIn("自动计划", json.loads(response.text)["error"])
+            request.json.assert_not_awaited()  # force 参数不能恢复已移除的生成入口。
+
+    async def test_days_status_is_read_only(self):
+        summarizer = Mock(spec_set=["daily_status"])  # 唯一可用能力是查询，不允许调用生成方法。
+        summarizer.daily_status.return_value = {"days": [], "latest_daily": None}
+        request = SimpleNamespace(
+            app={"pipe": SimpleNamespace(summarizer=summarizer)},
+            query={"start_date": "2026-09-23", "end_date": "2026-09-24"},
+        )
+        self.assertEqual((await _summary_days(request)).status, 200)
+        summarizer.daily_status.assert_called_once_with("2026-09-23", "2026-09-24")
+        summarizer.daily_status.side_effect = ValueError("最多 31 天")  # 业务范围错误需反馈为请求错误。
+        self.assertEqual((await _summary_days(request)).status, 400)
 
 
 class RecoveryTests(unittest.TestCase):

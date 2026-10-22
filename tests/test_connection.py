@@ -103,9 +103,9 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         pipe.started_at = pipe.ws_connected_at = now - 4000
         pipe.ws_conns.add(Mock(closed=False))
         pipe.last_protocol_message = {"self_id": "123", "received_at": now - 2000}
-        with patch("msgx.pipeline.napcat.qq_msg_db_age", return_value=2000) as age, \
+        with patch("msgx.protocol_session.napcat.qq_msg_db_age", return_value=2000) as age, \
                 patch.object(pipe.store, "hour_baseline", return_value=20), \
-                patch("msgx.pipeline.napcat.recover_worker", return_value={"ok": True, "note": "等待新消息"}) as recover:
+                patch("msgx.protocol_session.napcat.recover_worker", return_value={"ok": True, "note": "等待新消息"}) as recover:
             await pipe._check_receive_health()
             age.assert_called_once_with("123")
             recover.assert_called_once_with(pipe.cfg, "123")
@@ -134,9 +134,9 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         pipe.bot_uin = "123"
         pipe.started_at = pipe.ws_connected_at = now - 4000
         pipe.ws_conns.add(Mock(closed=False))
-        with patch("msgx.pipeline.napcat.qq_msg_db_age", return_value=2000) as age, \
+        with patch("msgx.protocol_session.napcat.qq_msg_db_age", return_value=2000) as age, \
                 patch.object(pipe.store, "hour_baseline", return_value=20) as baseline, \
-                patch("msgx.pipeline.napcat.recover_worker") as recover:
+                patch("msgx.protocol_session.napcat.recover_worker") as recover:
             await pipe._check_receive_health()  # 尚未验证过消息
             pipe.last_protocol_message = {"self_id": "123", "received_at": now}
             await pipe._check_receive_health()  # 活跃消息
