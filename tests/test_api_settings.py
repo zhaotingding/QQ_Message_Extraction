@@ -122,11 +122,24 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA=="}}]}], "stream": False})
         self.assertEqual(session.post.call_args.kwargs["timeout"].total, 900)
 
-    async def test_flex_429_backoff_never_falls_back_and_other_providers_unchanged(self):
+    async def test_flex_capacity_falls_back_immediately_and_other_429_keeps_backoff(self):
         from msgx.llm import RetryableRequestError
         self.cfg["api"]["service_tier"] = "flex"
         session = Mock()
-        session.post.return_value = Response({"error": {"code": "resource_unavailable"}}, status=429)
+        session.post.side_effect = [Response({"error": {"code": "resource_unavailable"}}, status=429), Response(self.response())]
+        with patch.object(self.llm, "session", AsyncMock(return_value=session)), \
+                patch("msgx.llm.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            await self.llm.chat("x", "y", require_complete=True)
+        self.assertEqual([json.loads(call.kwargs["data"])["service_tier"] for call in session.post.call_args_list], ["flex", "default"])
+        sleep.assert_not_awaited()
+        row = self.store.api_usage_details()["items"][0]
+        self.assertIn("Flex资源不足已转Standard", row["status"])
+        self.assertEqual(json.loads(row["pricing"])["requested_service_tier"], "default")
+        self.assertAlmostEqual(row["cost_usd"], (600*.1+400*.01+100*.5)/1_000_000)
+        self.assertEqual(self.cfg["api"]["service_tier"], "flex")  # 不修改共享配置或其他在途调用。
+        session.reset_mock()
+        session.post.side_effect = None
+        session.post.return_value = Response({"error": {"code": "rate_limit_exceeded"}}, status=429)
         with patch.object(self.llm, "session", AsyncMock(return_value=session)), \
                 patch("msgx.llm.asyncio.sleep", new_callable=AsyncMock) as sleep:
             with self.assertRaises(RetryableRequestError):
@@ -141,6 +154,14 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             await self.llm._post_once({"model": "deepseek-flash", "messages": []})
         self.assertNotIn("service_tier", json.loads(session.post.call_args.kwargs["data"]))
         self.assertNotIn("timeout", session.post.call_args.kwargs)
+
+    async def test_ambiguous_flex_failure_does_not_switch_to_standard(self):
+        from msgx.llm import AmbiguousResponseError
+        self.cfg["api"]["service_tier"] = "flex"
+        with patch.object(self.llm, "_post_once", AsyncMock(side_effect=AmbiguousResponseError("未知提交"))) as post:
+            with self.assertRaises(AmbiguousResponseError):
+                await self.llm._post({"model": "gpt-6-luna", "messages": [], "max_tokens": 100})
+        self.assertEqual(post.await_count, 1)
 
     async def test_responses_stream_maps_body_usage_and_price(self):
         session = Mock()
@@ -319,6 +340,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_output_limit_matches_provider(self):
         for profile in (api_settings.DEFAULTS, api_settings.catalog({}, {})[0]["deepseek"]):
             cfg = api_settings.apply(self.cfg, {**profile, "protocol": "chat_completions"})
+            cfg["llm"]["protocol"] = "chat_completions"  # 仅验证旧在途快照兼容；新公开配置已统一Responses。
             llm = LLM(cfg, self.store)
             llm.configure(KEY)
             session = Mock()
@@ -533,9 +555,9 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                 await release.wait()
                 return self
         session = Mock()
-        session.post.side_effect = [Delayed(self.response()), Response({
-            "choices": [{"message": {"content": "DeepSeek 摘要"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 1000, "completion_tokens": 100}})]
+        ds_response = self.response()
+        ds_response["output"][1]["content"][0]["text"] = "DeepSeek 摘要"
+        session.post.side_effect = [Delayed(self.response()), Response(ds_response)]
         def key_for(url, *, profile_id=""):
             return KEY + "-" + profile_id
         with patch.dict(os.environ, {prefs.ENV_PREFS: str(path)}), \
@@ -553,7 +575,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.llm.snapshot().cfg["api"], profiles["openai"])
         first, second = session.post.call_args_list
         self.assertEqual(first.args[0], "https://api.openai.com/v1/responses")
-        self.assertEqual(second.args[0], "https://api.deepseek.com/chat/completions")
+        self.assertEqual(second.args[0], "https://api.deepseek.com/responses")
         self.assertNotEqual(first.kwargs["headers"]["Authorization"], second.kwargs["headers"]["Authorization"])
         self.assertEqual(json.loads(second.kwargs["data"])["model"], "deepseek-flash")
         rows = self.store.api_usage_details(active_only=True)
@@ -605,6 +627,46 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             api_settings.catalog({}, {"active_api_profile": "missing"})
         ds = LLM(api_settings.apply(self.cfg, profiles["deepseek"]), self.store)
         self.assertAlmostEqual(ds.cost_cny(1000, 100, peak=True), 2 * ds.cost_cny(1000, 100, peak=False))
+
+    async def test_deleted_profiles_are_not_resurrected_by_defaults_or_shared_config(self):
+        profiles, _ = api_settings.catalog({}, {})
+        shared = {"api_profiles": {**profiles, "retired": dict(profiles["openai"])}}
+        data = {"api_profiles": {"openai": profiles["openai"]}, "active_api_profile": "openai",
+                "deleted_api_profiles": ["deepseek", "retired"]}
+        path = Path(self.tmp.name) / "deleted.yaml"
+        prefs.save(data, path)
+        loaded, active = api_settings.catalog(shared, prefs.load_raw(path))
+        self.assertEqual(list(loaded), ["openai"])
+        self.assertEqual(active, "openai")
+        only_deepseek, next_active = api_settings.catalog({"active_api_profile": "openai"}, {
+            "deleted_api_profiles": ["openai"]})
+        self.assertEqual(list(only_deepseek), ["deepseek"])
+        self.assertEqual(next_active, "deepseek")
+        for removed in ("openai", [None], ["not-a-profile"]):
+            with self.assertRaises(ValueError):
+                api_settings.catalog({}, {"deleted_api_profiles": removed})
+        with self.assertRaises(ValueError):
+            api_settings.catalog({}, {"deleted_api_profiles": ["openai", "deepseek"]})
+
+    async def test_credential_locator_does_not_read_or_write_secrets(self):
+        url = "https://api.example.invalid/v1"
+        with patch.object(credentials, "_api", side_effect=AssertionError("locator must not touch credential storage")):
+            target = credentials.target_name(url, "custom_1")
+        self.assertEqual(target, credentials._target(url, "custom_1"))
+        self.assertTrue(target.startswith("msgx/api/"))
+        self.assertNotIn(KEY, target)
+
+    async def test_public_chat_profiles_migrate_to_responses_without_mutating_input_or_credentials(self):
+        legacy = {**api_settings.DEFAULTS, "protocol": "chat_completions"}
+        old = copy.deepcopy(legacy)
+        profiles, _ = api_settings.catalog({}, {"api_profiles": {"openai": legacy}})
+        self.assertEqual(legacy, old)
+        self.assertTrue(all(profile["protocol"] == "responses" for profile in profiles.values()))
+        self.assertEqual(credentials.target_name(legacy["base_url"], "openai"),
+                         credentials.target_name(profiles["openai"]["base_url"], "openai"))
+        path = Path(self.tmp.name) / "migration.yaml"
+        prefs.save({"api_profiles": {"openai": legacy}}, path)
+        self.assertEqual(prefs.load_raw(path)["api_profiles"]["openai"]["protocol"], "responses")
 
 
 @unittest.skipUnless(os.environ.get("MSGX_TEST_CREDENTIALS") == "1", "仅显式启用时测试 Windows 虚构凭据")

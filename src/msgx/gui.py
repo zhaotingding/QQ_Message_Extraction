@@ -125,6 +125,8 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
 
         style = ttk.Style(self.root)
         style.theme_use("clam")
+        from .ui.check_style import install_check_style
+        install_check_style(self.root, style)  # clam 默认选中标记是叉，统一替换为勾。
         self.root.option_add("*Font", (FONT, 10))
         style.configure(".", font=(FONT, 10))
         style.configure("TButton", padding=(8, 4), font=(FONT, 10))

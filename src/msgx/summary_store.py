@@ -197,12 +197,15 @@ class SummaryStore:
                           (*key, started, json.dumps(metadata, ensure_ascii=False)))
         self.conn.commit()
 
-    def update_summary_request(self, key: tuple, *, response_id: str = "", request_id: str = "", result: dict | None = None) -> None:
+    def update_summary_request(self, key: tuple, *, response_id: str = "", request_id: str = "", result: dict | None = None,
+                               submitted_tier: str = "") -> None:
         self.conn.execute("UPDATE summary_requests SET response_id=CASE WHEN ?<>'' THEN ? ELSE response_id END,"
-                          "request_id=CASE WHEN ?<>'' THEN ? ELSE request_id END,result=COALESCE(?,result)"
+                          "request_id=CASE WHEN ?<>'' THEN ? ELSE request_id END,result=COALESCE(?,result),"
+                          "metadata=CASE WHEN ?<>'' THEN json_set(metadata,'$.submitted_service_tier',?) ELSE metadata END"
                           " WHERE kind=? AND start_date=? AND end_date=?",
                           (response_id, response_id, request_id, request_id,
-                           json.dumps(result, ensure_ascii=False) if result is not None else None, *key))
+                           json.dumps(result, ensure_ascii=False) if result is not None else None,
+                           submitted_tier, submitted_tier, *key))
         self.conn.commit()
 
     def clear_summary_request(self, key: tuple) -> None:

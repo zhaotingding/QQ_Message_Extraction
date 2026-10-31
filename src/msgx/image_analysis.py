@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 from . import security
-from .image_policy import is_sticker, screen_image, validate_analysis
+from .image_policy import ANALYSIS_DELAY_SECONDS, is_sticker, screen_image, validate_analysis
 from .llm import LLM
 
 
@@ -33,7 +34,7 @@ class ImageAnalysis:
     async def process(self) -> int:
         options, _ = self.options()
         count = 0
-        for source in self.store.screening_images(5):
+        for source in self.store.screening_images(5, options["history_days"]):
             row = dict(source)
             context = self.store.image_context(row["message_row"], options["context_messages"])
             try:
@@ -41,7 +42,7 @@ class ImageAnalysis:
             except (OSError, ValueError):
                 from .image_policy import ImageDecision
                 decision = ImageDecision(0, "本地文件不可读取，未上传", True)
-            self.store.set_screen_result(row["id"], decision)
+            self.store.set_screen_result(row["id"], decision, options["threshold"])
             count += 1
         if not options["enabled"]:
             self.status = {"state": "disabled", "message": "本地初筛运行，自动图片 API 已关闭"}
@@ -57,6 +58,11 @@ class ImageAnalysis:
             self.status = {"state": "idle", "message": "暂无达到阈值的待分析图片", **usage}
             return count
         row = dict(rows[0])
+        if row["auto_ready_at"] > time.time():
+            remaining = max(1, int(row["auto_ready_at"]-time.time()))
+            self.status = {"state": "waiting", "message": f"图片 #{row['id']} 已标记（{row['screen_score']}分），等待后续群聊约{remaining//60}分{remaining%60}秒",
+                           "image_id": row["id"], "ready_at": row["auto_ready_at"], **usage}
+            return count
         if row["id"] in self.media._vision_running:
             return count
         llm = self.media.llm.snapshot(role="image") if isinstance(self.media.llm, LLM) else self.media.llm
@@ -67,7 +73,7 @@ class ImageAnalysis:
             self.status = {"state": "limited", "message": "全局每日模型预算已达上限，未提交图片"}
             return count
         # 以有界上下文和本次输出上限预留估算额度；实际供应商账单仍可能有延迟或汇率差异。
-        reserve = llm.cost_cny(8000, llm.image_output_limit()) if isinstance(llm, LLM) else 0
+        reserve = llm.cost_cny(8000, llm.image_output_limit(), service_tier="default") if isinstance(llm, LLM) else 0  # 预留可回退 Standard 的费用。
         if usage["cost_cny"] + reserve > options["daily_budget_cny"]:
             self.status = {"state": "limited", "message": "剩余预算不足以预留下一张图片的估算费用", **usage}
             return count
@@ -82,7 +88,8 @@ class ImageAnalysis:
         self.media._vision_running.add(row["id"])
         self.status = {"state": "running", "message": f"正在分析图片 #{row['id']}（本地重要度 {row['screen_score']}）"}
         try:
-            context = self.store.image_context(row["message_row"], options["context_messages"], account=account)
+            context = self.store.image_context(row["message_row"], options["context_messages"], account=account,
+                                               after_seconds=ANALYSIS_DELAY_SECONDS)
             text, state = await self.media._run_vision(Path(row["media_path"]), row, purpose="自动图片理解", llm=llm, context=context)
             self.store.set_image_result(row["id"], vision_text=text if state == "ok" else "", vision_state=state)
             self.store.finish_auto_image(row["id"], state if state == "ok" else "unknown")

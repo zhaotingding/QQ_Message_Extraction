@@ -57,7 +57,7 @@ class AutomationControls:
         ttk.Label(frame, text="图片分析使用配置：").grid(row=0, column=0, sticky="w")
         self.profile = ttk.Combobox(frame, state="readonly")
         self.profile.grid(row=0, column=1, sticky="ew")
-        ttk.Checkbutton(frame, text="达到重要度阈值后自动调用图片 API", variable=self.image_enabled).grid(
+        ttk.Checkbutton(frame, text="关键词评分达阈值后，等待15分钟自动分析", variable=self.image_enabled).grid(
             row=1, column=0, columnspan=2, sticky="w", pady=5)
         for row, (key, title) in enumerate((("threshold", "重要度阈值（1～100）"),
                      ("daily_limit", "每日最多自动分析张数"), ("daily_budget_cny", "每日自动分析预算（元，估算）"),
@@ -65,7 +65,7 @@ class AutomationControls:
             ttk.Label(frame, text=title).grid(row=row, column=0, sticky="w", pady=2)
             ttk.Entry(frame, textvariable=self.image_values[key], width=12).grid(row=row, column=1, sticky="w")
         frame.columnconfigure(1, weight=1)
-        ttk.Label(frame, text="已下载图片逐批本地初筛，表情包直接过滤；仅高分候选上传，结合附近群聊，成功入库后纳入摘要。\n"
+        ttk.Label(frame, text="OCR按近期报告的22项主题匹配加分，表情包直接过滤；达阈值标记后等待15分钟，再结合该群前后文字分析。\n"
                   "筛选是保守规则，不能保证语义准确；广告降权、同图去重、次数/预算限制和未知结果不自动重发共同控制调用。\n"
                   "先在上方创建并保存低价图片 API 配置，再在此选择；摘要继续使用上方选中的摘要配置。",
                   wraplength=850).grid(row=6, column=0, columnspan=2, sticky="w", pady=5)

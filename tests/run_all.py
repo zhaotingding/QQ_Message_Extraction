@@ -19,6 +19,7 @@ sys.path.insert(0, str(PROJ / "src"))  # 套件不借用外层项目的运行入
 from msgx import conda_runtime
 
 SUITES = [
+    ("复选框勾选样式", "test_check_style.py"),
     ("项目 Conda 环境、轻量 EXE 与离线诊断", "test_startup.py"),
     ("存储查询与迁移工作量", "test_storage_queries.py"),
     ("后台只读与协议任务关闭", "test_onebot_reads.py"),

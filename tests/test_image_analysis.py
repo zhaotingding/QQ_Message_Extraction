@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from PIL import Image
 from msgx import api_settings, prefs
 from msgx.config import DEFAULTS
-from msgx.image_policy import is_sticker, screen_image, validate_analysis
+from msgx.image_policy import ANALYSIS_DELAY_SECONDS, KEYWORD_RULES, SCREEN_VERSION, is_sticker, screen_image, validate_analysis
 from msgx.llm import LLM
 from msgx.media import MediaWorker
 from msgx.models import Msg
@@ -54,6 +54,23 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_analysis(value)
 
+    def test_report_keywords_have_different_weights_and_repetition_cap(self):
+        weights = {name: weight for name, _, weight in KEYWORD_RULES}
+        self.assertEqual(len(weights), 22)
+        self.assertGreater(weights["Codex"], weights["训练与梯度"])
+        once = screen_image("Codex", "").score
+        twice = screen_image("Codex Codex", "").score
+        self.assertGreater(twice, once)
+        self.assertEqual(screen_image("Codex " * 500, "").score, twice)
+        self.assertLess(twice, 70)
+
+    def test_plain_text_and_context_alone_do_not_score(self):
+        self.assertEqual(screen_image("明天一起去吃饭。" * 100, "").score, 0)
+        self.assertEqual(screen_image("", "CUDA RuntimeError Codex API").score, 0)
+        decision = screen_image("CUDA RuntimeError: failed; API 429", "")
+        self.assertGreaterEqual(decision.score, 70)
+        self.assertIn("GPU与显存", decision.reason)
+
 
 class AnalysisTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -80,12 +97,18 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         row_id = self.store.insert_message(Msg(msg_id=key, group_id=group, sender_id="222", ts=int(time.time()),
             text=text, msg_type="mixed", image_urls=["local:" + key]), bot_uin=account)
         image = self.store.conn.execute("SELECT * FROM message_images WHERE message_row=?", (row_id,)).fetchone()
-        self.store.set_image_result(image["id"], ocr_text="Traceback RuntimeError: failed\n" * 8,
+        self.store.set_image_result(image["id"], ocr_text="Traceback RuntimeError: CUDA error\n" * 8,
             media_path=str(self.path), media_hash=digest, media_state="done")
         return self.store.get_image(image["id"])
 
     def enable(self, **values):
         self.cfg["media"]["analysis"].update(enabled=True, **values)
+
+    async def process_ready(self):
+        await self.worker.analysis.process()  # 首次只标记，测试显式推进持久化就绪时间。
+        self.store.conn.execute("UPDATE message_images SET auto_ready_at=? WHERE auto_state='waiting'", (time.time()-1,))
+        self.store.conn.commit()
+        await self.worker.analysis.process()
 
     async def test_disabled_only_screens_local_files(self):
         row = self.image("off")
@@ -97,7 +120,7 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
     async def test_success_context_and_summary_reuse(self):
         self.enable()
         row = self.image("one")
-        await self.worker.analysis.process()
+        await self.process_ready()
         saved = self.store.get_image(row["id"])
         self.assertEqual(saved["auto_state"], "ok")
         self.assertEqual(saved["include_vision"], 1)
@@ -113,7 +136,7 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.enable()
         self.fake.ok = False
         row = self.image("failure")
-        await self.worker.analysis.process()
+        await self.process_ready()
         other = MediaWorker(self.cfg, self.store, self.fake)
         await other.analysis.process()
         await other.close()
@@ -124,7 +147,7 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
     async def test_budget_and_count_stop_additional_calls(self):
         self.enable(daily_limit=1)
         self.image("first")
-        await self.worker.analysis.process()
+        await self.process_ready()
         self.image("second", digest="different")
         await self.worker.analysis.process()
         self.assertEqual(len(self.fake.calls), 1)
@@ -133,9 +156,9 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
     async def test_duplicate_same_context_reuses_saved_vision(self):
         self.enable()
         self.image("first")
-        await self.worker.analysis.process()
+        await self.process_ready()
         second = self.image("second")
-        await self.worker.analysis.process()
+        await self.process_ready()
         self.assertEqual(len(self.fake.calls), 1)
         self.assertEqual(self.store.get_image(second["id"])["auto_state"], "cached")
 
@@ -158,6 +181,105 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         row = self.image("context")
         self.store.insert_message(Msg(msg_id="hidden", group_id="g", ts=int(time.time()), text="other-account-secret"), bot_uin="999")
         self.assertNotIn("other-account-secret", self.store.image_context(row["message_row"]))
+
+    async def test_waits_fifteen_minutes_and_keeps_wait_across_restart(self):
+        self.enable()
+        row = self.image("delayed")
+        started = time.time()
+        await self.worker.analysis.process()
+        saved = self.store.get_image(row["id"])
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(saved["auto_state"], "waiting")
+        self.assertGreaterEqual(saved["auto_ready_at"], started+ANALYSIS_DELAY_SECONDS)
+        self.assertFalse(self.store.claim_auto_image(row["id"]))
+        self.assertEqual(self.worker.analysis.status["state"], "waiting")
+        other = MediaWorker(self.cfg, self.store, self.fake)
+        await other.analysis.process()
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.store.get_image(row["id"])["auto_ready_at"], saved["auto_ready_at"])
+        await other.close()
+        await self.process_ready()
+        self.assertEqual(len(self.fake.calls), 1)
+
+    async def test_delayed_context_contains_followup_and_preserves_ocr(self):
+        self.enable(context_messages=8)
+        row = self.image("followup")
+        now = int(time.time())
+        self.store.insert_message(Msg(msg_id="resolution", group_id="g", sender_id="222", ts=now+12*60,
+            text="后续结论：CUDA驱动版本不兼容，回滚解决"), bot_uin="111")
+        self.store.insert_message(Msg(msg_id="outsider", group_id="other", ts=now+12*60, text="其他群不应出现"), bot_uin="111")
+        await self.process_ready()
+        self.assertIn("后续结论", self.fake.calls[0][1])
+        self.assertNotIn("其他群不应出现", self.fake.calls[0][1])
+        saved = self.store.get_image(row["id"])
+        self.assertIn("Traceback", saved["ocr_text"])
+        self.assertIn("修复方法", saved["vision_text"])
+
+    async def test_disabling_after_mark_keeps_waiting_without_call(self):
+        self.enable()
+        row = self.image("disable-marked")
+        await self.worker.analysis.process()
+        self.cfg["media"]["analysis"]["enabled"] = False
+        self.store.conn.execute("UPDATE message_images SET auto_ready_at=?", (time.time()-1,))
+        self.store.conn.commit()
+        await self.worker.analysis.process()
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.store.get_image(row["id"])["auto_state"], "waiting")
+
+    async def test_higher_score_waiting_does_not_block_ready_candidate(self):
+        self.enable()
+        ready = self.image("ready-first", digest="ready")
+        waiting = self.image("waiting-high", digest="waiting")
+        await self.worker.analysis.process()
+        self.store.conn.execute("UPDATE message_images SET screen_score=80,auto_ready_at=? WHERE id=?", (time.time()-1, ready["id"]))
+        self.store.conn.execute("UPDATE message_images SET screen_score=100 WHERE id=?", (waiting["id"],))
+        self.store.conn.commit()
+        await self.worker.analysis.process()
+        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(self.store.get_image(ready["id"])["auto_state"], "ok")
+        self.assertEqual(self.store.get_image(waiting["id"])["auto_state"], "waiting")
+
+    async def test_rescreening_uses_two_bounded_index_queries(self):
+        images = [self.image(f"batch-{index}") for index in range(8)]
+        for row in images[::2]:
+            self.store.conn.execute("UPDATE message_images SET screen_state='done',screen_version=? WHERE id=?", (SCREEN_VERSION-1, row["id"]))
+        self.store.conn.commit()
+        queries = []
+        self.store.conn.set_trace_callback(queries.append)
+        try:
+            rows = self.store.screening_images(5)
+        finally:
+            self.store.conn.set_trace_callback(None)
+        self.assertEqual([row["id"] for row in rows], [row["id"] for row in reversed(images[-5:])])
+        selects = [query for query in queries if query.startswith("SELECT i.*")]
+        self.assertEqual(len(selects), 2)
+        self.assertTrue(all(query.endswith("LIMIT 5") for query in selects))
+        plans = [[str(row[3]) for row in self.store.conn.execute("EXPLAIN QUERY PLAN " + query)] for query in selects]
+        self.assertTrue(any("idx_image_screen" in part for part in plans[0]), plans)
+        self.assertTrue(any("idx_image_screen_version" in part for part in plans[1]), plans)
+
+    async def test_empty_rescreening_is_not_repeated_until_scope_expands(self):
+        old = self.image("expired-legacy")
+        self.store.conn.execute("UPDATE message_images SET screen_state='done',screen_version=? WHERE id=?", (SCREEN_VERSION-1, old["id"]))
+        self.store.conn.execute("UPDATE messages SET ts=? WHERE id=?", (time.time()-14*86400, old["message_row"]))
+        self.store.conn.commit()
+        queries = []
+        self.store.conn.set_trace_callback(queries.append)
+        try:
+            self.assertEqual(self.store.screening_images(history_days=7), [])
+            first = [query for query in queries if query.startswith("SELECT i.*")]
+            self.assertEqual(len(first), 2)
+            queries.clear()
+            self.assertEqual(self.store.screening_images(history_days=7), [])
+            second = [query for query in queries if query.startswith("SELECT i.*")]
+            self.assertEqual(len(second), 1)
+            self.assertNotIn("screen_version<", second[0])
+            queries.clear()
+            expanded = self.store.screening_images(history_days=30)
+            self.assertEqual([row["id"] for row in expanded], [old["id"]])
+            self.assertEqual(len([query for query in queries if query.startswith("SELECT i.*")]), 2)
+        finally:
+            self.store.conn.set_trace_callback(None)
 
     async def test_shared_message_context_uses_current_receiving_account(self):
         row = self.image("shared", account="999")

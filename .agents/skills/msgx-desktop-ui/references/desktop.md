@@ -18,6 +18,8 @@ GUI和协议操作共用 `napcat.resolve_dir()`。二维码监视在操作前固
 
 ## 批注、阅读与反馈
 
+1.0.1（2026-10-31，4项勾选样式与完整39组隔离回归通过）：`gui.py`保留clam主题，在主题初始化后调用`ui/check_style.py`统一替换全局TCheckbutton的indicator。选中为勾号，保留原标签/焦点/键盘行为及disabled/active/pressed状态；图像按DPI生成，由root持有引用。不要为改勾号更换整套主题或逐页面复制样式。`tests/test_check_style.py`覆盖实际Tk图形与控件状态，不代表生产窗口点击已验收。
+
 保存返回False可表示仍在后台等待锁。只有真实落库成功才执行切换/关闭的继续动作；失败保留文章与草稿。读回批注携带文章身份和请求序号，旧结果不能覆盖新内容。
 
 坐标与内容版本关联。Tk对emoji的字符索引可能不同于Python切片，恢复时核对选中文字。HTML丢失时从 `summaries.content` 读取；不得为了阅读重新生成。

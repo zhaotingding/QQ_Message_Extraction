@@ -248,8 +248,8 @@ class FeedbackTests(unittest.TestCase):
         app.v_api_key.set(self.key)
         self.assertIn("尚未保存", app.v_api_key_status.get())
         with patch.object(prefs, "save") as save:
-            self.assertTrue(app.save_prefs())
-            self.assertNotIn(self.key, json.dumps(save.call_args.args[0]))
+            self.assertTrue(app.save_api_key())
+            save.assert_not_called()  # 纯密钥动作不收集、保存或改写其它设置。
         self.assertEqual(app.v_api_key.get(), "")
         self.assertIn("新密钥已配置", app.v_api_feedback.get())
         self.assertIn("未验证 API", app.v_api_feedback.get())
@@ -270,15 +270,95 @@ class FeedbackTests(unittest.TestCase):
             save.assert_not_called()
         self.assertIn("未保存", app.v_api_feedback.get())
         self.assertEqual(app.v_api_key.get(), self.key)
-        app.v_summary_chars.set("2000")
+        # 无关设置有误不阻止独立保存密钥；失败时保留输入且不回显密钥。
         with patch.object(settings.credentials, "save", side_effect=OSError(self.key)):
-            self.assertFalse(app.save_prefs())
+            self.assertFalse(app.save_api_key())
         self.assertIn("保存失败", app.v_api_feedback.get())
         self.assertNotIn(self.key, app.v_api_feedback.get())
+        self.assertEqual(app.v_api_key.get(), self.key)
+        app.v_summary_chars.set("2000")
         with patch.object(prefs, "save", side_effect=OSError("fixture write failure")):
             self.assertFalse(app.save_prefs())
+        self.assertEqual(app.v_api_key.get(), self.key)
+        self.assertNotIn("新密钥已保存", app.v_api_feedback.get())
+
+    def test_add_copies_current_parameters_persists_and_does_not_overwrite_source(self):
+        app = self.app
+        original = copy.deepcopy(app._api_profiles[app._api_selected])
+        app.v_summary_chars.set("invalid")  # 新增API不能依赖另一模块的输入是否有效。
+        app.v_api["provider"].set("我的低价图片服务")
+        app.v_api["model"].set("vision-cheap")
+        app.v_api_key.set(self.key)
+        app.add_api_profile()
+        saved = prefs.load_raw(app.prefs_file)
+        self.assertEqual(app._api_selected, "custom_1")
+        self.assertEqual(saved["api_profiles"]["custom_1"]["model"], "vision-cheap")
+        self.assertEqual(saved["api_profiles"]["openai"], original)
+        self.assertEqual(saved["active_api_profile"], "custom_1")
         self.assertEqual(app.v_api_key.get(), "")
-        self.assertIn("新密钥已保存，但配置保存失败", app.v_api_feedback.get())
+        self.assertNotIn(self.key, app.prefs_file.read_text(encoding="utf-8"))
+        self.assertIn("新增并保存", app.v_api_feedback.get())
+        self.assertEqual(app.v_summary_chars.get(), "invalid")
+        self.assertIn("custom_1", app.api_selector.get())
+
+    def test_switch_preserves_isolated_unsaved_drafts_and_ignores_other_invalid_fields(self):
+        app = self.app
+        saved_model = app._api_profiles["openai"]["model"]
+        app.v_summary_chars.set("invalid")
+        app.v_api["model"].set("draft-model")
+        app.v_api_key.set(self.key)
+        with patch.object(settings.credentials, "save") as save_key:
+            app.api_selector.current(list(app._api_profiles).index("deepseek"))
+            app._select_api_profile()
+            self.assertEqual(app._api_selected, "deepseek")
+            self.assertEqual(app.v_api_key.get(), "")
+            saved = prefs.load_raw(app.prefs_file)
+            self.assertEqual(saved["active_api_profile"], "deepseek")
+            self.assertEqual(saved["api_profiles"]["openai"]["model"], saved_model)
+            app.api_selector.current(list(app._api_profiles).index("openai"))
+            app._select_api_profile()
+            save_key.assert_not_called()
+        self.assertEqual(app.v_api["model"].get(), "draft-model")
+        self.assertEqual(app.v_api_key.get(), self.key)
+        self.assertNotIn(self.key, app.prefs_file.read_text(encoding="utf-8"))
+
+    def test_api_parameter_save_and_key_save_are_separate_and_precise(self):
+        app = self.app
+        app.v_summary_chars.set("invalid")
+        app.v_api["model"].set("new-model")
+        app.v_api["base_url"].set("https://api-images.invalid/v1")
+        app.v_api_key.set(self.key)
+        with patch.object(settings.credentials, "save") as save_key:
+            self.assertFalse(app.save_api_key())
+            save_key.assert_not_called()
+            self.assertIn("地址尚未保存", app.v_api_feedback.get())
+            self.assertTrue(app.save_api_profile())
+            save_key.assert_not_called()
+            self.assertEqual(app.v_api_key.get(), self.key)
+            self.assertEqual(prefs.load_raw(app.prefs_file)["api"]["model"], "new-model")
+            self.assertTrue(app.save_api_key())
+            save_key.assert_called_once_with("https://api-images.invalid/v1", self.key, profile_id="openai")
+        self.assertIn(str(app.prefs_file.resolve()), app.v_api_locations.get())
+        self.assertIn(settings.credentials.target_name("https://api-images.invalid/v1", "openai"), app.v_api_locations.get())
+        self.assertIn("密钥不在 YAML 文件中", app.v_api_locations.get())
+        self.assertNotIn(self.key, app.v_api_locations.get())
+
+    def test_delete_profile_survives_reload_preserves_credentials_and_rebinds_image(self):
+        app = self.app
+        app.prefs["image_api_profile"] = "openai"
+        with patch.object(settings.messagebox, "askyesno", return_value=True), \
+                patch.object(settings.credentials, "delete") as delete_key:
+            app.delete_api_profile()
+            delete_key.assert_not_called()
+        self.assertNotIn("openai", app._api_profiles)
+        saved = prefs.load_raw(app.prefs_file)
+        self.assertEqual(saved["image_api_profile"], "")
+        self.assertIn("openai", saved["deleted_api_profiles"])
+        app.reload_prefs()
+        self.assertNotIn("openai", app._api_profiles)
+        self.assertEqual(app._api_selected, "deepseek")
+        app.delete_api_profile()
+        self.assertIn("至少保留一个", app.v_api_feedback.get())
 
     def test_cancel_import_export_duplicate_sender_and_log_refresh(self):
         app = self.app

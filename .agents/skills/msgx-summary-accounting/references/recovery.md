@@ -16,6 +16,10 @@
 
 ## 网络与费用
 
+1.0.1（2026-10-31，30项API及8项后台恢复隔离测试通过）：只有官方OpenAI已请求Flex且明确返回`429 resource_unavailable`时立即按Standard重新提交；普通429、超时及未知提交不走该分支。回退后的实际提交档位须持久化到请求metadata，重开GET取回时继续按该档位推算，服务端返回档位仍优先；不能保留原Flex半价。
+
+策略依据：[OpenAI Flex资源不足处理](https://developers.openai.com/api/docs/guides/flex-processing)。新任务统一Responses；[DeepSeek官方Responses](https://api-docs.deepseek.com/guides/responses_api/)已提供该格式（2026-10-31查阅），不把官方支持推广到任意代理。旧任务恢复仍用原协议快照，不因编辑配置切换接口或重新POST。
+
 `force_close=True` 是现有可靠性策略：旧实现发生过陈旧连接和重置共享Session扩散失败。连接复用可作为待测优化，需验证断连和并发隔离；这不是永远禁止改动的规则，旧注释数字也不是当前性能基准。
 
 官方OpenAI的Flex按实际返回服务档位折算，避免再次将已折算金额减半；不把该倍率推广到其它平台。区分平台明细、余额差值、本地估算和未知；新API模式“刷新账单”只刷新本地估算，不等于取得平台余额或扣费。余额差值分辨率和跨充值断档的限制随结果说明，不伪造逐模型归因。

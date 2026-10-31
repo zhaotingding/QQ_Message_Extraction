@@ -1174,6 +1174,8 @@ with patch("msgx.ui.settings.credentials.save") as _save_key, \
         patch("msgx.gui.prefs_mod.save") as _save_prefs:
     check("保存自定义 API 设置", app.save_prefs())
     _saved = _save_prefs.call_args.args[0]
+    check("保存参数不暗中保存输入密钥", not _save_key.called and app.v_api_key.get() == _fake_key)
+    check("独立保存密钥", app.save_api_key())
     check("密钥仅交给系统凭据存储", _save_key.call_args.args == ("https://api.openai.com/v1", _fake_key)
           and _fake_key not in json.dumps(_saved) and not app.v_api_key.get())
     check("平台和模型可编辑且界面只显示配置状态", _saved["api"]["model"] == "future-model"
@@ -1215,14 +1217,16 @@ app.v_api["model"].set("my-openai-model")
 app.v_api["service_tier"].set("flex")
 app.v_api_key.set(_fake_key)
 with patch("msgx.gui.prefs_mod.save") as _save_prefs, patch("msgx.ui.settings.credentials.save") as _save_key:
+    check("API参数独立保存", app.save_api_profile())
     app.api_selector.current(list(app._api_profiles).index("deepseek"))
     app._select_api_profile()
     check("下拉选择即切换并保存 DeepSeek", app._api_selected == "deepseek"
           and _save_prefs.call_args.args[0]["active_api_profile"] == "deepseek"
           and app.v_api["model"].get() == app._api_profiles["deepseek"]["model"])
-    check("切换前密钥保存到原配置且输入框清空", _save_key.call_args.kwargs == {"profile_id": "openai"}
+    check("切换不自动保存密钥且不同配置不带入密钥草稿", not _save_key.called
           and not app.v_api_key.get())
     app.v_api["model"].set("my-deepseek-model")
+    check("DeepSeek参数独立保存", app.save_api_profile())
     app.api_selector.current(list(app._api_profiles).index("openai"))
     app._select_api_profile()
     check("切回 OpenAI 保留两套独立模型", app.v_api["model"].get() == "my-openai-model"
@@ -1230,6 +1234,8 @@ with patch("msgx.gui.prefs_mod.save") as _save_prefs, patch("msgx.ui.settings.cr
     check("服务档位随配置独立保存", app.v_api["service_tier"].get() == "flex"
           and app._api_profiles["deepseek"]["service_tier"] == "default"
           and _save_prefs.call_args.args[0]["api_profiles"]["openai"]["service_tier"] == "flex")
+    check("切回原配置恢复密钥草稿并可单独保存", app.v_api_key.get() == _fake_key and app.save_api_key()
+          and _save_key.call_args.kwargs == {"profile_id": "openai"} and not app.v_api_key.get())
     _public = _save_prefs.call_args.args[0]
     check("多配置保存不含密钥", _fake_key not in json.dumps(_public)
           and {"openai", "deepseek"}.issubset(_public["api_profiles"]))
@@ -1242,7 +1248,8 @@ with patch("msgx.gui.prefs_mod.save") as _save_prefs, patch("msgx.ui.settings.cr
           and len(app._api_profiles) == 3 and not app.v_api_key.get())
     app.v_api["provider"].set("自定义测试平台")
     app.v_api_key.set(_fake_key)
-    app.save_prefs()
+    app.save_api_profile()
+    app.save_api_key()
     check("同地址的自定义配置密钥也独立", _save_key.call_args.kwargs == {"profile_id": "custom_1"})
 with patch("msgx.ui.settings.credentials.delete") as _delete:
     app.delete_api_key()

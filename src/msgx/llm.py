@@ -85,6 +85,22 @@ class _Transient(Exception):
     """
 
 
+class _FlexUnavailable(_Transient):
+    """官方明确拒绝 Flex 容量；允许切换 Standard，不含未知提交。"""
+
+
+def _flex_unavailable(status: int, body: str) -> bool:
+    if status != 429:
+        return False
+    try:
+        error = json.loads(body).get("error", {})
+        return isinstance(error, dict) and any(
+            re.search(r"resource[ _-]+unavailable", str(error.get(key, "")), re.I)
+            for key in ("code", "type", "message"))  # 普通限流、余额不足不等于 Flex 容量不足。
+    except (ValueError, AttributeError):
+        return False
+
+
 # 会被算作「可重试」的 HTTP 状态码
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
@@ -190,6 +206,8 @@ class LLM:
         from .api_settings import apply
         from .config import api_key
         cfg = apply(self.cfg, metadata["api"])
+        if metadata["api"].get("protocol") == "chat_completions":
+            cfg["api"]["protocol"] = cfg["llm"]["protocol"] = "chat_completions"  # 旧在途材料不随公开配置迁移改写。
         cfg.update(active_api_profile=metadata["active_api_profile"], summary=metadata["summary"])
         result = LLM(cfg, self.store)
         result.configure(api_key(cfg))
@@ -322,7 +340,8 @@ class LLM:
         if tier not in ("default", "priority", "fast", "flex", "scale", "auto", ""):
             tier = "unknown"
         cost = None
-        requested_tier = self.cfg.get("api", {}).get("service_tier", "default") if official else ""
+        configured_tier = self.cfg.get("api", {}).get("service_tier", "default") if official else ""
+        requested_tier = data.get("_requested_service_tier", configured_tier) if official else ""
         estimated_tier = tier or requested_tier
         if usage is not None and (not official or estimated_tier in ("default", "priority", "fast", "flex")):
             cost = self.cost_cny(int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)),
@@ -334,6 +353,8 @@ class LLM:
         complete = finish_reason == "stop" and bool(content.strip())
         reason = "stop/empty_content" if finish_reason == "stop" and not content.strip() else finish_reason
         status = "完成" if complete else f"输出未完成（{reason}）"
+        if official and configured_tier == "flex" and requested_tier == "default":
+            status += "，Flex资源不足已转Standard"
         if usage is None:
             status += "，用量未知"
         elif self.cache_write_multiplier(payload["model"]) != 1 and usage.get("prompt_cache_write_tokens") is None:
@@ -348,6 +369,7 @@ class LLM:
                                             "long_context_threshold", "long_input_multiplier", "long_output_multiplier", "peak_multiplier", "peak_windows_utc", "base_url")},
                                             "cache_write_multiplier": self.cache_write_multiplier(payload["model"]),
                                             "requested_service_tier": requested_tier,
+                                            "configured_service_tier": configured_tier,
                                             "service_tier_source": "response" if tier_returned else f"request_{requested_tier}" if official else "unknown"} if "api" in self.cfg else None,
                                    summary_key=request_key)
         if complete:
@@ -479,10 +501,19 @@ class LLM:
         """
         n = int(self.llm.get("post_retries", 4)) if retries is None else int(retries)
         last: Exception | str = ""
+        submitted = dict(payload)  # 每次调用独占档位，不能修改共享 LLM 或其他在途任务。
         for attempt in range(1, max(1, n) + 1):
             t0 = time.time()
             try:
-                return await self._post_once(payload)
+                try:
+                    data = await self._post_once(submitted)
+                except _FlexUnavailable:
+                    submitted["_service_tier"] = "default"  # 服务端已明确拒绝，立即转 Standard，不先等待 Flex 重试。
+                    log.warning("Flex资源不足，当前请求切换Standard；后续费用按实际档位记录")
+                    data = await self._post_once(submitted)
+                if urlsplit(self.llm["base_url"]).hostname == "api.openai.com":
+                    data["_requested_service_tier"] = submitted.get("_service_tier", self.cfg.get("api", {}).get("service_tier", "default"))
+                return data
             except _Transient as e:
                 last = e
                 dt = time.time() - t0
@@ -499,7 +530,7 @@ class LLM:
                     attempt, n, dt, e,
                 )
                 flex = (urlsplit(self.llm["base_url"]).hostname == "api.openai.com"
-                        and self.cfg.get("api", {}).get("service_tier") == "flex")
+                        and submitted.get("_service_tier", self.cfg.get("api", {}).get("service_tier")) == "flex")
                 await asyncio.sleep(min(2 ** attempt, 30) if flex else min(0.6 * attempt, 3.0))
         raise RetryableRequestError(f"请求失败（已重试 {n} 次）: {last}")
 
@@ -514,6 +545,7 @@ class LLM:
         responses = self.llm.get("protocol") == "responses" or bool(payload.get("background"))
         summary_stream = bool(payload.get("stream"))
         outgoing = self._responses_payload(payload) if responses else dict(payload)
+        outgoing.pop("_service_tier", None)  # 内部回退标记不作为未知参数发送给服务端。
         if summary_stream and not responses:
             outgoing["stream_options"] = {"include_usage": True}
         if not responses and "api" in self.cfg:
@@ -526,7 +558,7 @@ class LLM:
         if not responses and urlsplit(base).hostname == "api.openai.com" and "max_tokens" in outgoing:
             outgoing["max_completion_tokens"] = outgoing.pop("max_tokens")
         if urlsplit(base).hostname == "api.openai.com":
-            outgoing["service_tier"] = self.cfg.get("api", {}).get("service_tier", "default")
+            outgoing["service_tier"] = payload.get("_service_tier", self.cfg.get("api", {}).get("service_tier", "default"))
         encoded = json.dumps(outgoing).encode("utf-8")
         paced = len(encoded) > 64 * 1024
         headers = {
@@ -591,7 +623,10 @@ class LLM:
                             return result
                         except json.JSONDecodeError:
                             raise AmbiguousResponseError("API 响应不是完整 JSON，用量未知；未自动重发") from None
-                    last = _http_error(r.status, await r.text(), r.headers)
+                    error_body = await r.text()
+                    last = _http_error(r.status, error_body, r.headers)
+                    if urlsplit(base).hostname == "api.openai.com" and outgoing.get("service_tier") == "flex" and _flex_unavailable(r.status, error_body):
+                        raise _FlexUnavailable(last)
                     if r.status in RETRY_STATUS:
                         raise _Transient(last)
                     if r.status != 404:
@@ -650,13 +685,17 @@ class LLM:
             response_id = data.get("response_id", "")
             if not response_id:
                 raise AmbiguousResponseError("后台响应未返回任务 ID，未自动重发")
-            self.store.update_summary_request(key, response_id=response_id, request_id=data.get("request_id", ""))
+            self.store.update_summary_request(key, response_id=response_id, request_id=data.get("request_id", ""),
+                                              submitted_tier=data.get("_requested_service_tier", ""))
             log.info("自动摘要后台任务已接受：%s；后续仅查询同一响应", response_id)
         started = time.monotonic()
         while True:
             if data and data.get("response_status") not in ("queued", "in_progress"):
                 original_id = self.store.summary_request(key)["request_id"]
                 data["request_id"] = original_id or data.get("request_id", "")
+                submitted_tier = self.store.summary_request(key)["metadata"].get("submitted_service_tier")
+                if submitted_tier:
+                    data["_requested_service_tier"] = submitted_tier  # 重开后原响应未返档位，也不能误按 Flex 半价估算。
                 self.store.update_summary_request(key, result=data)
                 return data
             if time.monotonic() - started >= 900:
@@ -689,7 +728,7 @@ class LLM:
                             {"type": "input_image", "image_url": item["image_url"]["url"],
                              "detail": item["image_url"].get("detail", "low")}) for item in content]
             inputs.append({"role": message["role"], "content": content})
-        effort = self.cfg["api"]["reasoning"]
+        effort = self.cfg.get("api", {}).get("reasoning", payload.get("reasoning_effort", "none"))
         background = bool(payload.get("background"))
         result = {"model": payload["model"], "input": inputs, "max_output_tokens": payload["max_tokens"],
                   "reasoning": {"effort": effort}, "store": background, "stream": not background}

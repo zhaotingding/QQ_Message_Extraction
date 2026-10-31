@@ -112,7 +112,7 @@ class RealtimeGuiTests(unittest.TestCase):
     def detail(self):
         return self.app.rt_detail.get("1.0", "end-1c")
 
-    def test_table_previews_each_images_ocr_without_semantics_or_extra_columns(self):
+    def test_table_previews_each_images_best_saved_text_without_extra_columns(self):
         self.render()
         app = self.app
         self.assertNotIn("ocr", app.rt.cget("columns"))
@@ -120,8 +120,8 @@ class RealtimeGuiTests(unittest.TestCase):
         self.assertEqual(app.rt.get_children(), ("3", "2:201", "2:202", "1"))
         self.assertIn("今天比较两组实验结果", app.rt.set("3", "text"))
         self.assertEqual(app.rt.set("2:201", "text"), "[图片] OCR:第一张图片：控制实验条件后再比较结果。")
-        self.assertEqual(app.rt.set("2:202", "text"), "[图片] OCR:第二张图片：学习计划与记录。")
-        self.assertNotIn("学习进度表", app.rt.set("2:202", "text"))
+        self.assertEqual(app.rt.set("2:202", "text"), "[图片] 语义:一张学习进度表，各列对应日期和任务。")
+        self.assertNotIn("学习计划与记录", app.rt.set("2:202", "text"))
         self.assertEqual(app.rt.set("2:201", "image"), "打开")
         self.assertIn("识别", app.rt.set("2:201", "recognize"))
 
@@ -516,6 +516,24 @@ class RealtimeGuiTests(unittest.TestCase):
             x, _, width, _ = app.rt.bbox("3", column)
             self.assertGreaterEqual(x, 0)
             self.assertLessEqual(x + width, app.rt.winfo_width())
+
+
+    def test_image_semantics_replace_ocr_preview_and_waiting_is_visible(self):
+        rows = sample_payload()["items"]
+        picture = next(row for row in rows if row.get("images"))
+        image = picture["images"][0]
+        image.update(vision_text="模型已理解的关键语义", ocr_text="原始OCR证据", auto_state="waiting",
+                     auto_ready_at=picture["ts"] + 900)
+        self.app._render_messages(rows)
+        iid = f"{picture['id']}:{image['id']}"
+        preview = self.app.rt.set(iid, "text")
+        self.assertIn("语义:模型已理解的关键语义", preview)
+        self.assertNotIn("原始OCR证据", preview)
+        self.assertIn("待分析", preview)
+        self.app._show_message_detail(self.app._rt_rows[iid])
+        detail = self.app.rt_detail.get("1.0", "end-1c")
+        self.assertIn("原始OCR证据", detail)
+        self.assertIn("最早分析时间", detail)
 
 
 if __name__ == "__main__":

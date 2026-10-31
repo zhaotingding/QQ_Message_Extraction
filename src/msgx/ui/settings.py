@@ -49,7 +49,8 @@ class SettingsPage:
         self.api_selector = ttk.Combobox(selector, state="readonly", width=30)
         self.api_selector.pack(side="left", padx=8)
         self.api_selector.bind("<<ComboboxSelected>>", self._select_api_profile)
-        ttk.Button(selector, text="新增自定义配置", command=self.add_api_profile).pack(side="left")
+        ttk.Button(selector, text="以当前参数新增配置", command=self.add_api_profile).pack(side="left")
+        ttk.Button(selector, text="删除此配置", command=self.delete_api_profile).pack(side="left", padx=5)
         self.v_api = {}
         fields = [("provider", "服务平台"), ("base_url", "API 基础地址"), ("model", "模型（当前配置）"),
                   ("protocol", "接口格式"), ("reasoning", "思考强度"),
@@ -60,7 +61,7 @@ class SettingsPage:
                   ("usd_cny", "美元折人民币（估算）"), ("long_context_threshold", "长输入加价阈值（0 关闭）"),
                   ("long_input_multiplier", "长输入价格倍数"), ("long_output_multiplier", "长输出价格倍数"),
                   ("peak_multiplier", "高峰价格倍数"), ("peak_windows_utc", "工作日高峰时段（UTC）")]
-        choices = {"protocol": ("responses", "chat_completions"), "currency": ("USD", "CNY"),
+        choices = {"protocol": ("responses",), "currency": ("USD", "CNY"),
                    "reasoning": ("none", "low", "medium", "high", "xhigh", "max"),
                    "service_tier": ("flex", "default")}
         for row, (key, title) in enumerate(fields, 1):
@@ -80,19 +81,24 @@ class SettingsPage:
         ttk.Label(api, textvariable=self.v_api_key_status).grid(row=row+1, column=1, sticky="w", padx=8)
         controls = ttk.Frame(api)
         controls.grid(row=row+2, column=0, columnspan=2, sticky="w", pady=8)
-        ttk.Button(controls, text="保存配置 / 替换密钥", command=self.save_prefs).pack(side="left")
+        ttk.Button(controls, text="保存 API 参数", command=self.save_api_profile).pack(side="left")
+        ttk.Button(controls, text="保存 / 替换密钥", command=self.save_api_key).pack(side="left", padx=4)
         ttk.Button(controls, text="删除此地址的密钥", command=self.delete_api_key).pack(side="left", padx=4)
         ttk.Button(controls, text="导入配置", command=self.import_api_config).pack(side="left")
         ttk.Button(controls, text="导出配置", command=self.export_api_config).pack(side="left", padx=4)
         self.v_api_feedback = tk.StringVar(value="")
         self.api_feedback_label = ttk.Label(api, textvariable=self.v_api_feedback, foreground="#245cc4", wraplength=730)
         self.api_feedback_label.grid(row=row+3, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        self.v_api_locations = tk.StringVar()  # 文件路径、用途与系统凭据标识分别展示，密钥没有明文配置文件。
+        ttk.Label(api, textvariable=self.v_api_locations, wraplength=730).grid(
+            row=row+4, column=0, columnspan=2, sticky="ew", pady=(0, 5))
         self.v_api_key.trace_add("write", lambda *_: self._api_key_status())
-        ttk.Label(api, text="选择配置即保存切换；编辑参数后点击保存。新任务使用所选 API，在途摘要仍用原配置。\n"
+        ttk.Label(api, text="选择配置仅切换摘要用途；参数草稿暂存在当前窗口，点击「保存 API 参数」后生效。新增复制当前参数，不覆盖原配置。\n"
+                  "密钥只由「保存 / 替换密钥」保存；删除配置不删除系统凭据，避免破坏在途任务恢复。\n"
                   "配置导出不含密钥；不同配置或地址不复用密钥。更换模型请核对容量和费率，汇率为手动估值。\n"
                   "官方 OpenAI：flex 为半价慢速，default 为 Standard；单价填写 Standard 基准价，自动按档位折算。\n"
-                  "Flex 最长等待 15 分钟，资源不足会有限重试，不自动切换 Standard；其他平台不发送此参数。",
-                  style="Hint.TLabel", wraplength=730).grid(row=row+4, column=0, columnspan=2, sticky="w")
+                  "Flex 资源不足时改用 Standard；仅对明确资源拒绝回退，结果未知不自动重发；其他平台不发送此参数。",
+                  style="Hint.TLabel", wraplength=730).grid(row=row+5, column=0, columnspan=2, sticky="w")
 
         # --- 摘要 ---
         sm = ttk.LabelFrame(tab, text="自动摘要", padding=12)
@@ -311,6 +317,8 @@ class SettingsPage:
     def _load_into_widgets(self) -> None:
         p = self.prefs
         self._api_profiles, active = api_settings.catalog(self.cfg, p)
+        self._api_drafts = {}  # 重新载入才丢弃窗口内草稿；普通切换不覆盖已保存参数。
+        self._api_key_drafts = {}
         self._show_api_profile(active)
         self.automation.load()
         if "summary_target_chars" not in prefs_mod.load_raw(self.prefs_file):
@@ -434,9 +442,6 @@ class SettingsPage:
 
 
     def save_prefs(self, silent: bool = False) -> bool:
-        new_key = self.v_api_key.get().strip()
-        if new_key:
-            security.register(new_key)
         try:
             data = self._collect()
         except ValueError as exc:
@@ -444,73 +449,164 @@ class SettingsPage:
                 self._settings_feedback(f"设置有误：{exc}；未保存")
                 self._log_ui(f"[界面] 设置有误：{exc}\n")
             return False
-        key_saved = False
         try:
-            if new_key:
-                credentials.save(data["api"]["base_url"], self.v_api_key.get(), profile_id=self._api_selected)
-                key_saved = True
-                self.v_api_key.set("")
             prefs_mod.save(data, self.prefs_file)
-        except (OSError, credentials.CredentialError) as exc:
+        except (OSError, ValueError) as exc:
             if not silent:
-                self._settings_feedback(("新密钥已保存，但配置保存失败：" if key_saved else "保存失败：") + str(exc))
+                self._settings_feedback("保存失败：" + str(exc))
                 self._log_ui(f"[界面] 保存失败：{exc}\n")
             return False
         self.prefs = data
         self._api_profiles = data["api_profiles"]
-        self.api_selector.configure(values=[p["provider"] for p in self._api_profiles.values()])
-        self.api_selector.current(list(self._api_profiles).index(self._api_selected))
+        self.v_api["protocol"].set(data["api"]["protocol"])
+        self._api_drafts.pop(self._api_selected, None)
+        self._refresh_api_selector()
         self._api_key_status()
         if hasattr(self, "automation"):
             self.automation.refresh_profiles()
         self.v_summary_schedule_desc.set(self._summary_schedule_desc())
         n_groups = len(data["groups"]) or "全部"
         self._settings_feedback(
-            ("保存成功 · 新密钥已配置（仅本地保存，未验证 API 可用性）" if key_saved else "保存成功 · 密钥未更改")
+            ("保存成功 · 密钥未更改" + ("（输入中的新密钥仍待单独保存）" if self.v_api_key.get().strip() else ""))
             + f" · 新任务使用 {data['api']['provider']} / {data['api']['model']} · 摘要约 {data['summary_target_chars']} 字 · 群 {n_groups}"
             + ("（其他非 API 服务设置重启后生效）" if self.proc else "")
         )
         return True
 
 
+    def _refresh_api_selector(self) -> None:
+        self.api_selector.configure(values=[
+            f"{p['provider']} / {p['model']} [{name}]" for name, p in self._api_profiles.items()])
+        self.api_selector.current(list(self._api_profiles).index(self._api_selected))
+
+
+    def _remember_api_draft(self) -> None:
+        self._api_drafts[self._api_selected] = {key: var.get() for key, var in self.v_api.items()}
+        self._api_key_drafts[self._api_selected] = self.v_api_key.get()  # 密钥草稿只留内存且按配置隔离。
+
+
+    def _persist_api_catalog(self, profiles: dict, active: str, **extra) -> bool:
+        data = {**self.prefs, **extra, "api_profiles": profiles, "active_api_profile": active, "api": profiles[active]}
+        try:
+            prefs_mod.save(data, self.prefs_file)  # 不收集其他页面草稿，避免无关输入错误阻断API操作。
+        except (OSError, ValueError) as exc:
+            self._settings_feedback("API 配置保存失败：" + str(exc))
+            return False
+        self.prefs, self._api_profiles = data, profiles
+        return True
+
+
+    def save_api_profile(self) -> bool:
+        try:
+            profile = api_settings.validate({key: var.get() for key, var in self.v_api.items()})
+        except ValueError as exc:
+            self._settings_feedback(f"API 参数有误：{exc}；未保存")
+            return False
+        profiles = {**self._api_profiles, self._api_selected: profile}
+        if not self._persist_api_catalog(profiles, self._api_selected):
+            return False
+        self._api_drafts.pop(self._api_selected, None)
+        self.v_api["protocol"].set(profile["protocol"])
+        self._refresh_api_selector()
+        self._api_key_status()
+        self.automation.refresh_profiles()
+        self._settings_feedback("API 参数已保存；密钥未更改，在途任务保持原配置")
+        return True
+
+
+    def save_api_key(self) -> bool:
+        key = self.v_api_key.get().strip()
+        if not key:
+            self._settings_feedback("没有输入新密钥；已有密钥未更改")
+            return False
+        security.register(key)
+        try:
+            url = api_settings.endpoint(self.v_api["base_url"].get())
+            if url != self._api_profiles[self._api_selected]["base_url"]:
+                raise ValueError("API 地址尚未保存，请先保存 API 参数或以当前参数新增配置")
+            credentials.save(url, key, profile_id=self._api_selected)  # 纯密钥操作，不写偏好或其它页面参数。
+        except (ValueError, OSError, credentials.CredentialError) as exc:
+            self._settings_feedback("密钥保存失败：" + str(exc))
+            return False
+        self._api_key_drafts.pop(self._api_selected, None)
+        self.v_api_key.set("")
+        self._api_key_status()
+        self._settings_feedback("保存成功 · 新密钥已配置（仅 Windows 本地保存，未验证 API 可用性）；API 参数未更改")
+        return True
+
+
     def _show_api_profile(self, active: str) -> None:
         self._api_selected = active
-        self.api_selector.configure(values=[p["provider"] for p in self._api_profiles.values()])
-        self.api_selector.current(list(self._api_profiles).index(active))
+        self._refresh_api_selector()
+        draft = self._api_drafts.get(active, self._api_profiles[active])
         for key, var in self.v_api.items():
-            var.set(str(self._api_profiles[active][key]))
-        self.v_api_key.set("")
+            var.set(str(draft[key]))
+        self.v_api_key.set(self._api_key_drafts.get(active, ""))
         self._api_key_status()
 
 
     def _select_api_profile(self, _event=None) -> None:
-        selected = list(self._api_profiles)[self.api_selector.current()]
+        index = self.api_selector.current()
+        if index < 0:
+            return
+        selected = list(self._api_profiles)[index]
         previous = self._api_selected
         if selected == previous:
             return
-        if not self.save_prefs():
+        self._remember_api_draft()
+        if not self._persist_api_catalog(self._api_profiles, selected):
             self.api_selector.current(list(self._api_profiles).index(previous))
             return
         self._show_api_profile(selected)
-        if not self.save_prefs():
-            self._show_api_profile(previous)
+        self._settings_feedback(f"已切换摘要与提示词 API：{selected}；各配置的未保存参数和密钥草稿保留在当前窗口")
 
 
     def add_api_profile(self) -> None:
-        if not self.save_prefs():
+        try:
+            profile = api_settings.validate({key: var.get() for key, var in self.v_api.items()})
+        except ValueError as exc:
+            self._settings_feedback(f"无法新增：{exc}；当前输入已保留")
             return
         i = 1
-        while f"custom_{i}" in self._api_profiles:
+        removed = self.prefs.get("deleted_api_profiles", [])
+        while f"custom_{i}" in self._api_profiles or f"custom_{i}" in removed:
             i += 1
         name = f"custom_{i}"
-        self._api_profiles[name] = {**api_settings.DEFAULTS, "provider": f"自定义 {i}"}
+        self._remember_api_draft()
+        if not self._persist_api_catalog({**self._api_profiles, name: profile}, name):
+            return
         self._show_api_profile(name)
-        self._settings_feedback("新配置待填写并保存；未保存前继续使用原配置。密钥需单独设置。")
+        self.automation.refresh_profiles()
+        self._settings_feedback(f"已按当前参数新增并保存配置 {name}；原配置未覆盖，密钥需单独设置")
+
+
+    def delete_api_profile(self) -> None:
+        selected = self._api_selected
+        if len(self._api_profiles) <= 1:
+            self._settings_feedback("至少保留一个 API 配置，当前配置未删除")
+            return
+        if not messagebox.askyesno("删除 API 配置", f"删除配置 {selected}？\n历史用量与系统凭据保留，在途任务仍可恢复。\n若图片使用此配置，将改为跟随摘要 API。", parent=self.root):
+            self._settings_feedback("已取消删除 API 配置")
+            return
+        profiles = {name: profile for name, profile in self._api_profiles.items() if name != selected}
+        active = next(iter(profiles))
+        removed = list(dict.fromkeys([*self.prefs.get("deleted_api_profiles", []), selected]))
+        extra = {"deleted_api_profiles": removed}
+        if self.prefs.get("image_api_profile", self.cfg.get("media", {}).get("image_api_profile", "")) == selected:
+            extra["image_api_profile"] = ""
+        if not self._persist_api_catalog(profiles, active, **extra):
+            return
+        self._api_drafts.pop(selected, None)
+        self._api_key_drafts.pop(selected, None)
+        self._show_api_profile(active)
+        self.automation.refresh_profiles()
+        self._settings_feedback(f"已删除配置 {selected}；系统凭据与历史记录保留，当前摘要配置为 {active}")
 
 
     def _api_key_status(self) -> None:
+        self._api_location_status()
         if self.v_api_key.get().strip():
-            self.v_api_key_status.set("新密钥尚未保存；点击下方「保存配置 / 替换密钥」后生效")
+            self.v_api_key_status.set("新密钥尚未保存；点击下方「保存 / 替换密钥」后生效")
             self.v_api_feedback.set("新密钥待保存；此前的保存结果不代表本次输入已保存")
             return
         try:
@@ -520,9 +616,26 @@ class SettingsPage:
             self.v_api_key_status.set("无法读取密钥或地址无效")
 
 
+    def _api_location_status(self) -> None:
+        local = self.ui_dir / "config.local.yaml"
+        config = Path(self.config_path) if self.config_path else local if local.exists() else self.ui_dir.parent / "config.yaml"
+        active = self.prefs.get("active_api_profile", self.cfg.get("active_api_profile", "openai"))
+        image = self.prefs.get("image_api_profile", self.cfg.get("media", {}).get("image_api_profile", "")) or active
+        try:
+            target = credentials.target_name(self.v_api["base_url"].get(), self._api_selected)
+        except ValueError:
+            target = "地址无效，尚无可定位凭据"
+        self.v_api_locations.set(
+            f"主配置：{config.resolve()}\n个人配置：{self.prefs_file.resolve()}\n"
+            f"已保存 {len(self._api_profiles)} 套 API 参数；正在编辑：{self._api_selected}\n"
+            f"用途绑定：摘要／提示词更新共用 {active}；图片分析使用 {image}\n"
+            f"密钥不在 YAML 文件中：Windows 凭据管理器（当前登录用户）→ {target}")
+
+
     def delete_api_key(self) -> None:
         try:
             credentials.delete(api_settings.endpoint(self.v_api["base_url"].get()), profile_id=self._api_selected)
+            self._api_key_drafts.pop(self._api_selected, None)
             self.v_api_key.set("")
             self._api_key_status()
             self._settings_feedback("此地址的密钥已删除；在途请求可能继续完成，后续请求不再使用该密钥")

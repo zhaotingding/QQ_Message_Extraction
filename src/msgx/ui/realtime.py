@@ -555,15 +555,19 @@ class RealtimePage:
             vision = (r.get("vision_text") or "").strip()
             body = " ".join(body.split())[:300]
             ocr = " ".join((r.get("ocr_text") or "").split())
-            if r.get("has_media") and ocr:
+            if r.get("has_media") and (vision or ocr):
                 # 给 OCR 留出预览空间；完整正文与逐图识别结果仍保留在消息详情。
                 caption = " ".join(prefs_mod.plain_text(raw).split())
                 if len(caption) > 100:
                     caption = caption[:100] + "…"
-                preview = ocr[:180] + ("…" if len(ocr) > 180 else "")
-                body = f"{caption} [图片] OCR:{preview}".strip()
+                picture_text = " ".join((vision or ocr).split())  # 成功语义替代列表 OCR，原 OCR 仍可在详情核对。
+                preview = picture_text[:180] + ("…" if len(picture_text) > 180 else "")
+                body = f"{caption} [图片] {'语义' if vision else 'OCR'}:{preview}".strip()
             if r.get("has_media") and r.get("screen_state") in ("done", "blocked"):
                 body += f" · 初筛:{int(r.get('screen_score') or 0)}"  # 复用内容列，不增加宽列。
+            if r.get("auto_state") == "waiting":
+                ready = float(r.get("auto_ready_at") or 0)
+                body += " · 待分析" + (f" {datetime.fromtimestamp(ready, BEIJING):%H:%M}" if ready else "")
             state = self._media_label(r)
             tags: list[str] = []
             if r.get("keyword_matches"):
@@ -623,12 +627,14 @@ class RealtimePage:
             if row.get("has_media"):
                 detail += (f"\n\n图片 {row.get('image_index', 1)} / {row.get('image_count', 1)}"
                            f"\nOCR:\n{row.get('ocr_text') or '（无文字）'}\n\n"
-                           f"图片语义：\n{row.get('vision_text') or '（尚未手动识别）'}")
+                           f"图片语义：\n{row.get('vision_text') or '（尚未生成）'}")
                 if row.get("screen_state") in ("done", "blocked"):
                     detail += f"\n\n本地重要度：{int(row.get('screen_score') or 0)}/100\n筛选理由：{row.get('screen_reason') or '未提供'}"
-                states = {"running": "正在分析", "ok": "分析完成", "unknown": "结果未知，等待人工核对", "cached": "复用已有分析"}
+                states = {"waiting": "已标记，等待15分钟上下文", "running": "正在分析", "ok": "分析完成", "unknown": "结果未知，等待人工核对", "cached": "复用已有分析"}
                 if row.get("auto_state"):
                     detail += f"\n自动分析状态：{states.get(row['auto_state'], row['auto_state'])}"
+                if row.get("auto_state") == "waiting" and row.get("auto_ready_at"):
+                    detail += f"\n最早分析时间：{datetime.fromtimestamp(float(row['auto_ready_at']), BEIJING):%Y-%m-%d %H:%M:%S}（仍受开关与限额约束）"
         if self.rt_detail.get("1.0", "end-1c") == detail:
             return
         self.rt_detail.configure(state="normal")

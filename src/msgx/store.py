@@ -257,6 +257,8 @@ class Store(MessageStore, SummaryStore, UsageStore, ImageAnalysisStore):
                           "(account TEXT PRIMARY KEY, group_ids TEXT NOT NULL, updated_at REAL NOT NULL)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_image_screen ON message_images(screen_state,id)"
                           " WHERE media_state='done' AND media_path<>''")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_image_screen_version ON message_images(screen_state,screen_version,id)"
+                          " WHERE media_state='done' AND media_path<>''")  # 新规则扫完后直接命中空范围，不每轮遍历旧 done。
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_image_auto ON message_images(auto_state,screen_score,id)"
                           " WHERE screen_state='done' AND vision_state<>'ok'")
         self._migrate_accounts(backfill=version < 705)

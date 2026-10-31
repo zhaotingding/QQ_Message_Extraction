@@ -52,7 +52,8 @@ def validate(values: dict) -> dict:
             raise ValueError("服务名称或模型名称无效，请勿填写密钥")
         out[key] = text
     if out["protocol"] not in ("responses", "chat_completions"):
-        raise ValueError("接口格式必须是 responses 或 chat_completions")
+        raise ValueError("接口格式必须是 responses；旧 chat_completions 设置会迁移")
+    out["protocol"] = "responses"  # 公开配置统一Responses；历史在途请求由LLM恢复原协议快照。
     if out["reasoning"] not in ("none", "low", "medium", "high", "xhigh", "max"):
         raise ValueError("思考强度无效")
     if out["currency"] not in ("USD", "CNY"):
@@ -91,7 +92,7 @@ def apply(cfg: dict, values: dict) -> dict:
 def deepseek_profile(llm: dict) -> dict:
     """只迁移旧配置的公开参数，不读取或复制旧密钥。"""
     return validate({**DEFAULTS, "provider": "DeepSeek", "base_url": llm["base_url"],
-                     "model": llm["model"], "protocol": "chat_completions", "service_tier": "default",
+                     "model": llm["model"], "protocol": "responses", "service_tier": "default",
                      "context_tokens": 1000000, "max_output_tokens": 393216, "currency": "CNY",
                      "input_price": llm["price_cache_miss_cny_per_mtok"],
                      "cached_price": llm["price_cache_hit_cny_per_mtok"],
@@ -104,18 +105,27 @@ def catalog(cfg: dict, prefs: dict) -> tuple[dict, str]:
     from .config import DEFAULTS as CONFIG_DEFAULTS
     profiles = {"openai": dict(DEFAULTS), "deepseek": deepseek_profile(CONFIG_DEFAULTS["llm"])}
     profiles.update(cfg.get("api_profiles", {}))
+    removed = prefs.get("deleted_api_profiles", [])  # 删除内置或主配置预设后，不在下次加载时重新补回。
+    if not isinstance(removed, list) or any(not isinstance(name, str) or not name.isidentifier() or len(name) > 64 for name in removed):
+        raise ValueError("已删除 API 配置列表无效")
+    for name in removed:
+        profiles.pop(name, None)
     saved = prefs.get("api_profiles")
     if saved is not None:
         if not isinstance(saved, dict) or not saved:
             raise ValueError("API 配置列表无效")
-        profiles.update(saved)
+        profiles.update({name: profile for name, profile in saved.items() if name not in removed})
     elif "api" in prefs:
         # 兼容初版 0.7.0 的单配置；自定义地址也原样保留。
         profiles["openai"] = prefs["api"]
     profiles = {name: validate(value) for name, value in profiles.items()}
+    if not profiles:
+        raise ValueError("至少需要保留一个 API 配置")
     if any(not isinstance(name, str) or not name.isidentifier() or len(name) > 64 for name in profiles):
         raise ValueError("API 配置标识无效")
     active = prefs.get("active_api_profile", cfg.get("active_api_profile", "openai"))
+    if active in removed:
+        active = next(iter(profiles))  # 旧主配置仍引用已删预设时，使用保留下来的首项；UI删除会明确保存新绑定。
     if active not in profiles:
         raise ValueError("所选 API 配置不存在")
     return profiles, active

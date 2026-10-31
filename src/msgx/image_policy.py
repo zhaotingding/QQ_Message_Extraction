@@ -6,6 +6,37 @@ import re
 from dataclasses import dataclass
 
 
+SCREEN_VERSION = 2  # 规则变化后仅重筛时间范围内的旧记录，不重跑下载和 OCR。
+ANALYSIS_DELAY_SECONDS = 15 * 60  # 从首次达到阈值的标记时间起等待后续群聊。
+
+# 2026-10-31：最近14个去重日报的主题命中天数；周报只复核主题，不重复计频。
+# 权重 = 16 + min(16, 2 * 命中天数)，同主题重复最多计两次，第二次只加半权。
+KEYWORD_RULES = tuple((name, re.compile(pattern, re.I | re.ASCII), 16 + min(16, 2 * days)) for name, pattern, days in (
+    ("Agent与多代理", r"\bagent(?:s|ic)?\b|多\s*agent|多代理|子代理|智能体", 13),
+    ("Codex", r"\bcodex\b", 12),
+    ("Claude Code", r"\bclaude\s*code\b", 3),
+    ("Skill与工作流", r"\bskills?\b|技能|工作流|harness", 12),
+    ("MCP与工具调用", r"\bmcp\b|工具调用|function\s*call", 8),
+    ("上下文与记忆", r"上下文|context|记忆|压缩", 13),
+    ("RAG与检索", r"\brag\b|检索增强|知识库|向量检索", 6),
+    ("推理与思考", r"推理|reasoning|thinking|思考预算", 7),
+    ("量化与精度", r"量化|\bint[48]\b|\bbf16\b|\bfp[148]+\b", 4),
+    ("LoRA与微调", r"\blora\b|微调|蒸馏", 2),
+    ("训练与梯度", r"训练|梯度|\bloss\b|学习率|优化器", 1),
+    ("性能与延迟", r"吞吐|延迟|性能|tokens?/s|\bfps\b", 11),
+    ("本地部署与推理服务", r"本地部署|本地模型|\bvllm\b|\bollama\b|推理服务", 7),
+    ("GPU与显存", r"\bcuda\b|\bgpu\b|显存|\boom\b|内存占用", 9),
+    ("API与限流", r"\bapi\b|\bresponses?\b|限流|\b429\b|速率限制", 13),
+    ("报错与故障", r"traceback|runtimeerror|exception|error[:：]|故障|报错|崩溃", 9),
+    ("安全漏洞", r"\bcve[- ]?\d*|漏洞|入侵|勒索|加密勒索", 5),
+    ("权限与沙箱", r"权限|沙箱|sandbox|隔离", 12),
+    ("版本与恢复", r"\bgit\b|回滚|备份|版本控制|恢复", 11),
+    ("缓存与成本", r"缓存|cache|token消耗|成本", 14),
+    ("评测与对照", r"评测|benchmark|消融|对照实验|准确率", 5),
+    ("数据库与存储", r"数据库|\bredis\b|\bsql\b|持久化|存储", 3),
+))
+
+
 @dataclass(frozen=True)
 class ImageDecision:
     score: int
@@ -39,26 +70,22 @@ def screen_image(ocr: str, context: str, *, sticker: bool = False, animated: boo
     if len(ad_hits) >= 2 and not technical:
         return ImageDecision(0, "广告/交易特征：" + "、".join(dict.fromkeys(ad_hits))[:100], True)
     score, reasons = 0, []
-    if technical:
-        score += 65
-        reasons.append("明确报错或可复现诊断")
-    if re.search(r"(?:def |class |import |pip install|git clone|docker run|SELECT .+ FROM |[{};].*[{};])", text, re.I):
-        score += 45
-        reasons.append("代码/命令/配置")
-    if re.search(r"benchmark|吞吐|延迟|消融|对照实验|准确率|性能测试|tokens/s|推理速度|架构图|流程图", combined, re.I):
-        score += 35
-        reasons.append("测量/结构证据")
-    if len(text.strip()) >= 100:
-        score += 15
-        reasons.append("含可读细节")
-    if re.search(r"复现|解决|原因|怎么修|测试结果|修复|实现|对比数据", context or ""):
-        score += 20
-        reasons.append("上下文讨论具体问题")
+    for name, pattern, weight in KEYWORD_RULES:
+        hits = sum(1 for _ in zip(range(2), pattern.finditer(text)))  # 重复堆同词不会无限加分。
+        if hits:
+            points = weight + (weight // 2 if hits > 1 else 0)
+            score += points
+            reasons.append(f"{name}×{hits}:{points}")
+    if not score:
+        return ImageDecision(0, "OCR未命中近期报告主题，保留本地查看")  # 只有字数、只有上下文均不能触发上传。
+    if any(pattern.search((context or "")[:4000]) for _, pattern, _ in KEYWORD_RULES):
+        score += 10
+        reasons.append("相关上下文:+10")
     if ad_hits:
         score -= 35
         reasons.append("含交易噪声降权")
     score = max(0, min(score, 100))
-    return ImageDecision(score, "；".join(reasons) or "缺乏明确技术证据，保留本地查看")
+    return ImageDecision(score, "；".join(reasons)[:500])
 
 
 DEFAULT_IMAGE_ANALYSIS = {
