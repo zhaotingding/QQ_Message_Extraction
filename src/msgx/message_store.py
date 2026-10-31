@@ -293,6 +293,10 @@ class MessageStore:
             " AND ocr_text<>'' LIMIT 1", (media_hash,),
         ).fetchone()
 
+    def mark_image_api_request(self, image_id: int) -> None:
+        self.conn.execute("UPDATE message_images SET vision_requested_at=? WHERE id=?", (time.time(), image_id))
+        self.conn.commit()  # 请求前落盘，重开后仍可识别已提交的图片。
+
     def set_image_result(self, image_id: int, *, ocr_text: str | None = None,
                          vision_text: str | None = None, media_path: str | None = None,
                          media_hash: str | None = None, media_state: str | None = None,

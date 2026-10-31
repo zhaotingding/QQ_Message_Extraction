@@ -57,6 +57,28 @@ class FeedbackTests(unittest.TestCase):
             self.root.tk.call("after", "cancel", callback)
         self.root.destroy()
 
+    def test_picture_settings_save_bypasses_unrelated_api_and_summary_drafts(self):
+        app = self.app
+        app.v_api["context_tokens"].set("尚未填完的API草稿")
+        app.v_summary_chars.set("无效摘要字数草稿")
+        controls = app.automation
+        controls.image_values["threshold"].set("50")
+        controls.image_values["daily_limit"].set("200")
+        controls.image_values["daily_budget_cny"].set("10")
+        prefs.save({"ui": {"theme": "dark"}, "personal_rule": "保留"}, app.prefs_file)
+        with patch.object(app, "_collect", side_effect=AssertionError("不得全页校验")), \
+                patch.object(settings.credentials, "save") as secret:
+            self.assertTrue(controls.save_image_settings())
+        secret.assert_not_called()
+        saved = prefs.load_raw(app.prefs_file)
+        self.assertEqual(saved["image_analysis"]["threshold"], 50)
+        self.assertEqual(saved["image_analysis"]["daily_limit"], 200)
+        self.assertEqual(saved["image_analysis"]["daily_budget_cny"], 10)
+        self.assertEqual(saved["ui"]["theme"], "dark")
+        self.assertEqual(saved["personal_rule"], "保留")
+        self.assertIn("保存成功", controls.image_save_status.get())
+        self.assertEqual(app.v_api["context_tokens"].get(), "尚未填完的API草稿")
+
     def test_unconfigured_status_does_not_start_or_save_anything(self):
         app = self.app
         app.prefs["qq_account"] = ""
@@ -505,6 +527,32 @@ class FeedbackTests(unittest.TestCase):
         self.root.update()
         self.assertTrue(app.api_feedback_label.winfo_ismapped())
         self.assertIn("保存成功", app.v_api_feedback.get())
+
+
+    def test_api_switch_preserves_other_modules_edited_directly_in_yaml(self):
+        app = self.app
+        external = {"image_analysis": {"enabled": False, "threshold": 80, "daily_limit": 200,
+                                       "daily_budget_cny": 10, "keyword_rules": []}, "ui": {"theme": "light"}}
+        prefs.save(external, app.prefs_file)
+        selected = app._api_selected
+        other = next(name for name in app._api_profiles if name != selected)
+        app.api_selector.current(list(app._api_profiles).index(other))
+        app._select_api_profile()
+        saved = prefs.load_raw(app.prefs_file)
+        self.assertEqual(saved["image_analysis"], external["image_analysis"])
+        self.assertEqual(saved["ui"], external["ui"])
+        self.assertEqual(saved["active_api_profile"], other)
+        self.assertEqual(app.prefs["image_analysis"]["threshold"], 80)
+
+    def test_reload_personal_yaml_applies_saved_theme_without_rewriting_file(self):
+        app = self.app
+        prefs.save({"ui": {"theme": "light"}, "image_analysis": {"threshold": 50, "daily_limit": 200, "daily_budget_cny": 10}}, app.prefs_file)
+        before = app.prefs_file.read_bytes()
+        app.reload_prefs()
+        self.assertEqual(app.theme.name, "light")
+        self.assertEqual(app.theme_controls.choice.get(), "浅色")
+        self.assertEqual(app.automation.image_values["threshold"].get(), "50")
+        self.assertEqual(app.prefs_file.read_bytes(), before)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 
 from .time_rules import BEIJING
-from .image_policy import ANALYSIS_DELAY_SECONDS, SCREEN_VERSION
+from .image_policy import ANALYSIS_DELAY_SECONDS, SCREEN_VERSION, rules_version
 
 
 IMAGE_COLUMNS = (
@@ -17,36 +17,37 @@ IMAGE_COLUMNS = (
     ("auto_attempted_at", "REAL NOT NULL DEFAULT 0"),
     ("auto_ready_at", "REAL NOT NULL DEFAULT 0"),
     ("screen_version", "INTEGER NOT NULL DEFAULT 0"),
+    ("vision_requested_at", "REAL NOT NULL DEFAULT 0"),
 )
 
 
 class ImageAnalysisStore:
-    def screening_images(self, limit: int = 5, history_days: int = 7) -> list:
+    def screening_images(self, limit: int = 5, history_days: int = 7, *, version: int = SCREEN_VERSION) -> list:
         sender_sql, sender_params = self._sender_condition("m.")
         select = "SELECT i.*,m.text,m.raw,m.group_id,m.ts FROM message_images i JOIN messages m ON m.id=i.message_row"
         common = " AND i.media_state='done' AND i.media_path<>'' AND " + sender_sql
         pending = list(self.conn.execute(select + " WHERE i.screen_state='pending'" + common +
                                         " ORDER BY i.id DESC LIMIT ?", (*sender_params, limit)))
-        filter_key = (sender_sql, sender_params)
+        filter_key = (sender_sql, sender_params, version)
         if getattr(self, "_screening_filter_key", None) != filter_key:
             self._screening_filter_key = filter_key
             self._screening_completed_days = 0  # 过滤规则改变后，先前隐藏的旧图需要重新检查。
         legacy = []
         if history_days > self._screening_completed_days:
-            legacy = list(self.conn.execute(select + " WHERE i.screen_state='done' AND i.screen_version<? AND m.ts>=?" + common +
-                                           " ORDER BY i.id DESC LIMIT ?", (SCREEN_VERSION, time.time()-history_days*86400, *sender_params, limit)))
+            legacy = list(self.conn.execute(select + " WHERE i.screen_state='done' AND i.screen_version<>? AND m.ts>=?" + common +
+                                           " ORDER BY i.id DESC LIMIT ?", (version, time.time()-history_days*86400, *sender_params, limit)))
             if not legacy:
                 self._screening_completed_days = history_days  # 本进程扫空后不再轮询过期旧图；扩大范围或重开再查。
         # 两个状态分支分别有界；新图始终由pending索引接续，不依赖旧图回筛缓存。
         return sorted(pending + legacy, key=lambda row: row["id"], reverse=True)[:limit]
 
-    def set_screen_result(self, image_id: int, decision, threshold: int = 70) -> None:
+    def set_screen_result(self, image_id: int, decision, threshold: int = 70, *, version: int = SCREEN_VERSION) -> None:
         now = time.time()
         eligible = not decision.blocked and decision.score >= threshold
         self.conn.execute("UPDATE message_images SET screen_score=?,screen_reason=?,screen_state=?,screened_at=?,screen_version=?,"
                           " auto_ready_at=CASE WHEN ? AND auto_ready_at=0 AND auto_state='' AND vision_state<>'ok' THEN ? ELSE auto_ready_at END,"
                           " auto_state=CASE WHEN ? AND auto_state='' AND vision_state<>'ok' THEN 'waiting' ELSE auto_state END WHERE id=?",
-                          (decision.score, decision.reason, "blocked" if decision.blocked else "done", now, SCREEN_VERSION,
+                          (decision.score, decision.reason, "blocked" if decision.blocked else "done", now, version,
                            eligible, now+ANALYSIS_DELAY_SECONDS, eligible, image_id))
         self.conn.commit()
 
@@ -83,10 +84,11 @@ class ImageAnalysisStore:
         group_sql = " AND m.group_id IN (" + ",".join("?" for _ in groups) + ")" if groups else ""
         current_scope, scope_params = self._activity_group_scope("m.group_id", account)
         eligible = (" FROM message_images i JOIN messages m ON m.id=i.message_row"
-                    " WHERE i.screen_state='done' AND i.screen_score>=? AND i.vision_state<>'ok' AND m.ts>=? AND " +
+                    " WHERE i.screen_state='done' AND i.screen_score>=? AND i.screen_version=? AND i.vision_state<>'ok' AND m.ts>=? AND " +
                     sender_sql + group_sql + " AND " + current_scope +
                     " AND (?='' OR EXISTS(SELECT 1 FROM message_receipts r WHERE r.message_row=m.id AND r.account=?))")
-        params = (options["threshold"], time.time()-options["history_days"]*86400, *sender_params, *groups, *scope_params, account, account)
+        params = (options["threshold"], rules_version(options.get("keyword_rules")), time.time()-options["history_days"]*86400,
+                  *sender_params, *groups, *scope_params, account, account)
         # 降低阈值后的新候选也从首次命中时计时；限定范围与每批5张，不全库反复写入。
         new = list(self.conn.execute("SELECT i.id" + eligible + " AND i.auto_state='' AND i.auto_ready_at=0 LIMIT 5", params))
         if new:

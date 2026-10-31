@@ -92,6 +92,7 @@ class RealtimePage:
         self.rt.bind("<ButtonRelease-1>", self._on_rt_click)
         self.rt.bind("<<TreeviewSelect>>", self._on_rt_select)
         # 交替行色便于阅读；与我相关的消息使用红字。
+        self.rt.tag_configure("image_api", background="#dff3e5")  # API图片优先绿色背景，本人/回复仍保留红字。
         self.rt.tag_configure("keyword", background="#fff2a8")
         self.rt.tag_configure("odd", background="#f5f7fa")
         self.rt.tag_configure("failed", foreground="#a15c00")
@@ -570,6 +571,8 @@ class RealtimePage:
                 body += " · 待分析" + (f" {datetime.fromtimestamp(ready, BEIJING):%H:%M}" if ready else "")
             state = self._media_label(r)
             tags: list[str] = []
+            if r.get("has_media") and (r.get("vision_requested_at") or vision):
+                tags.append("image_api")  # 绿色表示经过API分析，完成/失败以状态列为准。
             if r.get("keyword_matches"):
                 tags.append("keyword")
             if i % 2:
@@ -635,6 +638,8 @@ class RealtimePage:
                     detail += f"\n自动分析状态：{states.get(row['auto_state'], row['auto_state'])}"
                 if row.get("auto_state") == "waiting" and row.get("auto_ready_at"):
                     detail += f"\n最早分析时间：{datetime.fromtimestamp(float(row['auto_ready_at']), BEIJING):%Y-%m-%d %H:%M:%S}（仍受开关与限额约束）"
+                if row.get("vision_requested_at"):
+                    detail += f"\n图片 API 最近提交：{datetime.fromtimestamp(float(row['vision_requested_at']), BEIJING):%Y-%m-%d %H:%M:%S}（绿色仅标记调用，结果见状态）"
         if self.rt_detail.get("1.0", "end-1c") == detail:
             return
         self.rt_detail.configure(state="normal")

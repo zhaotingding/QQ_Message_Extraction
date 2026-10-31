@@ -536,5 +536,20 @@ class RealtimeGuiTests(unittest.TestCase):
         self.assertIn("最早分析时间", detail)
 
 
+    def test_only_api_attempt_or_saved_semantics_get_green_tag(self):
+        rows = sample_payload()["items"]
+        picture = next(row for row in rows if row.get("images"))
+        first, second = picture["images"]
+        first.update(vision_requested_at=picture["ts"], vision_text="", vision_state="failed")
+        second.update(vision_requested_at=0, vision_text="", auto_state="waiting")
+        picture["relation"] = "reply"
+        self.app._render_messages(rows)
+        first_iid, second_iid = (f"{picture['id']}:{image['id']}" for image in (first, second))
+        self.assertIn("image_api", self.app.rt.item(first_iid, "tags"))
+        self.assertIn("related", self.app.rt.item(first_iid, "tags"))
+        self.assertNotIn("image_api", self.app.rt.item(second_iid, "tags"))
+        self.assertEqual(str(self.app.rt.tag_configure("image_api", "background")), "#dff3e5")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

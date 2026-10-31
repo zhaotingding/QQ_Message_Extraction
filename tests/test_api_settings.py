@@ -450,8 +450,44 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "HTTP 400") as raised:
                 await self.llm.chat("x", "y")
         self.assertNotIn("private chat", str(raised.exception))
+
         self.assertNotIn(KEY, str(raised.exception))
         self.assertEqual(session.post.call_count, 1)
+
+    async def test_image_incomplete_keeps_ocr_marks_attempt_and_disables_thinking(self):
+        from PIL import Image
+        from msgx.media import MediaWorker
+        from msgx.models import Msg
+        image = Path(self.tmp.name) / "incomplete-image.png"
+        Image.new("RGB", (16, 16), "white").save(image)
+        self.cfg["api"]["reasoning"] = "high"
+        row_id = self.store.insert_message(Msg(msg_id="incomplete", group_id="g", text="错误截图[图片]", image_urls=["image-test"]))
+        image_id = self.store.conn.execute("SELECT id FROM message_images WHERE message_row=?", (row_id,)).fetchone()[0]
+        self.store.set_image_result(image_id, media_path=str(image), media_state="done", ocr_text="原始OCR保留")
+        worker = MediaWorker(self.cfg, self.store, self.llm)
+        session = Mock()
+        session.post.return_value = Response(self.response(status="incomplete"))
+        try:
+            with patch.object(self.llm, "snapshot", return_value=self.llm), patch.object(self.llm, "session", AsyncMock(return_value=session)):
+                result = await worker.manual_vision(image_id)
+            self.assertEqual(result["state"], "failed")
+            saved = self.store.get_image(image_id)
+            self.assertEqual(saved["ocr_text"], "原始OCR保留")
+            self.assertEqual(saved["vision_text"], "")
+            self.assertGreater(saved["vision_requested_at"], 0)
+            self.assertEqual(session.post.call_count, 1)
+            body = json.loads(session.post.call_args.kwargs["data"])
+            self.assertEqual(body["reasoning"]["effort"], "none")
+            self.assertIn("未完成", self.store.api_usage_details()["items"][0]["status"])
+        finally:
+            await worker.close()
+
+    async def test_image_local_precheck_does_not_mark_api_attempt(self):
+        callback = Mock()
+        with patch.object(self.llm, "budget_ok", return_value=False), patch.object(self.llm, "_accounted_post", new_callable=AsyncMock) as post:
+            self.assertEqual(await self.llm.describe_image("unused-file.png", "test", on_submitted=callback), ("", False))
+        callback.assert_not_called()
+        post.assert_not_awaited()
 
     async def test_incomplete_or_missing_terminal_is_not_saved_as_complete_or_retried(self):
         for events in ([{"type": "response.incomplete", "response": self.response("incomplete")}],

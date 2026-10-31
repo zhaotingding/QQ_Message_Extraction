@@ -41,6 +41,8 @@ class SettingsPage:
         canvas.bind("<Configure>", _fit)
         self._scroll_canvas = canvas
 
+        from .theme import build_theme_controls
+        build_theme_controls(self, tab)  # 外观独立保存到本机，不提交API或自动化草稿。
         api = ttk.LabelFrame(tab, text="API 配置（密钥独立加密保存）", padding=12)
         api.pack(fill="x", pady=(0, 12))
         selector = ttk.Frame(api)
@@ -464,6 +466,7 @@ class SettingsPage:
         self._api_key_status()
         if hasattr(self, "automation"):
             self.automation.refresh_profiles()
+            self.automation.saved_image_settings()  # 全页保存同样包含图片设置，清除该模块未保存提示。
         self.v_summary_schedule_desc.set(self._summary_schedule_desc())
         n_groups = len(data["groups"]) or "全部"
         self._settings_feedback(
@@ -486,13 +489,13 @@ class SettingsPage:
 
 
     def _persist_api_catalog(self, profiles: dict, active: str, **extra) -> bool:
-        data = {**self.prefs, **extra, "api_profiles": profiles, "active_api_profile": active, "api": profiles[active]}
+        patch = {**extra, "api_profiles": profiles, "active_api_profile": active, "api": profiles[active]}
         try:
-            prefs_mod.save(data, self.prefs_file)  # 不收集其他页面草稿，避免无关输入错误阻断API操作。
+            data = prefs_mod.update(patch, self.prefs_file)  # 只保存API字段，不把旧窗口快照写回其他模块的YAML。
         except (OSError, ValueError) as exc:
             self._settings_feedback("API 配置保存失败：" + str(exc))
             return False
-        self.prefs, self._api_profiles = data, profiles
+        self.prefs, self._api_profiles = {**self.prefs, **data}, profiles
         return True
 
 
@@ -684,6 +687,11 @@ class SettingsPage:
             return
         self.prefs = loaded
         self._load_into_widgets()
+        if hasattr(self, "theme"):
+            from .theme import theme_name
+            selected_theme = theme_name(loaded)
+            self.theme.apply(selected_theme)  # 手工编辑YAML后重新加载，也同步外观与下拉框。
+            self.theme_controls.choice.current(0 if selected_theme == "dark" else 1)
         self._settings_feedback("已重新加载设置" if self.prefs_file.exists() else "偏好文件尚不存在，已加载默认设置")
 
 

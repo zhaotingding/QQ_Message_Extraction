@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from .ui.theme import palette
 
 PURPOSE_COLORS = {"摘要总结": "#2563eb", "图片理解": "#b45309", "自动图片理解": "#15803d", "提示词更新": "#9333ea"}
 FONT = "Microsoft YaHei UI"
@@ -39,6 +40,11 @@ def day_description(series: dict[str, list[dict]], index: int) -> str:
 def draw_daily_costs(canvas, series: dict[str, list[dict]]) -> tuple[float, float]:
     """返回绘图区横坐标范围，供界面显示鼠标所在日期的金额。"""
     canvas.delete("all")
+    colors = palette(canvas)
+    purpose_colors = ({"摘要总结": "#82b6ff", "图片理解": "#f2c16d", "自动图片理解": "#81d6a0", "提示词更新": "#c7a4ff"}
+                      if colors["name"] == "dark" else PURPOSE_COLORS)
+    if hasattr(canvas, "winfo_toplevel"):
+        canvas._msgx_redraw = lambda: draw_daily_costs(canvas, series)  # 外观切换复用已缓存数据，不重新查账。
     width, height = max(canvas.winfo_width(), 260), max(canvas.winfo_height(), 145)
     left, right, bottom = 66, width - 18, height - 30
     columns = 4 if width >= 780 else 2 if width >= 360 else 1
@@ -47,8 +53,8 @@ def draw_daily_costs(canvas, series: dict[str, list[dict]]) -> tuple[float, floa
     rows = next(iter(series.values()))
     known = [row["cost_cny"] for values in series.values() for row in values if row["cost_cny"] is not None]
     ceiling = max(known, default=0) * 1.1 or 0.01
-    canvas.create_text(left, 15, text="人民币 / 元（本地估算）", anchor="w", fill="#555555", font=(FONT, 9))
-    for i, (purpose, color) in enumerate(PURPOSE_COLORS.items()):
+    canvas.create_text(left, 15, text="人民币 / 元（本地估算）", anchor="w", fill=colors["muted"], font=(FONT, 9))
+    for i, (purpose, color) in enumerate(purpose_colors.items()):
         x = (right - 490 if columns == 4 else left) + (i % columns) * 122
         y = legend_y + (i // columns) * 18
         canvas.create_line(x, y, x + 18, y, fill=color, width=2)
@@ -56,20 +62,20 @@ def draw_daily_costs(canvas, series: dict[str, list[dict]]) -> tuple[float, floa
     for tick in range(4):
         value = ceiling * tick / 3
         y = bottom - (bottom - top) * tick / 3
-        canvas.create_line(left, y, right, y, fill="#e5e7eb")
-        canvas.create_text(left - 7, y, text=f"{value:.4f}", anchor="e", fill="#666666", font=(FONT, 8))
-    canvas.create_line(left, top, left, bottom, right, bottom, fill="#999999")
+        canvas.create_line(left, y, right, y, fill=colors["grid"])
+        canvas.create_text(left - 7, y, text=f"{value:.4f}", anchor="e", fill=colors["muted"], font=(FONT, 8))
+    canvas.create_line(left, top, left, bottom, right, bottom, fill=colors["border"])
     count = len(rows)
     def x_for(index: int) -> float:
         return left + (right - left) * index / max(count - 1, 1)
     for index in sorted({0, (count - 1) // 2, count - 1}):
-        canvas.create_text(x_for(index), bottom + 16, text=rows[index]["day"][5:], fill="#666666", font=(FONT, 8))
+        canvas.create_text(x_for(index), bottom + 16, text=rows[index]["day"][5:], fill=colors["muted"], font=(FONT, 8))
     if not any(row["calls"] for values in series.values() for row in values):
         canvas.create_text((left + right) / 2, (top + bottom) / 2,
-                           text="最近 30 天暂无当前用途的消费记录", fill="#666666", font=(FONT, 10))
+                           text="最近 30 天暂无当前用途的消费记录", fill=colors["muted"], font=(FONT, 10))
         return left, right
     for purpose, values in series.items():
-        color = PURPOSE_COLORS[purpose]
+        color = purpose_colors[purpose]
         previous = None
         for index, row in enumerate(values):
             x = x_for(index)

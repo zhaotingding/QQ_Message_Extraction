@@ -19,7 +19,7 @@ class UsagePage:
     def _build_usage_tab(self, nb: ttk.Notebook) -> None:
         self.usage_tab = ttk.Frame(nb, padding=12)
         nb.add(self.usage_tab, text="消费明细")
-        self.usage_viewport = tk.Canvas(self.usage_tab, highlightthickness=0, yscrollincrement=24)
+        self.usage_viewport = tk.Canvas(self.usage_tab, highlightthickness=0)  # 不固定24像素对齐，窄窗滚到底时末行也必须完整可达。
         page_scroll = ttk.Scrollbar(self.usage_tab, command=self.usage_viewport.yview)
         self.usage_viewport.configure(yscrollcommand=page_scroll.set)
         page_scroll.pack(side="right", fill="y")

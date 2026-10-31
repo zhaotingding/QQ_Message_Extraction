@@ -8,6 +8,7 @@ import re
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
+from typing import Callable
 
 import aiohttp
 
@@ -173,7 +174,7 @@ class LLM:
         cfg["media"] = dict(self.cfg.get("media", {}))
         if "image_analysis" in saved:
             from .image_policy import validate_analysis
-            cfg["media"]["analysis"] = validate_analysis(saved["image_analysis"])
+            cfg["media"]["analysis"] = validate_analysis({**cfg["media"].get("analysis", {}), **saved["image_analysis"]})
         if "prompt_evolution" in saved:
             cfg["summary"]["prompt_evolution"] = dict(saved["prompt_evolution"])
         prompt = str(saved.get("summary_prompt") or "").strip()
@@ -721,14 +722,18 @@ class LLM:
 
     def _responses_payload(self, payload: dict) -> dict:
         inputs = []
+        has_image = False
         for message in payload["messages"]:
             content = message["content"]
             if isinstance(content, list):
+                has_image = has_image or any(item.get("type") == "image_url" for item in content)
                 content = [({"type": "input_text", "text": item["text"]} if item["type"] == "text" else
                             {"type": "input_image", "image_url": item["image_url"]["url"],
                              "detail": item["image_url"].get("detail", "low")}) for item in content]
             inputs.append({"role": message["role"], "content": content})
         effort = self.cfg.get("api", {}).get("reasoning", payload.get("reasoning_effort", "none"))
+        if has_image:
+            effort = payload.get("reasoning_effort", effort)  # 图片提取明确关闭思考，不能再被配置覆盖而吃满输出预算。
         background = bool(payload.get("background"))
         result = {"model": payload["model"], "input": inputs, "max_output_tokens": payload["max_tokens"],
                   "reasoning": {"effort": effort}, "store": background, "stream": not background}
@@ -835,7 +840,7 @@ class LLM:
         return min(2000, int(self.cfg.get("api", {}).get("max_output_tokens", 2000)))  # 尊重独立图片配置的更低上限。
 
     async def describe_image(self, path: str | Path, prompt: str, *, source_ids: list[int] | None = None,
-                             purpose: str = "图片理解") -> tuple[str, bool]:
+                             purpose: str = "图片理解", on_submitted: Callable[[], None] | None = None) -> tuple[str, bool]:
         """让模型读图，返回 ``(文本, 是否成功)``。
 
         临时失败返回 False；不可重试的 API 拒绝交给媒体层记录为 rejected，
@@ -872,10 +877,13 @@ class LLM:
             "reasoning_effort": "none",
         }
         try:
+            if on_submitted:
+                on_submitted()  # 本地检查通过后、提交前记录API尝试，OCR和等待不冒充调用。
             resp = await self._accounted_post(payload, purpose, source_ids)
-            text = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            choice = (resp.get("choices") or [{}])[0]
+            text = (choice.get("message") or {}).get("content") or ""
             text = text.strip()
-            return text, bool(text)
+            return text, bool(text) and choice.get("finish_reason") == "stop"  # 截断或未结束内容不能纳入摘要。
         except Exception as e:  # noqa: BLE001
             log.warning(
                 "图片语义提取失败（上传 %.0fKB）：%s", len(data) / 1024, e

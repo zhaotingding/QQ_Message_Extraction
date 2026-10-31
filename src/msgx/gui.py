@@ -47,6 +47,8 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
         self.stop_file = self.ui_dir / "stop.signal"
 
         self.prefs = prefs_mod.load(self.prefs_file)
+        from .ui.theme import ThemeManager
+        self.theme = ThemeManager(self.root)  # 外观与业务设置分离，后续切换只保存ui.theme。
         self.service = ServiceProcess()
         self._service_restart_id = None
         self.events: queue.Queue = queue.Queue()
@@ -99,6 +101,8 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
         self._group_ids: list[str] = []
         self._build()
         self._load_into_widgets()
+        from .ui.theme import theme_name
+        self.theme.apply(theme_name(self.prefs))  # 先完成原控件构建，再统一覆盖原固定浅色。
         self._apply_app_icon()
         self.refresh_groups()
         self.root.after(0, self.refresh_report_history)

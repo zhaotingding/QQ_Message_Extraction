@@ -6,16 +6,17 @@ import time
 from pathlib import Path
 
 from . import security
-from .image_policy import ANALYSIS_DELAY_SECONDS, is_sticker, screen_image, validate_analysis
+from .image_policy import ANALYSIS_DELAY_SECONDS, is_sticker, screen_image, validate_analysis, rules_version
 from .llm import LLM
 
 
-def local_decision(path: Path, row: dict, context: str):
+def local_decision(path: Path, row: dict, context: str, keyword_rules=None):
     from PIL import Image
     with Image.open(path) as image:
         animated = bool(getattr(image, "is_animated", False))
     return screen_image(row.get("ocr_text", ""), context,
-                        sticker=is_sticker(row.get("raw", ""), row.get("image_url", "")), animated=animated)
+                        sticker=is_sticker(row.get("raw", ""), row.get("image_url", "")), animated=animated,
+                        keyword_rules=keyword_rules)
 
 
 class ImageAnalysis:
@@ -29,20 +30,24 @@ class ImageAnalysis:
         from .prefs import load_from_env
         saved = load_from_env() or {}
         media = self.media.cfg.get("media", {})
-        return validate_analysis(saved.get("image_analysis", media.get("analysis", {}))), saved
+        override = saved.get("image_analysis", {})
+        if not isinstance(override, dict):
+            raise ValueError("本机图片设置必须是对象")
+        return validate_analysis({**media.get("analysis", {}), **override}), saved  # 缺省字段继承已加载值，空规则列表仍明确覆盖。
 
     async def process(self) -> int:
         options, _ = self.options()
+        version = rules_version(options["keyword_rules"])
         count = 0
-        for source in self.store.screening_images(5, options["history_days"]):
+        for source in self.store.screening_images(5, options["history_days"], version=version):
             row = dict(source)
             context = self.store.image_context(row["message_row"], options["context_messages"])
             try:
-                decision = await asyncio.to_thread(local_decision, Path(row["media_path"]), row, context)
+                decision = await asyncio.to_thread(local_decision, Path(row["media_path"]), row, context, options["keyword_rules"])
             except (OSError, ValueError):
                 from .image_policy import ImageDecision
                 decision = ImageDecision(0, "本地文件不可读取，未上传", True)
-            self.store.set_screen_result(row["id"], decision, options["threshold"])
+            self.store.set_screen_result(row["id"], decision, options["threshold"], version=version)
             count += 1
         if not options["enabled"]:
             self.status = {"state": "disabled", "message": "本地初筛运行，自动图片 API 已关闭"}

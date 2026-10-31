@@ -255,8 +255,10 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(selects), 2)
         self.assertTrue(all(query.endswith("LIMIT 5") for query in selects))
         plans = [[str(row[3]) for row in self.store.conn.execute("EXPLAIN QUERY PLAN " + query)] for query in selects]
-        self.assertTrue(any("idx_image_screen" in part for part in plans[0]), plans)
-        self.assertTrue(any("idx_image_screen_version" in part for part in plans[1]), plans)
+        for plan in plans:
+            self.assertTrue(any("SEARCH i" in part and "idx_image_screen" in part for part in plan), plans)
+            self.assertFalse(any("SCAN i" in part for part in plan), plans)  # 两分支走图片状态索引，不按特定索引名绑定优化器。
+        self.assertIn("i.screen_version<>", selects[1])  # 规则指纹无大小顺序，所有不同版本均须回筛。
 
     async def test_empty_rescreening_is_not_repeated_until_scope_expands(self):
         old = self.image("expired-legacy")
@@ -294,7 +296,7 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         cfg = api_settings.apply(self.cfg, {**api_settings.DEFAULTS, "max_output_tokens": 500})
         client = LLM(cfg, self.store)
         client.configure("test-only-key")
-        result = {"choices": [{"message": {"content": "图片说明"}}]}
+        result = {"choices": [{"message": {"content": "图片说明"}, "finish_reason": "stop"}]}
         with patch.object(client, "_accounted_post", AsyncMock(return_value=result)) as request:
             text, ok = await client.describe_image(self.path, "test")
         self.assertTrue(ok)
@@ -325,6 +327,43 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(image.cfg["active_api_profile"], "cheap")
         self.assertEqual(normal.llm["model"], "summary-model")
         self.assertEqual(normal.cfg["active_api_profile"], "openai")
+
+    async def test_changed_personal_rules_rescore_and_empty_list_does_not_upload(self):
+        row = self.image("changed-rules")
+        await self.worker.analysis.process()
+        before = self.store.get_image(row["id"])
+        self.assertGreaterEqual(before["screen_score"], 70)
+        self.cfg["media"]["analysis"]["keyword_rules"] = []
+        self.enable()
+        self.store.conn.execute("UPDATE message_images SET auto_ready_at=? WHERE id=?", (time.time()-1, row["id"]))
+        self.store.conn.commit()
+        await self.worker.analysis.process()
+        after = self.store.get_image(row["id"])
+        self.assertEqual(after["screen_score"], 0)
+        self.assertNotEqual(after["screen_version"], before["screen_version"])
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(after["ocr_text"], before["ocr_text"])
+
+    async def test_partial_saved_limits_keep_configured_rules_and_hidden_values(self):
+        self.cfg["media"]["analysis"].update(keyword_rules=[], context_messages=16)
+        saved = {"image_analysis": {"threshold": 50, "daily_limit": 200, "daily_budget_cny": 10}}
+        with patch("msgx.prefs.load_from_env", return_value=saved):
+            options, _ = self.worker.analysis.options()
+        self.assertEqual(options["keyword_rules"], [])
+        self.assertEqual(options["context_messages"], 16)
+        self.assertEqual(options["daily_limit"], 200)
+
+    async def test_old_high_score_is_not_uploaded_before_rule_rescore_finishes(self):
+        rows = [self.image(f"revision-{index}", digest=str(index)) for index in range(6)]
+        for row in rows:
+            self.store.set_screen_result(row["id"], screen_image("CUDA API RuntimeError:", ""))
+        self.store.conn.execute("UPDATE message_images SET auto_ready_at=?", (time.time()-1,))
+        self.store.conn.commit()
+        self.cfg["media"]["analysis"]["keyword_rules"] = []
+        self.enable()
+        await self.worker.analysis.process()  # 每批只重筛5张；余下旧高分不能作为新规则候选。
+        self.assertEqual(self.fake.calls, [])
+        self.assertGreaterEqual(self.store.get_image(rows[0]["id"])["screen_score"], 70)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from urllib.error import HTTPError
 
-from .. import security
+from .. import security, prefs as prefs_mod
 from ..image_policy import validate_analysis
 from ..local_client import request_json
 from ..time_rules import BEIJING
@@ -28,6 +28,9 @@ class AutomationControls:
         self.prompt_interval = tk.StringVar()
         self.prompt_status = tk.StringVar(value="尚未读取动态提示词记录")
         self.image_status = tk.StringVar(value="本地初筛无需额外模型；自动 API 默认关闭")
+        self.image_save_status = tk.StringVar(value="图片设置尚未读取")
+        self.image_dirty = False
+        self._loading_image = True  # 填入已保存值时不产生“未保存”提示。
         line = ttk.Frame(summary)
         line.pack(fill="x", pady=(8, 0))
         ttk.Checkbutton(line, text="启用提示词自更新", variable=self.prompt_enabled).pack(side="left")
@@ -70,6 +73,15 @@ class AutomationControls:
                   "先在上方创建并保存低价图片 API 配置，再在此选择；摘要继续使用上方选中的摘要配置。",
                   wraplength=850).grid(row=6, column=0, columnspan=2, sticky="w", pady=5)
         ttk.Label(frame, textvariable=self.image_status, wraplength=850).grid(row=7, column=0, columnspan=2, sticky="w")
+        save_row = ttk.Frame(frame)
+        save_row.grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 3))
+        ttk.Button(save_row, text="保存图片分析设置", command=self.save_image_settings).pack(side="left")
+        ttk.Button(save_row, text="编辑图片主题与评分规则", command=self.edit_image_rules).pack(side="left", padx=6)
+        ttk.Label(frame, textvariable=self.image_save_status, wraplength=850).grid(
+            row=9, column=0, columnspan=2, sticky="ew")
+        for variable in (self.image_enabled, *self.image_values.values()):
+            variable.trace_add("write", lambda *_: self.mark_image_dirty())
+        self.profile.bind("<<ComboboxSelected>>", lambda _event: self.mark_image_dirty())
 
     def refresh_profiles(self):
         old = self.profile_ids[self.profile.current()] if self.profile.current() >= 0 else self.page.prefs.get("image_api_profile", "")
@@ -79,34 +91,107 @@ class AutomationControls:
         self.profile.current(self.profile_ids.index(old) if old in self.profile_ids else 0)
 
     def load(self):
+        self._loading_image = True
         self.refresh_profiles()
         saved = self.page.prefs
         selected = saved.get("image_api_profile", self.page.cfg.get("media", {}).get("image_api_profile", ""))
         self.profile.current(self.profile_ids.index(selected) if selected in self.profile_ids else 0)
-        options = validate_analysis(saved.get("image_analysis", self.page.cfg.get("media", {}).get("analysis", {})))
+        options = validate_analysis({**self.page.cfg.get("media", {}).get("analysis", {}),
+                                     **saved.get("image_analysis", {})})  # 局部个人覆盖不抹掉主配置隐藏字段。
         self.image_enabled.set(options["enabled"])
         for key, var in self.image_values.items():
             var.set(str(options[key]))
+        self._loading_image = False
+        self.image_dirty = False
+        self.image_save_status.set(("已读取本地图片设置：" if "image_analysis" in saved or "image_api_profile" in saved else
+                                    "当前为初次默认值；保存后写入：") + self.image_settings_path())
         prompt = {"enabled": False, "days": 7, "interval_days": 7,
                   **self.page.cfg.get("summary", {}).get("prompt_evolution", {}), **saved.get("prompt_evolution", {})}
         self.prompt_enabled.set(prompt["enabled"])
         self.prompt_days.set(str(prompt["days"]))
         self.prompt_interval.set(str(prompt["interval_days"]))
 
-    def collect(self) -> dict:
-        base = {**self.page.cfg.get("media", {}).get("analysis", {}), **self.page.prefs.get("image_analysis", {})}
+    def image_settings_path(self) -> str:
+        path = getattr(self.page, "prefs_file", None)
+        return str(path.resolve()) if path is not None else "本地 preferences.yaml"
+
+    def mark_image_dirty(self) -> None:
+        if self._loading_image:
+            return
+        self.image_dirty = True
+        self.image_save_status.set("有未保存的图片设置；点击「保存图片分析设置」后生效并在更新时保留。")
+
+    def collect_image(self) -> dict:
+        latest = prefs_mod.load_raw(getattr(self.page, "prefs_file", None))
+        base = {**self.page.cfg.get("media", {}).get("analysis", {}), **self.page.prefs.get("image_analysis", {}),
+                **latest.get("image_analysis", {})}  # 手动YAML或规则编辑刚保存的隐藏字段优先于窗口旧快照。
         options = validate_analysis({**base, "enabled": self.image_enabled.get(), **{key: value.get() for key, value in self.image_values.items()}})
+        selected = self.profile.current()
+        if selected < 0:
+            raise ValueError("请选择已保存的图片 API 配置")
+        return {"image_api_profile": self.profile_ids[selected], "image_analysis": options}
+
+    def collect(self) -> dict:
+        image = self.collect_image()
         try:
             days, interval = int(self.prompt_days.get()), int(self.prompt_interval.get())
             if not 2 <= days <= 30 or not 1 <= interval <= 30:
                 raise ValueError
         except ValueError:
             raise ValueError("提示词材料天数为2～30，更新间隔为1～30天") from None
-        selected = self.profile.current()
-        if selected < 0:
-            raise ValueError("请选择已保存的图片 API 配置")
-        return {"image_api_profile": self.profile_ids[selected], "image_analysis": options,
+        return {**image,
                 "prompt_evolution": {"enabled": self.prompt_enabled.get(), "days": days, "interval_days": interval}}
+
+    def _image_feedback(self, message: str) -> None:
+        self.image_save_status.set(message)
+        if hasattr(self.page, "_settings_feedback"):
+            self.page._settings_feedback(message)
+        else:
+            self.page.status.set(message)
+
+    def saved_image_settings(self) -> None:
+        self.image_dirty = False
+        self.image_save_status.set("图片设置已保存：" + self.image_settings_path())
+
+    def save_image_settings(self) -> bool:
+        try:
+            data = prefs_mod.update(self.collect_image(), self.page.prefs_file)  # 不收集API、摘要或账号草稿。
+        except (OSError, ValueError) as exc:
+            self._image_feedback("图片设置保存失败：" + security.redact(str(exc)) + "；输入已保留")
+            return False
+        self.page.prefs.update(data)
+        self.saved_image_settings()
+        self._image_feedback("图片设置保存成功，后续任务读取此文件；在途任务保持原设置：" + self.image_settings_path())
+        return True
+
+    def save_image_rules(self, rules: list) -> bool:
+        try:
+            latest = prefs_mod.load_raw(self.page.prefs_file)
+            base = {**self.page.cfg.get("media", {}).get("analysis", {}), **self.page.prefs.get("image_analysis", {}),
+                    **latest.get("image_analysis", {})}
+            options = validate_analysis({**base, "keyword_rules": rules})
+            data = prefs_mod.update({"image_analysis": options}, self.page.prefs_file)  # 规则保存不提交其他图片草稿。
+        except (OSError, ValueError) as exc:
+            self._image_feedback("主题规则保存失败：" + security.redact(str(exc)) + "；原配置未修改")
+            return False
+        self.page.prefs.update(data)
+        self._image_feedback("主题规则已保存：" + self.image_settings_path() +
+                             ("；其他图片输入仍未保存" if self.image_dirty else "；后续初筛使用新规则"))
+        return True
+
+    def edit_image_rules(self) -> None:
+        from .image_rules import ImageRulesEditor
+        window = getattr(self, "_rules_window", None)
+        if window is not None and window.winfo_exists():
+            window.lift()
+            return
+        options = validate_analysis({**self.page.cfg.get("media", {}).get("analysis", {}),
+                                     **self.page.prefs.get("image_analysis", {})})
+        window = self._rules_window = tk.Toplevel(self.page.root)
+        window.title("图片主题与评分规则（本地配置）")
+        window.geometry("1000x660")
+        window.minsize(760, 520)
+        ImageRulesEditor(window, options["keyword_rules"], self.save_image_rules).pack(fill="both", expand=True)
 
     def send(self, action: str = "", body: dict | None = None):
         if self.busy:
