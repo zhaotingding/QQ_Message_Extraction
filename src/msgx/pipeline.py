@@ -80,6 +80,7 @@ class Pipeline(ProtocolSession, BillingCoordinator, SummaryScheduler):
             # 表现为「服务日志显示协议端已连接，但数据库里一条消息都没有」。
             asyncio.create_task(self._ingest_loop(), name="ingest"),
             asyncio.create_task(self._media_loop(), name="media"),
+            asyncio.create_task(self._image_analysis_loop(), name="image-analysis"),
             asyncio.create_task(self._prune_loop(), name="prune"),
             asyncio.create_task(self._billing_loop(), name="billing"),
             asyncio.create_task(self._watchdog_loop(), name="watchdog"),
@@ -193,6 +194,17 @@ class Pipeline(ProtocolSession, BillingCoordinator, SummaryScheduler):
                 log.warning("媒体循环异常: %s", e)
                 await asyncio.sleep(5)
 
+    async def _image_analysis_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                count = await self.media.analysis.process()
+                await asyncio.sleep(1 if count else 5)  # 空队列退避，不新增数据库高频轮询。
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("本地图片分析异常: %s", exc)
+                await asyncio.sleep(10)
+
     async def _prune_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -242,4 +254,6 @@ class Pipeline(ProtocolSession, BillingCoordinator, SummaryScheduler):
             "queue": self.ingest_q.qsize(),
             "counters": self.counters,
             "stats": self.store.stats(),
+            "image_analysis": dict(self.media.analysis.status),
+            "prompt_evolution": self.prompt_evolution.status(include_history=False),
         }

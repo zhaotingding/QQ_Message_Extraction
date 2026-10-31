@@ -336,6 +336,53 @@ class RealtimeGuiTests(unittest.TestCase):
         self.assertEqual(after, before)
         self.assertIn("失败", self.app.v_rt_status.get())
 
+    def test_activity_trend_uses_compact_group_number_and_only_redraws_changed_series(self):
+        payload = sample_payload()
+        payload["activity"]["trend"] = {"group_id": "1002", "group_name": "同名交流群", "days": 7,
+                                         "dates": ["2026-09-24", "2026-09-25", "2026-09-26"],
+                                         "counts": [5, 0, 3], "note": "保留数据；0不代表真实零活跃"}
+        self.render(payload)
+        self.assertEqual(self.app.rt_activity.item("1002", "values")[:2], ("同名交流群", "1002"))
+        self.assertLessEqual(self.app.rt_activity.column("id", "width"), 110)
+        self.assertEqual(self.app.rt_activity_chart.series["counts"], [5, 0, 3])
+        self.assertIn("0不代表", self.app.rt_activity_chart.note.cget("text"))
+        with patch.object(self.app.rt_activity_chart, "_draw") as draw:
+            self.render(payload)
+        draw.assert_not_called()
+
+    def test_removed_current_group_disappears_from_filter_and_older_trend_result_is_ignored(self):
+        self.render()
+        self.app._rt_group_id = "1002"
+        self.app.v_rt_group.set("同名交流群 (1002)")
+        payload = sample_payload()
+        payload["activity"]["groups"] = [payload["activity"]["groups"][1]]
+        self.app._render_activity(payload["activity"])
+        self.assertEqual(self.app._rt_group_id, "")
+        self.assertNotIn("1002", self.app._rt_group_labels.values())
+        self.app.v_activity_days.set("30")
+        payload["_activity_key"] = ("", 7)
+        with patch.object(self.app, "_render_activity") as render:
+            self.render(payload)
+        render.assert_not_called()
+
+    def test_image_screening_explains_score_and_prevents_duplicate_running_request(self):
+        payload = sample_payload()
+        payload["items"][1]["images"][0].update(screen_score=82, screen_state="done",
+                                               screen_reason="包含技术报错与上下文求助", auto_state="running")
+        self.render(payload)
+        self.select("2:201")
+        self.assertIn("初筛:82", self.app.rt.item("2:201", "values")[3])
+        self.assertIn("本地重要度：82/100", self.detail())
+        self.assertIn("包含技术报错", self.detail())
+        self.assertIn("自动分析状态：正在分析", self.detail())
+        columns = list(self.app.rt.cget("columns"))
+        with patch.object(self.app.rt, "identify_row", return_value="2:201"), \
+                patch.object(self.app.rt, "identify_column", return_value=f"#{columns.index('recognize') + 1}"), \
+                patch.object(self.app, "_start_rt_action") as action:
+            self.app._on_rt_click(SimpleNamespace(x=1, y=1))
+        action.assert_not_called()
+        self.assertIn("避免重复调用", self.app.status.get())
+
     def test_picture_actions_keep_image_identity_after_column_removal(self):
         self.render()
         app = self.app

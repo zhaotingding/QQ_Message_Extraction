@@ -101,6 +101,8 @@ class ProtocolSession:
         if self.target_account and uin != self.target_account:
             raise RuntimeError("协议端登录账号与设置的目标 QQ 不一致，请核对账号")
         data = await self.call_action("get_group_list", {}, 8.0)
+        if not isinstance(data, list) or not uin:
+            raise RuntimeError("未取得当前账号的完整群列表，保留原有群归属")
         keep: set[str] = set()
         for g in data or []:
             gid = str((g or {}).get("group_id") or "")
@@ -108,6 +110,7 @@ class ProtocolSession:
                 keep.add(gid)
                 self.store.upsert_group(gid, str((g or {}).get("group_name") or ""), uin)
         log.info("已从协议端拉取群列表：%d 个群（账号 %s）", len(keep), uin or "未知")
+        self.store.sync_account_groups(uin, keep)  # 成功的空列表也有效；退群只影响当前显示，历史仍保留。
         out = {"count": len(keep), "uin": uin, "deleted": [], "protected": []}
         if prune and keep:
             deleted, protected = self.store.prune_groups(keep)

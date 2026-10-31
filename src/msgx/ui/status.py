@@ -565,6 +565,8 @@ class StatusPage:
             f"其中已过滤 {c.get('filtered', 0)}）"
         )
         self._apply_summary_schedule(data)
+        if hasattr(self, "automation"):
+            self.automation.health(data)
 
         # 账单：优先用服务抓到的真实数据；没抓到就退回本地估算，并标明是估算。
         budget = float(data.get("budget_cny") or 0)

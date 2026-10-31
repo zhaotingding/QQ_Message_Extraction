@@ -46,7 +46,7 @@ async def main() -> None:
             check("启动不发起模型探测", pipe.llm._post.await_count == 0)
             check("启动只创建统一自动周期摘要任务",
                   {task.get_name() for task in pipe._tasks} ==
-                  {"ingest", "media", "prune", "billing", "watchdog", "summary-schedule"})
+                  {"ingest", "media", "image-analysis", "prune", "billing", "watchdog", "summary-schedule"})
             for mid, message in enumerate([
                 [{"type": "at", "data": {"qq": "all"}}, {"type": "text", "data": {"text": "紧急通知"}}],
                 "[CQ:at,qq=all]紧急通知",

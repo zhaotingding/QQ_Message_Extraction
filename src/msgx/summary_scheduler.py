@@ -9,6 +9,7 @@ from .llm import BudgetExceeded, IncompleteResponse, RetryableRequestError, Back
 from .summarize import MissingSummary, period_parts, summary_chars
 
 from .time_rules import BEIJING as SHANGHAI
+from .prompt_evolution import PromptEvolution
 
 log = logging.getLogger("msgx.summary_scheduler")
 
@@ -25,6 +26,7 @@ class SummaryScheduler:
         self.daily_schedule = {"state": "idle", "message": "", "day": ""}
         self.summary_schedule = {"state": "idle", "message": "", "kind": "", "start_date": "", "end_date": ""}
         self._summary_recovered = False
+        self.prompt_evolution = PromptEvolution(self.cfg, self.store, self.llm)  # 共用当前摘要调度，不另起收费循环。
 
     def _ensure_summary_baselines(self, today: date) -> None:
         if self.store.auto_daily_start() is None:
@@ -257,6 +259,8 @@ class SummaryScheduler:
             self._summary_wake.clear()
             try:
                 await self._catch_up_summaries()
+                if not self._stop.is_set():
+                    await self.prompt_evolution.check()  # 到期日报/周报/月报处理后，再更新近期动态。
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -275,6 +279,11 @@ class SummaryScheduler:
                 await asyncio.wait_for(self._summary_wake.wait(), timeout=wait)
             except asyncio.TimeoutError:
                 pass
+
+    def request_prompt_update(self, *, confirmed: bool = False) -> dict:
+        result = self.prompt_evolution.queue(confirmed=confirmed)  # HTTP请求只排队，实际调用仍由单一循环持有。
+        self._summary_wake.set()
+        return result
 
 
     def summary_schedule_status(self, now: datetime | None = None) -> dict:

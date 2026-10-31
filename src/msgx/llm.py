@@ -145,15 +145,21 @@ class LLM:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    def snapshot(self) -> LLM:
+    def snapshot(self, role: str = "summary") -> LLM:
         """新任务读取已保存选择，在途任务保留自己的配置和费率。"""
         from . import api_settings, prefs
         from .config import api_key
         saved = prefs.load_from_env() or {}
         if "api" not in self.cfg and "api_profiles" not in saved and not any(
-                key in saved for key in ("summary_prompt", "summary_target_chars")):
+                key in saved for key in ("summary_prompt", "summary_target_chars", "image_analysis", "image_api_profile", "prompt_evolution")) and role != "image":
             return self
         cfg = {**self.cfg, "summary": dict(self.cfg.get("summary", {}))}
+        cfg["media"] = dict(self.cfg.get("media", {}))
+        if "image_analysis" in saved:
+            from .image_policy import validate_analysis
+            cfg["media"]["analysis"] = validate_analysis(saved["image_analysis"])
+        if "prompt_evolution" in saved:
+            cfg["summary"]["prompt_evolution"] = dict(saved["prompt_evolution"])
         prompt = str(saved.get("summary_prompt") or "").strip()
         if prompt:
             cfg["summary"]["prompt"] = prompt
@@ -167,6 +173,14 @@ class LLM:
             profiles, active = api_settings.catalog(cfg, saved)
             cfg = api_settings.apply(cfg, profiles[active])
             cfg.update(api_profiles=profiles, active_api_profile=active)
+        if role == "image":
+            selected = str(saved.get("image_api_profile", cfg["media"].get("image_api_profile", "")) or "")
+            if selected:
+                profiles, _ = api_settings.catalog(cfg, saved)
+                if selected not in profiles:
+                    raise ValueError("图片 API 配置已不存在，请重新选择并保存")
+                cfg = api_settings.apply(cfg, profiles[selected])
+                cfg.update(api_profiles=profiles, active_api_profile=selected)
         result = LLM(cfg, self.store)
         result.configure(api_key(cfg))
         result._session_owner = self._session_owner or self
@@ -778,6 +792,9 @@ class LLM:
         mime = {"jpg": "jpeg", "png": "png", "gif": "gif", "webp": "webp"}.get(suffix, "jpeg")
         return path.read_bytes(), f"image/{mime}"
 
+    def image_output_limit(self) -> int:
+        return min(2000, int(self.cfg.get("api", {}).get("max_output_tokens", 2000)))  # 尊重独立图片配置的更低上限。
+
     async def describe_image(self, path: str | Path, prompt: str, *, source_ids: list[int] | None = None,
                              purpose: str = "图片理解") -> tuple[str, bool]:
         """让模型读图，返回 ``(文本, 是否成功)``。
@@ -810,7 +827,7 @@ class LLM:
                     ],
                 }
             ],
-            "max_tokens": 2000,
+            "max_tokens": self.image_output_limit(),
             "temperature": 0.2,
             "stream": False,
             "reasoning_effort": "none",

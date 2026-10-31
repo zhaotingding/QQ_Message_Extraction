@@ -4,9 +4,71 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from datetime import date, datetime, time as day_time
+
+from .time_rules import BEIJING
 
 
 class SummaryStore:
+    def prompt_source_reports(self, start: str, end: str) -> list[dict]:
+        bounds = [datetime.combine(date.fromisoformat(day), day_time.min, BEIJING).timestamp() for day in (start, end)]
+        rows = self.conn.execute("SELECT id,window_start,window_end,content FROM summaries"
+                                 " WHERE kind='daily' AND window_start>=? AND window_end<=?"
+                                 " AND window_end-window_start=86400 AND content<>''"
+                                 " ORDER BY window_start DESC,id DESC", bounds)
+        selected = {}  # 同一自然日只选最新成稿，不把旧版本或周月报当独立证据。
+        for row in rows:
+            day = datetime.fromtimestamp(row["window_start"], BEIJING).date().isoformat()
+            if day not in selected:
+                selected[day] = {"id": row["id"], "day": day, "content": row["content"]}
+        return list(selected.values())
+
+    def prompt_evolution_state(self) -> dict:
+        row = self.conn.execute("SELECT * FROM summary_prompt_state WHERE id=1").fetchone()
+        result = dict(row)
+        result["prepared"] = json.loads(result["prepared"]) if result["prepared"] else None
+        return result
+
+    def update_prompt_evolution(self, **values) -> None:
+        if set(values) - {"state", "attempted_at", "error", "active_version", "prepared"}:
+            raise ValueError("提示词更新状态字段无效")
+        if not values:
+            return
+        if isinstance(values.get("prepared"), dict):
+            values["prepared"] = json.dumps(values["prepared"], ensure_ascii=False)
+        self.conn.execute("UPDATE summary_prompt_state SET " + ",".join(f"{key}=?" for key in values) + " WHERE id=1", tuple(values.values()))
+        self.conn.commit()
+
+    def prompt_versions(self, limit: int = 20) -> list[dict]:
+        rows = [dict(row) for row in self.conn.execute("SELECT * FROM summary_prompt_versions ORDER BY id DESC LIMIT ?",
+                                                      (max(1, min(100, limit)),))]
+        for row in rows:
+            row["data"] = json.loads(row["data"])
+            row["report_ids"] = json.loads(row["report_ids"])
+        return rows
+
+    def active_prompt_version(self) -> dict | None:
+        row = self.conn.execute("SELECT v.* FROM summary_prompt_versions v JOIN summary_prompt_state s"
+                                " ON s.active_version=v.id WHERE s.id=1").fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["data"] = json.loads(result["data"])
+        result["report_ids"] = json.loads(result["report_ids"])
+        return result
+
+    def add_prompt_version(self, start: str, end: str, report_ids: list[int], data: dict, *, now: float) -> int:
+        with self.conn:  # 成功版本与生效指针一起落盘，恢复不出现半份新规则。
+            cur = self.conn.execute("INSERT INTO summary_prompt_versions(created_at,source_start,source_end,report_ids,data) VALUES(?,?,?,?,?)",
+                                    (now, start, end, json.dumps(report_ids), json.dumps(data, ensure_ascii=False)))
+            self.conn.execute("UPDATE summary_prompt_state SET active_version=? WHERE id=1", (cur.lastrowid,))
+        return int(cur.lastrowid)
+
+    def activate_prompt_version(self, version_id: int) -> None:
+        if version_id and not self.conn.execute("SELECT 1 FROM summary_prompt_versions WHERE id=?", (version_id,)).fetchone():
+            raise ValueError("找不到该提示词版本")
+        self.update_prompt_evolution(active_version=version_id)
+
     def add_summary(
         self,
         group_id: str,

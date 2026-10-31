@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-PURPOSE_COLORS = {"摘要总结": "#2563eb", "图片理解": "#b45309"}
+PURPOSE_COLORS = {"摘要总结": "#2563eb", "图片理解": "#b45309", "自动图片理解": "#15803d", "提示词更新": "#9333ea"}
 FONT = "Microsoft YaHei UI"
 
 
@@ -41,15 +41,18 @@ def draw_daily_costs(canvas, series: dict[str, list[dict]]) -> tuple[float, floa
     canvas.delete("all")
     width, height = max(canvas.winfo_width(), 260), max(canvas.winfo_height(), 145)
     left, right, bottom = 66, width - 18, height - 30
-    legend_y, top = (29, 52) if width < 550 else (15, 40)
+    columns = 4 if width >= 780 else 2 if width >= 360 else 1
+    legend_y = 15 if columns == 4 else 33
+    top = legend_y + ((len(PURPOSE_COLORS)-1)//columns)*18 + 22
     rows = next(iter(series.values()))
     known = [row["cost_cny"] for values in series.values() for row in values if row["cost_cny"] is not None]
     ceiling = max(known, default=0) * 1.1 or 0.01
     canvas.create_text(left, 15, text="人民币 / 元（本地估算）", anchor="w", fill="#555555", font=(FONT, 9))
     for i, (purpose, color) in enumerate(PURPOSE_COLORS.items()):
-        x = max(left, right - 205) + i * 105
-        canvas.create_line(x, legend_y, x + 18, legend_y, fill=color, width=2)
-        canvas.create_text(x + 23, legend_y, text=purpose, anchor="w", fill=color, font=(FONT, 9))
+        x = (right - 490 if columns == 4 else left) + (i % columns) * 122
+        y = legend_y + (i // columns) * 18
+        canvas.create_line(x, y, x + 18, y, fill=color, width=2)
+        canvas.create_text(x + 23, y, text=purpose, anchor="w", fill=color, font=(FONT, 9))
     for tick in range(4):
         value = ceiling * tick / 3
         y = bottom - (bottom - top) * tick / 3

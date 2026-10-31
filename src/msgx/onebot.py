@@ -178,6 +178,11 @@ async def _messages_recent(request: web.Request) -> web.Response:
     group_id = request.query.get("group_id", "")
     pipe = request.app["pipe"]
     account = str(getattr(pipe, "target_account", "") or getattr(pipe, "bot_uin", ""))
+    try:
+        days = int(request.query.get("activity_days", "14"))
+    except ValueError:
+        days = 14
+    days = days if days in (7, 14, 30) else 14
 
     def query(store):
         # 一个只读事务让消息、本人关联和群统计使用相同快照；不借用接收线程的连接。
@@ -186,7 +191,9 @@ async def _messages_recent(request: web.Request) -> web.Response:
                            group_id=group_id, account=account)],
                 "related": store.recent_messages(limit, group_id=group_id, account=account,
                             related_only=True) if account else [],
-                "related_account": account, "activity": store.group_activity()}
+                "related_account": account, "activity": store.group_activity(
+                    account=account, watch_groups=getattr(pipe, "watch", ()),
+                    trend_group=request.query.get("activity_group", ""), days=days)}
 
     return web.json_response(await _read_store(pipe.store, query))
 
@@ -274,6 +281,25 @@ async def _groups_refresh(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "groups": r["count"], **r})
 
 
+async def _prompt_status(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, **request.app["pipe"].prompt_evolution.status()})
+
+
+async def _prompt_action(request: web.Request) -> web.Response:
+    if request.remote not in ("127.0.0.1", "::1") or not _local_edit_allowed(request) or not _auth_ok(request):
+        return web.json_response({"ok": False, "error": "仅允许本机授权 JSON 操作"}, status=403)
+    try:
+        body = await request.json()
+        pipe = request.app["pipe"]
+        if request.match_info["action"] == "update":
+            result = pipe.request_prompt_update(confirmed=body.get("confirmed") is True)
+        else:
+            result = pipe.prompt_evolution.restore(int(body.get("version_id", 0)))
+    except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=409)
+    return web.json_response({"ok": True, **result})
+
+
 async def _summary_retry(request: web.Request) -> web.Response:
     # GUI 本机 JSON 请求；拒绝浏览器跨站请求，避免意外触发收费补生成。
     if request.remote not in ("127.0.0.1", "::1") or request.headers.get("Origin") or not _auth_ok(request):
@@ -309,5 +335,7 @@ def build_app(cfg: dict, pipeline) -> web.Application:
     app.router.add_post("/summary/now", _summary_now)
     app.router.add_get("/summary/days", _summary_days)
     app.router.add_post("/summary/retry", _summary_retry)
+    app.router.add_get("/prompt-evolution", _prompt_status)
+    app.router.add_post(r"/prompt-evolution/{action:update|restore}", _prompt_action)
     app.router.add_post("/groups/refresh", _groups_refresh)
     return app

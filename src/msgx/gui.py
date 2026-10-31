@@ -167,10 +167,8 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
 
 
     def _apply_app_icon(self) -> None:
-        path = (self.prefs.get("ui") or {}).get("icon_path")
-        local_icon = self.prefs_file.parent / "app-icon.ico" if hasattr(self, "prefs_file") else ROOT / ".ui" / "app-icon.ico"
-        if (not path or not Path(path).is_file()) and local_icon.is_file():
-            path = local_icon
+        from .app_icon import DEFAULT_ICON, selected_icon
+        path = selected_icon(ROOT, self.prefs, getattr(self, "prefs_file", None))  # 个人覆盖与项目默认图标共用优先级。
         if not path:
             return
         try:
@@ -180,7 +178,8 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
                 frames = [icon.ico.getimage(size).convert("RGBA") for size in sorted(icon.ico.sizes())]
             self._icon_photos = [ImageTk.PhotoImage(frame, master=self.root) for frame in frames]
             self.root.iconphoto(False, *self._icon_photos)
-            self.v_icon_status.set("已应用自定义图标；以后启动继续使用")
+            self.v_icon_status.set("已应用项目默认图标；可在设置中更换" if path.resolve() == DEFAULT_ICON.resolve()
+                                   else "已应用自定义图标；以后启动继续使用")
         except (OSError, tk.TclError):
             self.v_icon_status.set("图标加载失败，请重新选择 PNG 或 ICO")
 
@@ -265,6 +264,9 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
             self._apply_health(value)
         elif kind == "billing":
             self._apply_billing(value)
+        elif kind == "automation_done":
+            proc, result, error = value
+            self.automation.receive(result if proc is self.proc else {}, error if proc is self.proc else "服务已变化，请重新刷新记录")
         elif kind == "billing_done":
             self._billing_finished(value)
         elif kind == "summary_retry_done":

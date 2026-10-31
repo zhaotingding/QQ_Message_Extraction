@@ -14,6 +14,7 @@
 | --- | --- |
 | 测试隔离、回归验收、精简或迁移测试用例 | [msgx-maintenance](.agents/skills/msgx-maintenance/SKILL.md) |
 | YAML 配置、偏好、API 配置与凭据保存 | [msgx-config-credentials](.agents/skills/msgx-config-credentials/SKILL.md) |
+| 图片本地初筛、独立图片 API、自动分析限额及语义入库 | [msgx-image-analysis](.agents/skills/msgx-image-analysis/SKILL.md) |
 | 消息过滤、活跃度、关键词、本人关联与 SQLite 查询或升级 | [msgx-message-queries](.agents/skills/msgx-message-queries/SKILL.md) |
 | 日周月摘要、请求恢复、用量记账与费用口径 | [msgx-summary-accounting](.agents/skills/msgx-summary-accounting/SKILL.md) |
 | Tk 交互、接收进程控制、扫码验证与阅读批注 | [msgx-desktop-ui](.agents/skills/msgx-desktop-ui/SKILL.md) |

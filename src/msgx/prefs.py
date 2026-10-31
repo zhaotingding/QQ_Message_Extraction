@@ -145,6 +145,13 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
     这样「界面留空」等于「沿用配置文件」，而不是「清空」。
     """
     out = json.loads(json.dumps(cfg, ensure_ascii=False, default=str))
+    if "image_analysis" in prefs:
+        from .image_policy import validate_analysis
+        out.setdefault("media", {})["analysis"] = validate_analysis(prefs["image_analysis"])
+    if "image_api_profile" in prefs:
+        out.setdefault("media", {})["image_api_profile"] = str(prefs["image_api_profile"] or "")
+    if "prompt_evolution" in prefs:
+        out.setdefault("summary", {})["prompt_evolution"] = dict(prefs["prompt_evolution"])
 
     prompt = str(prefs.get("summary_prompt") or "").strip()
     if prompt:

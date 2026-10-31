@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .prefs import DEFAULT_BLOCKED_SENDERS
 from . import yaml_config
+from .image_policy import DEFAULT_IMAGE_ANALYSIS
 
 PACKAGE_DIR = Path(__file__).resolve().parent      # <项目根>/src/msgx
 SRC_DIR = PACKAGE_DIR.parent                       # <项目根>/src
@@ -59,10 +60,13 @@ DEFAULTS: dict = {
         "vision_enabled": True,
         "max_download_mb": 20,
         "images_per_minute": 60,
+        "image_api_profile": "",  # 空值跟随摘要；可指定独立的低价图片 API 配置。
+        "analysis": dict(DEFAULT_IMAGE_ANALYSIS),
     },
     "summary": {
         "prompt": "",             # 空 = 使用内置申论式纪要提示词
         "target_chars": 3000,
+        "prompt_evolution": {"enabled": False, "days": 7, "interval_days": 7},
     },
     # 协议端（NapCat）。本服务只监听协议端连入，**不负责启动它**，所以默认都是空的。
     #   start_script —— 填上后界面出现「启动协议端(NapCat)」按钮（可见排障模式用）

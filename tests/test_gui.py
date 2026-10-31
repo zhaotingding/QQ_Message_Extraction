@@ -223,7 +223,7 @@ app.service.proc = object()
 app.v_rt_filter.set("仅看图片")
 with patch("threading.Thread") as thread:
     app.refresh_messages()
-    check("仅看图片筛选发送到服务端查询", thread.call_args.kwargs["args"] == (200, True, "", app.proc))
+    check("仅看图片筛选发送到服务端查询", thread.call_args.kwargs["args"] == (200, True, "", app.proc, app._activity_request_key()))
 app._rt_busy = False
 app.service.proc = old_proc
 app.v_rt_filter.set("全部消息")
@@ -871,7 +871,8 @@ app.v_summary_chars.set(_saved_chars)
 print("\n=== 状态和错误仅在界面内显示，不弹通知 ===")
 _labels = [str(w.cget("text")) for w in allw if isinstance(w, (ttk.Label, ttk.LabelFrame, ttk.Checkbutton))]
 check("删除热点关键词和摘要频率设置", "热点关注词" not in _labels and "摘要频率" not in _labels)
-check("图片规则明确本地 OCR 与手动 API 的边界", any("所有带链接的图片先做本地 OCR" in value for value in _labels)
+check("图片规则明确本地初筛与启用后自动 API 的边界", any("表情包直接过滤" in value for value in _labels)
+      and any("高分图片成功解析才纳入摘要" in value for value in _labels)
       and "纯图片（消息未附带文字）" in _labels)
 with patch.object(_mb, "showinfo") as _info, patch.object(_mb, "showerror") as _error:
     app.refresh_billing()

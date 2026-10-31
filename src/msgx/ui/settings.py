@@ -51,7 +51,7 @@ class SettingsPage:
         self.api_selector.bind("<<ComboboxSelected>>", self._select_api_profile)
         ttk.Button(selector, text="新增自定义配置", command=self.add_api_profile).pack(side="left")
         self.v_api = {}
-        fields = [("provider", "服务平台"), ("base_url", "API 基础地址"), ("model", "模型（摘要及图片）"),
+        fields = [("provider", "服务平台"), ("base_url", "API 基础地址"), ("model", "模型（当前配置）"),
                   ("protocol", "接口格式"), ("reasoning", "思考强度"),
                   ("service_tier", "OpenAI 服务档位"),
                   ("context_tokens", "上下文 Token 上限"), ("max_output_tokens", "输出 Token 上限"),
@@ -113,6 +113,8 @@ class SettingsPage:
             sm, height=12, wrap="word", font=(FONT, 10), relief="solid", borderwidth=1,
         )
         self.txt_summary_prompt.pack(fill="both", expand=True, pady=(6, 0))
+        from .automation import AutomationControls
+        self.automation = AutomationControls(self, tab, sm)
 
         # --- 群范围 ---
         gp = ttk.LabelFrame(tab, text="统计哪些群", padding=12)
@@ -150,8 +152,8 @@ class SettingsPage:
         self.btn_groups_prune.pack(side="left", padx=8)
         ttk.Label(
             gp,
-            text="群列表保留各账号的历史数据；共同群记录多个接收账号。"
-                 "「只保留当前账号的群」仅清理空群，有消息的群一律保留。",
+            text="选择列表仅显示当前账号的最新群；退出群隐藏，历史消息和报告保留。"
+                 "「只保留当前账号的群」重新同步归属，并清理不再属于当前账号的空群。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(4, 0))
 
@@ -160,8 +162,8 @@ class SettingsPage:
         ft.pack(fill="x", pady=(12, 0))
         ttk.Label(
             ft,
-            text="过滤的图片/表情保留简要记录并做本地 OCR，默认不进摘要；其他命中过滤的消息直接丢弃。\n"
-                 "所有带链接的图片先做本地 OCR；只有在实时消息页手动勾选才调用图片 API。",
+            text="表情包直接过滤，不下载/OCR/上传；其他图片本地 OCR 与初筛，默认不进摘要。\n"
+                 "开启自动图片分析后，高分图片成功解析才纳入摘要；也可在实时消息页手动识别。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(0, 6))
         self.v_filters = {
@@ -310,6 +312,7 @@ class SettingsPage:
         p = self.prefs
         self._api_profiles, active = api_settings.catalog(self.cfg, p)
         self._show_api_profile(active)
+        self.automation.load()
         if "summary_target_chars" not in prefs_mod.load_raw(self.prefs_file):
             p["summary_target_chars"] = self.cfg.get("summary", {}).get("target_chars", DIGEST_DEFAULT_CHARS)
         options = self._summary_options()
@@ -384,6 +387,7 @@ class SettingsPage:
         profile = api_settings.validate({key: var.get() for key, var in self.v_api.items()})
         return {
             **self.prefs,
+            **self.automation.collect(),
             "api": profile,
             "api_profiles": {**self._api_profiles, self._api_selected: profile},
             "active_api_profile": self._api_selected,
@@ -457,6 +461,8 @@ class SettingsPage:
         self.api_selector.configure(values=[p["provider"] for p in self._api_profiles.values()])
         self.api_selector.current(list(self._api_profiles).index(self._api_selected))
         self._api_key_status()
+        if hasattr(self, "automation"):
+            self.automation.refresh_profiles()
         self.v_summary_schedule_desc.set(self._summary_schedule_desc())
         n_groups = len(data["groups"]) or "全部"
         self._settings_feedback(
@@ -622,6 +628,7 @@ class SettingsPage:
         port = int(self.cfg["onebot"]["http_port"])
         db = abs_path(self.cfg, "db_path")
         running = self.proc is not None
+        account = str(self.prefs.get("qq_account") or self.cfg.get("napcat", {}).get("account") or "")
         events = self.events
         def work():
             fetched, rows, error = {}, [], ""
@@ -635,7 +642,7 @@ class SettingsPage:
                 if db.exists():
                     store = Store(db, readonly=True)
                     try:
-                        rows = store.group_rows()
+                        rows = store.group_rows(account=account)
                     finally:
                         store.close()
             except (OSError, sqlite3.Error) as exc:
@@ -677,7 +684,7 @@ class SettingsPage:
         if deleted:
             parts.append(f"已删除 {len(deleted)} 个不属于当前账号的空群")
         if protected:
-            parts.append(f"保留 {len(protected)} 个有消息但不属于当前账号的群（删了会让摘要失效）")
+            parts.append(f"已隐藏 {len(protected)} 个历史群，消息与报告保留")
         self.status.set("；".join(parts))
         return True
 
@@ -689,9 +696,9 @@ class SettingsPage:
             return
         if not messagebox.askyesno(
             "只保留当前账号的群",
-            "将删掉「不属于当前登录账号、且一条消息都没有」的群。\n\n"
-            "· 有消息的群**一律保留**（删了会让那个群的摘要静默失效）\n"
-            "· 删的只是群列表里的条目，不涉及任何消息数据\n\n"
+            "按当前登录账号重新同步群列表；退出或其他账号的群从选择和活跃度中隐藏。\n\n"
+            "· 历史消息和报告完整保留\n"
+            "· 不再属于当前账号的空群可清理\n\n"
             "继续吗？",
             parent=self.root,
         ):

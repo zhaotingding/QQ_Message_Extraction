@@ -19,6 +19,7 @@ from ..message_keywords import compile_rules, matching_message
 from ..store import Store
 from ..local_client import request_json
 from .common import FONT
+from .activity_chart import ActivityChart
 
 
 class RealtimePage:
@@ -160,14 +161,27 @@ class RealtimePage:
         self.rt_keywords.bind("<<TreeviewSelect>>", self._keyword_selected)
         self.rt_keywords.bind("<Double-1>", lambda _e: self.rt_bottom.select(self.rt_details_tab))
         self.v_rt_activity_status = tk.StringVar(value="今日未过滤消息累计 · 点击群可筛选消息")
-        ttk.Label(self.rt_activity_tab, textvariable=self.v_rt_activity_status,
-                  style="Hint.TLabel").pack(anchor="w", pady=3)
-        activity_wrap = ttk.Frame(self.rt_activity_tab)
-        activity_wrap.pack(fill="both", expand=True)
-        self.rt_activity = ttk.Treeview(activity_wrap, columns=("group", "count", "last"),
+        activity_bar = ttk.Frame(self.rt_activity_tab)
+        activity_bar.pack(fill="x", pady=3)
+        ttk.Label(activity_bar, textvariable=self.v_rt_activity_status,
+                  style="Hint.TLabel").pack(side="left")
+        self._rt_activity_group = ""
+        self.v_activity_days = tk.StringVar(value="14")
+        period = ttk.Combobox(activity_bar, textvariable=self.v_activity_days, values=("7", "14", "30"),
+                              state="readonly", width=3)
+        period.pack(side="right")
+        period.bind("<<ComboboxSelected>>", self._on_activity_period_changed)
+        ttk.Label(activity_bar, text="趋势天数").pack(side="right", padx=5)
+        activity_panes = ttk.Panedwindow(self.rt_activity_tab, orient="horizontal")
+        activity_panes.pack(fill="both", expand=True)
+        activity_wrap = ttk.Frame(activity_panes)
+        activity_panes.add(activity_wrap, weight=1)
+        self.rt_activity_chart = ActivityChart(activity_panes)
+        activity_panes.add(self.rt_activity_chart, weight=1)
+        self.rt_activity = ttk.Treeview(activity_wrap, columns=("group", "id", "count", "last"),
                                         show="headings", height=5)
-        for key, title, width in (("group", "群 / 群号", 380), ("count", "今日消息数", 110),
-                                  ("last", "最近未过滤消息", 180)):
+        for key, title, width in (("group", "群名", 190), ("id", "群号", 105), ("count", "今日有效", 78),
+                                  ("last", "最近消息", 86)):
             self.rt_activity.heading(key, text=title)
             self.rt_activity.column(key, width=width, stretch=key == "group",
                                     anchor="w" if key == "group" else "center")
@@ -217,7 +231,7 @@ class RealtimePage:
         self.v_rt_status.set("正在刷新消息…")
         self._rt_limit = self._read_rt_limit()
         threading.Thread(target=self._fetch_messages,
-                         args=(*self._rt_request_key(), self.proc), daemon=True).start()
+                         args=(*self._rt_request_key(), self.proc, self._activity_request_key()), daemon=True).start()
 
 
     def _rt_request_key(self) -> tuple:
@@ -242,12 +256,20 @@ class RealtimePage:
         group_id = self.rt_activity.identify_row(event.y) if event else (selected[0] if selected else "")
         if not group_id:
             return
+        self._rt_activity_group = group_id
         self._rt_group_id = group_id
         for label, value in self._rt_group_labels.items():
             if value == group_id:
                 self.v_rt_group.set(label)
                 break
         self._on_rt_filter_changed()
+
+    def _activity_request_key(self) -> tuple:
+        return self._rt_activity_group, int(self.v_activity_days.get())
+
+    def _on_activity_period_changed(self, _event=None) -> None:
+        self.v_rt_activity_status.set("正在读取活跃度趋势…")
+        self.refresh_messages()
 
 
     def _read_rt_limit(self) -> int:
@@ -258,12 +280,17 @@ class RealtimePage:
             return 200
 
 
-    def _fetch_messages(self, limit: int, images_only: bool = False, group_id: str = "", proc=None) -> None:
+    def _fetch_messages(self, limit: int, images_only: bool = False, group_id: str = "", proc=None,
+                        activity_key=None) -> None:
         port = int(self.cfg["onebot"]["http_port"])
         payload = None
         try:
-            payload = request_json(port, "/messages/recent", timeout=5,
-                                   query={"limit": limit, "images": int(images_only), "group_id": group_id})
+            query = {"limit": limit, "images": int(images_only), "group_id": group_id}
+            if activity_key is not None:
+                query.update(activity_group=activity_key[0], activity_days=activity_key[1])
+            payload = request_json(port, "/messages/recent", timeout=5, query=query)
+            if activity_key is not None:
+                payload["_activity_key"] = activity_key  # 只携带主线程快照，工作线程不读 Tk 变量。
         except Exception:  # noqa: BLE001
             payload = None
         self.events.put(("messages", ((limit, images_only, group_id), proc, payload)))
@@ -276,7 +303,8 @@ class RealtimePage:
                 self.refresh_messages()
             return
         if payload is not None:
-            self._render_activity(payload.get("activity") or {})
+            if payload.get("_activity_key", self._activity_request_key()) == self._activity_request_key():
+                self._render_activity(payload.get("activity") or {})
             self._render_related(payload.get("related") or [], payload.get("related_account") or "")
         else:
             self.v_rt_related.set("与我相关的消息刷新失败；保留上次结果")
@@ -451,27 +479,43 @@ class RealtimePage:
             group_id = str(group["group_id"])
             labels[f"{group.get('group_name') or group_id} ({group_id})"] = group_id
         if self._rt_group_id and self._rt_group_id not in labels.values():
-            labels[self.v_rt_group.get()] = self._rt_group_id
+            self._rt_group_id = ""  # 退出或取消统计的群不继续留在当前筛选列表。
         self._rt_group_labels = labels
         self.cb_rt_group.configure(values=tuple(labels))
         self.v_rt_group.set(next(label for label, value in labels.items() if value == self._rt_group_id))
         selection = self.rt_activity.selection()
         scroll = self.rt_activity.yview()[0]
-        self.rt_activity.delete(*self.rt_activity.get_children())
+        previous = set(self.rt_activity.get_children())
+        desired = {str(group["group_id"]) for group in groups}
+        for group_id in previous - desired:
+            self.rt_activity.delete(group_id)
+        reorder = self.rt_activity.get_children() != tuple(str(group["group_id"]) for group in groups)
+        if self._rt_activity_group not in desired:
+            self._rt_activity_group = ""
         total = 0
-        for group in groups:
+        for index, group in enumerate(groups):
             group_id = str(group["group_id"])
             count = int(group["count"])
             total += count
             ts = group.get("last_ts") or 0
-            self.rt_activity.insert("", "end", iid=group_id, values=(
-                f"{group.get('group_name') or group_id} ({group_id})", count,
-                datetime.fromtimestamp(ts, BEIJING).strftime("%H:%M:%S") if ts else "—"))
+            values = (group.get("group_name") or "未命名", group_id, count,
+                      datetime.fromtimestamp(ts, BEIJING).strftime("%H:%M:%S") if ts else "—")
+            if self.rt_activity.exists(group_id):
+                if self.rt_activity.item(group_id, "values") != tuple(str(value) for value in values):
+                    self.rt_activity.item(group_id, values=values)
+            else:
+                self.rt_activity.insert("", "end", iid=group_id, values=values)
+            if reorder:
+                self.rt_activity.move(group_id, "", index)
         if selection and self.rt_activity.exists(selection[0]):
             self.rt_activity.selection_set(selection[0])
         self.rt_activity.yview_moveto(scroll)
         self.v_rt_activity_status.set(
-            f"{activity.get('date') or '今日'} · 北京时间当天未过滤消息 {total} 条 · 点击群筛选（不受上方筛选及显示条数限制）")
+            f"{activity.get('date') or '今日'} · 统计 {len(groups)} 群 · 今日未过滤 {total} 条 · 点击群查看趋势")
+        trend = activity.get("trend") or {}
+        self.rt_activity_chart.set_series(trend)
+        if trend.get("group_id") and not self._rt_activity_group:
+            self._rt_activity_group = str(trend["group_id"])
 
 
     def _render_messages(self, rows) -> None:
@@ -518,6 +562,8 @@ class RealtimePage:
                     caption = caption[:100] + "…"
                 preview = ocr[:180] + ("…" if len(ocr) > 180 else "")
                 body = f"{caption} [图片] OCR:{preview}".strip()
+            if r.get("has_media") and r.get("screen_state") in ("done", "blocked"):
+                body += f" · 初筛:{int(r.get('screen_score') or 0)}"  # 复用内容列，不增加宽列。
             state = self._media_label(r)
             tags: list[str] = []
             if r.get("keyword_matches"):
@@ -535,7 +581,7 @@ class RealtimePage:
                     body,
                     state,
                     "打开" if r.get("media_path") else "—",
-                    ("☑ 已识别" if vision else "□ 识别") if r.get("media_path") else "—",
+                    ("识别中…" if r.get("auto_state") == "running" else "☑ 已识别" if vision else "□ 识别") if r.get("media_path") else "—",
                     ("☑" if r.get("include_vision") else "□") if r.get("has_media") else "—",
                     r.get("receiver_accounts") or r.get("received_by") or "历史未知",
                 )
@@ -578,6 +624,11 @@ class RealtimePage:
                 detail += (f"\n\n图片 {row.get('image_index', 1)} / {row.get('image_count', 1)}"
                            f"\nOCR:\n{row.get('ocr_text') or '（无文字）'}\n\n"
                            f"图片语义：\n{row.get('vision_text') or '（尚未手动识别）'}")
+                if row.get("screen_state") in ("done", "blocked"):
+                    detail += f"\n\n本地重要度：{int(row.get('screen_score') or 0)}/100\n筛选理由：{row.get('screen_reason') or '未提供'}"
+                states = {"running": "正在分析", "ok": "分析完成", "unknown": "结果未知，等待人工核对", "cached": "复用已有分析"}
+                if row.get("auto_state"):
+                    detail += f"\n自动分析状态：{states.get(row['auto_state'], row['auto_state'])}"
         if self.rt_detail.get("1.0", "end-1c") == detail:
             return
         self.rt_detail.configure(state="normal")
@@ -601,7 +652,10 @@ class RealtimePage:
             else:
                 self.status.set("本地图片已不存在")
         elif column == "recognize" and row.get("image_id") and row.get("media_path") and not row.get("vision_text"):
-            self._start_rt_action(str(row["image_id"]), "vision", {})
+            if row.get("auto_state") == "running":
+                self.status.set("该图片正在自动分析，请等待结果，避免重复调用")
+            else:
+                self._start_rt_action(str(row["image_id"]), "vision", {})
         elif column == "include" and row.get("image_id"):
             self._start_rt_action(str(row["image_id"]), "summary-include", {"include": not bool(row.get("include_vision"))})
 

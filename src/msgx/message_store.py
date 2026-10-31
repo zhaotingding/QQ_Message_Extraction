@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from .models import Msg, message_links
 from .message_keywords import matching_fields
-from .prefs import QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME, blocked_senders
+from .prefs import QGROUP_MANAGER_ID, QGROUP_MANAGER_NAME, blocked_senders, plain_text
 from .time_rules import BEIJING, beijing_day
 
 VISION_MAX_TRIES = 3  # 沿用已有的图片语义失败次数上限。
@@ -60,15 +60,40 @@ class MessageStore:
         )
         return [dict(r) for r in rows]
 
-    def group_rows(self) -> list[tuple]:
+    def group_rows(self, account: str = "") -> list[tuple]:
         """设置页的群、已有属主及消息数；只读旧库时保留原单属主回退。"""
         owners = "g.bot_uin"
         if self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='group_accounts'").fetchone():
             owners = "(SELECT GROUP_CONCAT(account) FROM group_accounts WHERE group_id=g.id)"
+        scope, params = self._activity_group_scope("g.id", account)  # 当前成员快照与历史群资料分别保存。
+        if account and not self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='account_group_snapshots'").fetchone():
+            scope, params = ("EXISTS(SELECT 1 FROM group_accounts ga WHERE ga.group_id=g.id AND ga.account=?)", (account,))
+            if not self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='group_accounts'").fetchone():
+                scope, params = "g.bot_uin=?", (account,)  # 服务迁移前仍可只读浏览旧库。
         return [tuple(row) for row in self.conn.execute(
             f"SELECT g.id,g.name,{owners},"
             " (SELECT COUNT(*) FROM messages m WHERE m.group_id=g.id)"
-            " FROM groups g ORDER BY g.id")]
+            f" FROM groups g WHERE {scope} ORDER BY g.id", params)]
+
+    def sync_account_groups(self, account: str, keep_ids: set[str]) -> None:
+        """成功同步成员列表；退群仅影响当前选择，不删除历史消息或成稿。"""
+        if not str(account).strip():
+            raise ValueError("同步群列表需要明确的当前账号")
+        ids = sorted({str(gid) for gid in keep_ids if str(gid)})  # 空列表表示已确认当前没有群。
+        self.conn.execute("INSERT INTO account_group_snapshots(account,group_ids,updated_at) VALUES(?,?,?)"
+                          " ON CONFLICT(account) DO UPDATE SET group_ids=excluded.group_ids,updated_at=excluded.updated_at",
+                          (str(account), json.dumps(ids), time.time()))
+        self.conn.commit()
+
+    def _activity_group_scope(self, column: str, account: str = "") -> tuple[str, tuple]:
+        if not account:
+            return "1=1", ()
+        if not getattr(self, "_has_current_group_snapshots", True):
+            return f"EXISTS(SELECT 1 FROM group_accounts ga WHERE ga.group_id={column} AND ga.account=?)", (account,)
+        return ("CASE WHEN EXISTS(SELECT 1 FROM account_group_snapshots WHERE account=?)"
+                f" THEN {column} IN (SELECT value FROM json_each((SELECT group_ids FROM account_group_snapshots WHERE account=?)))"
+                f" ELSE EXISTS(SELECT 1 FROM group_accounts ga WHERE ga.group_id={column} AND ga.account=?) END",
+                (account, account, account))  # 迁移前未知实时群时回退已有归属，不把其它账号混入。
 
     def prune_groups(self, keep_ids: set[str]) -> tuple[list[str], list[str]]:
         """删掉「不在 keep_ids 里 **且** 一条消息都没有」的群。
@@ -297,8 +322,9 @@ class MessageStore:
         ocr = "\n".join(r["ocr_text"] for r in images if r["include_vision"] and r["ocr_text"])
         vision = "\n".join(r["vision_text"] for r in images if r["include_vision"] and r["vision_text"])
         first = images[0]
-        current = self.conn.execute("SELECT media_state FROM messages WHERE id=?", (message_row,)).fetchone()
-        state = current["media_state"] if current and current["media_state"] == "filtered" else (
+        current = self.conn.execute("SELECT media_state,text FROM messages WHERE id=?", (message_row,)).fetchone()
+        only_filtered = all(r["media_state"] == "filtered" for r in images) and current and not plain_text(current["text"])
+        state = "filtered" if current and (current["media_state"] == "filtered" or only_filtered) else (
             "pending" if any(r["media_state"] == "pending" for r in images) else
             "failed" if any(r["media_state"] == "failed" for r in images) else "done"
         )
@@ -410,7 +436,8 @@ class MessageStore:
             by_id[image["message_row"]]["images"].append(dict(image))
         return result
 
-    def group_activity(self, now: datetime | None = None) -> dict:
+    def group_activity(self, now: datetime | None = None, *, account: str = "", watch_groups=None,
+                       trend_group: str = "", days: int = 14) -> dict:
         """北京时间今日未过滤消息榜；按消息正文计数，不展开图片或接收账号。"""
         beijing = BEIJING
         current = now or datetime.now(beijing)
@@ -420,20 +447,43 @@ class MessageStore:
         window_start = int(start.timestamp())
         window_end = int((start + timedelta(days=1)).timestamp())
         sender_sql, sender_params = self._sender_condition()
+        scope, scope_params = self._activity_group_scope("k.group_id", account)
+        watched = list(dict.fromkeys(str(gid) for gid in (watch_groups or []) if str(gid)))
+        if watched:
+            scope += f" AND k.group_id IN ({','.join('?' for _ in watched)})"  # 统计范围在查询内裁剪。
+            scope_params += tuple(watched)
+        receipt = " AND EXISTS(SELECT 1 FROM message_receipts r WHERE r.message_row=messages.id AND r.account=?)" if account else ""
         rows = self.conn.execute(
             "WITH known_groups AS (SELECT id AS group_id FROM groups UNION SELECT group_id FROM messages),"
             " today AS (SELECT group_id, COUNT(*) AS count, MAX(ts) AS last_ts FROM messages"
             " WHERE ts>=? AND ts<? AND media_state<>'filtered'"
-            f" AND {sender_sql} GROUP BY group_id)"
+            f" AND {sender_sql}{receipt} GROUP BY group_id)"
             " SELECT k.group_id, COALESCE(g.name, '') AS group_name,"
             " COALESCE(t.count, 0) AS count, COALESCE(t.last_ts, 0) AS last_ts"
             " FROM known_groups k LEFT JOIN groups g ON g.id=k.group_id"
             " LEFT JOIN today t ON t.group_id=k.group_id"
-            " ORDER BY count DESC, last_ts DESC, k.group_id",
-            (window_start, window_end, *sender_params),
+            f" WHERE {scope} ORDER BY count DESC, last_ts DESC, k.group_id",
+            (window_start, window_end, *sender_params, *((account,) if account else ()), *scope_params),
         )
+        groups = [dict(row) for row in rows]
+        selected = next((row for row in groups if row["group_id"] == trend_group), groups[0] if groups else None)
+        days = days if days in (7, 14, 30) else 14  # 固定短窗口，避免界面发起无限历史扫描。
+        dates = [(start - timedelta(days=days - index - 1)).date().isoformat() for index in range(days)]
+        counts = {day: 0 for day in dates}
+        if selected:
+            trend_rows = self.conn.execute(
+                "SELECT strftime('%Y-%m-%d',ts,'unixepoch','+8 hours') AS day,COUNT(*) AS n"
+                " FROM messages WHERE group_id=? AND ts>=? AND ts<? AND media_state<>'filtered'"
+                f" AND {sender_sql}{receipt} GROUP BY day",
+                (selected["group_id"], window_start - (days - 1) * 86400, window_end,
+                 *sender_params, *((account,) if account else ())))
+            counts.update({row["day"]: int(row["n"]) for row in trend_rows})
         return {"date": start.date().isoformat(), "window_start": window_start,
-                "window_end": window_end, "groups": [dict(row) for row in rows]}
+                "window_end": window_end, "groups": groups,
+                "trend": {"group_id": selected["group_id"] if selected else "",
+                          "group_name": selected["group_name"] if selected else "", "days": days,
+                          "dates": dates, "counts": [counts[day] for day in dates],
+                          "note": "按北京时间统计保留数据；0表示未发现有效消息，清理或未接收期间不代表真实零活跃。"}}
 
     def messages_between_all(self, start: int, end: int, limit: int = -1) -> list:
         """窗口内消息按时间升序；逐张图片选择已勾选的语义或 OCR。"""

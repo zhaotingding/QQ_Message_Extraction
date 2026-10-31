@@ -38,6 +38,7 @@ class PeriodSchedulerTests(IsolatedAsyncioTestCase):
         pipe._stop = asyncio.Event()
         pipe._summary_wake = asyncio.Event()
         pipe._summary_recovered = False
+        pipe.prompt_evolution = SimpleNamespace(check=AsyncMock())  # 绕过构造器的替身仍提供新增的串行任务入口。
         pipe.summary_schedule = {"state": "idle", "message": "", "kind": "", "start_date": "", "end_date": ""}
         pipe.daily_schedule = {}
         async def generate(kind, start, end):

@@ -41,6 +41,14 @@ class UsageChartTests(unittest.TestCase):
     def setUp(self):
         self.end = date(2026, 9, 28)
 
+    def test_new_automation_costs_remain_visible(self):
+        rows = [dict(day="2026-09-28", purpose="自动图片理解", cost_cny=.03, calls=1),
+                dict(day="2026-09-28", purpose="提示词更新", cost_cny=.02, calls=1)]
+        series = daily_series(rows, self.end)
+        self.assertEqual(series["自动图片理解"][-1]["cost_cny"], .03)
+        self.assertEqual(series["提示词更新"][-1]["cost_cny"], .02)
+        self.assertIn("提示词更新", day_description(series, 29))
+
     def test_empty_window_has_zero_days_but_no_fictitious_line(self):
         series = daily_series([], self.end)
         self.assertEqual(len(series["摘要总结"]), 30)
