@@ -1,6 +1,7 @@
 # 消息萃取项目约定
 
-- 开发在独立分支进行；main 仅通过 PR 合入，由项目负责人审查。AGENTS.md、项目 Skill 与 CODEOWNERS 的改动同样适用。
+- 日常开发、修复与版本迭代统一沿用现有 `zhaoting.ding` 分支；未经用户明确要求，不按版本另建 `feature/*` 分支或新建工作树。开始修改前核对当前分支与未提交改动，保留已有工作。
+- main 仅通过 PR 合入，由项目负责人审查。AGENTS.md、项目 Skill 与 CODEOWNERS 的改动同样适用；远程操作仍须遵守用户授权范围。
 - 架构与功能契约以 [docs/重构开发规范.md](docs/重构开发规范.md) 为准；现用安装与测试入口见 [README.md](README.md)。
 - 应用配置统一 YAML，开发说明统一 Markdown；Python 打包、Git 和外部协议保留各自标准格式。
 - 版本唯一来源为 `src/msgx/__init__.py`；中文本地提交，远程 push 需要单独授权。
@@ -14,6 +15,7 @@
 | --- | --- |
 | 测试隔离、回归验收、精简或迁移测试用例 | [msgx-maintenance](.agents/skills/msgx-maintenance/SKILL.md) |
 | YAML 配置、偏好、API 配置与凭据保存 | [msgx-config-credentials](.agents/skills/msgx-config-credentials/SKILL.md) |
+| 图片本地初筛、独立图片 API、自动分析限额及语义入库 | [msgx-image-analysis](.agents/skills/msgx-image-analysis/SKILL.md) |
 | 消息过滤、活跃度、关键词、本人关联与 SQLite 查询或升级 | [msgx-message-queries](.agents/skills/msgx-message-queries/SKILL.md) |
 | 日周月摘要、请求恢复、用量记账与费用口径 | [msgx-summary-accounting](.agents/skills/msgx-summary-accounting/SKILL.md) |
 | Tk 交互、接收进程控制、扫码验证与阅读批注 | [msgx-desktop-ui](.agents/skills/msgx-desktop-ui/SKILL.md) |

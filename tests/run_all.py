@@ -19,10 +19,16 @@ sys.path.insert(0, str(PROJ / "src"))  # 套件不借用外层项目的运行入
 from msgx import conda_runtime
 
 SUITES = [
+    ("可编辑图片主题规则", "test_image_rules.py"),
+    ("深浅主题与本地外观保存", "test_theme.py"),
+    ("复选框勾选样式", "test_check_style.py"),
     ("项目 Conda 环境、轻量 EXE 与离线诊断", "test_startup.py"),
     ("存储查询与迁移工作量", "test_storage_queries.py"),
     ("后台只读与协议任务关闭", "test_onebot_reads.py"),
     ("YAML 配置与持久化", "test_yaml_config.py"),
+    ("本地图片初筛与独立API", "test_image_analysis.py"),
+    ("摘要提示词动态观察与恢复", "test_prompt_evolution.py"),
+    ("自动化设置与HTTP闭环", "test_automation_gui.py"),
     ("大号分支与历史数据隔离", "test_accounts.py"),
     ("API 配置与密钥安全", "test_api_settings.py"),
     ("过滤规则", "test_filters.py"),

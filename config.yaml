@@ -41,17 +41,29 @@ llm:
   vision_max_side: 1280
   vision_jpeg_quality: 85
 
-# OCR 在本机执行；图片语义由界面手动操作调用 API。
+# OCR/初筛在本机执行；自动图片 API 须显式启用，默认仅手动调用。
 media:
   ocr_enabled: true
   vision_enabled: true
   max_download_mb: 20
   images_per_minute: 60
+  image_api_profile: ''  # 空值跟随摘要，或填写已保存 API 配置的标识。
+  analysis:
+    enabled: false
+    threshold: 70
+    daily_limit: 20
+    daily_budget_cny: 1.0
+    context_messages: 8
+    history_days: 7
 
 # target_chars 是日报目标字数；周报、月报分别使用 2 倍和 3 倍。prompt 为空用内置提示词。
 summary:
   prompt: ''
   target_chars: 3000
+  prompt_evolution:
+    enabled: false
+    days: 7
+    interval_days: 7
 
 # 协议端脚本与安装目录；qq_path 为空时从注册表定位 QQ。
 napcat:

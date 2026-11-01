@@ -28,6 +28,31 @@ class YamlTests(unittest.TestCase):
         path.write_text(yaml_config.dumps(data), encoding="utf-8")
         return path
 
+    def test_local_module_update_preserves_false_zero_empty_and_other_modules(self):
+        path = self.write("preferences.yaml", {"ui": {"theme": "dark"}, "account": "00123",
+                                               "image_analysis": {"enabled": True}})
+        result = prefs.update({"image_analysis": {"enabled": False, "keyword_rules": []},
+                               "filters": {"min_text_length": 0}}, path)
+        self.assertEqual(result["ui"], {"theme": "dark"})
+        self.assertEqual(result["account"], "00123")
+        self.assertEqual(yaml_config.read(path)["image_analysis"], {"enabled": False, "keyword_rules": []})
+        self.assertEqual(yaml_config.read(path)["filters"]["min_text_length"], 0)
+        path.write_text("image_analysis: [", encoding="utf-8")
+        original = path.read_bytes()
+        with self.assertRaises(ValueError):
+            prefs.update({"ui": {"theme": "light"}}, path)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_partial_personal_image_options_overlay_main_without_resetting_hidden_fields(self):
+        cfg = copy.deepcopy(config.DEFAULTS)
+        cfg["media"]["analysis"].update(context_messages=16, threshold=61, keyword_rules=[])
+        result = prefs.apply_to_config(cfg, {"image_analysis": {"daily_budget_cny": 10}})
+        self.assertEqual(result["media"]["analysis"]["context_messages"], 16)
+        self.assertEqual(result["media"]["analysis"]["threshold"], 61)
+        self.assertEqual(result["media"]["analysis"]["keyword_rules"], [])
+        self.assertEqual(result["media"]["analysis"]["daily_budget_cny"], 10)
+        self.assertNotEqual(cfg["media"]["analysis"]["daily_budget_cny"], 10)
+
     def test_scalar_types_regex_paths_and_multiline_roundtrip(self):
         data = {"account": "01371109209", "groups": ["867701092"],
                 "names": {"00123": "技术群"}, "enabled": False, "price": .1,

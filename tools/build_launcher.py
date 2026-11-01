@@ -1,4 +1,4 @@
-"""重新构建现有启动器，始终沿用本机保存的自定义图标。"""
+"""重新构建轻量启动器，优先个人图标，干净克隆使用项目默认图标。"""
 from datetime import datetime
 from pathlib import Path
 import shutil
@@ -7,17 +7,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from msgx import conda_runtime, prefs, yaml_config
-
-
-def selected_icon(root: Path) -> Path | None:
-    preferences = prefs.prefs_path(root)
-    saved = yaml_config.read(preferences) if preferences.exists() else {}
-    path = (saved.get("ui") or {}).get("icon_path")
-    if path and Path(path).is_file():
-        return Path(path)
-    local = root / ".ui" / "app-icon.ico"
-    return local if local.is_file() else None
+from msgx import conda_runtime
+from msgx.app_icon import selected_icon  # 与运行窗口共用图标选择，避免两种入口各自回退。
 
 
 def refresh_shell_icon(target: Path) -> None:

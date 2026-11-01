@@ -38,7 +38,11 @@
 
 ICO原样保存作者提供的尺寸帧；PNG各尺寸直接由原图采样，避免从已缩小帧再次放大。运行窗口使用 `iconphoto(False, ...)`。导入后保存本地副本，升级保留 `.ui`，不能让新版本回到默认图标。
 
-`tools/build_launcher.py` 从偏好或 `.ui/app-icon.ico` 选图标、备份旧EXE并重建。窗口与任务栏、EXE资源像素、Explorer目录图标分别验证。历史上资源正确仍曾显示旧大图，发送 `SHCNE_ASSOCCHANGED` 并刷新目录后解决；无需删除系统缓存或重启Explorer。
+1.0.0 的公共默认图标为 Git 管理的 `assets/app-icon.ico`；`app_icon.selected_icon()` 是窗口与 `tools/build_launcher.py` 共用的选择入口，顺序为个人有效路径、偏好旁的本机图标副本、公共默认资源。默认资源按源码位置定位，不受个人 `MSGX_ROOT` 影响。`.ui/` 继续忽略，新克隆无需复制维护者个人偏好即可用默认图标，用户仍可自行更换。
+
+构建会备份旧EXE并重建。窗口与任务栏、EXE资源像素、Explorer目录图标分别验证。历史上资源正确仍曾显示旧大图，发送 `SHCNE_ASSOCCHANGED` 并刷新目录后解决；无需删除系统缓存或重启Explorer。
+
+- 2026-10-31：默认图标原样复制本机已选ICO，逐字节相同，保留16/20/24/32/40/48/64/128/256九种尺寸与透明度。`tests/test_icon_windows.py` 6项通过，包含无个人.ui的默认选择、个人覆盖、构建选择一致性与实际Windows大小窗口像素；既有自定义图标导入反馈2项通过。测试在沙箱外普通Windows令牌下运行，以绕过沙箱对Python新建0700临时目录的访问限制；未启动生产应用或覆盖旧EXE。上述选择器与窗口测试不等于本次新EXE资源和Explorer显示已验收。
 
 - 2026-10-09 实际Explorer显示：`data/diagnostics/v0.9.4/explorer-after.png`。
 - 2026-10-13 新启动器隔离运行及16/32帧验证：`data/diagnostics/dependency-singlefile-20261013/launcher-verification.json`。

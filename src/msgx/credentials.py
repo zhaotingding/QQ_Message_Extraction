@@ -42,6 +42,10 @@ def _target(url: str, profile_id: str = "") -> str:
     return "msgx/api/" + hashlib.sha256((scope + endpoint(url)).encode()).hexdigest()
 
 
+def target_name(url: str, profile_id: str = "") -> str:
+    return _target(url, profile_id)  # 仅公开凭据定位标识，不读取、解密或输出密钥。
+
+
 def save(url: str, key: str, *, profile_id: str = "") -> None:
     key = key.strip()
     if not key or any(c.isspace() for c in key) or len(key.encode("utf-8")) > 2500:

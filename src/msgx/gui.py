@@ -47,6 +47,8 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
         self.stop_file = self.ui_dir / "stop.signal"
 
         self.prefs = prefs_mod.load(self.prefs_file)
+        from .ui.theme import ThemeManager
+        self.theme = ThemeManager(self.root)  # 外观与业务设置分离，后续切换只保存ui.theme。
         self.service = ServiceProcess()
         self._service_restart_id = None
         self.events: queue.Queue = queue.Queue()
@@ -99,6 +101,8 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
         self._group_ids: list[str] = []
         self._build()
         self._load_into_widgets()
+        from .ui.theme import theme_name
+        self.theme.apply(theme_name(self.prefs))  # 先完成原控件构建，再统一覆盖原固定浅色。
         self._apply_app_icon()
         self.refresh_groups()
         self.root.after(0, self.refresh_report_history)
@@ -125,6 +129,8 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
 
         style = ttk.Style(self.root)
         style.theme_use("clam")
+        from .ui.check_style import install_check_style
+        install_check_style(self.root, style)  # clam 默认选中标记是叉，统一替换为勾。
         self.root.option_add("*Font", (FONT, 10))
         style.configure(".", font=(FONT, 10))
         style.configure("TButton", padding=(8, 4), font=(FONT, 10))
@@ -167,10 +173,8 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
 
 
     def _apply_app_icon(self) -> None:
-        path = (self.prefs.get("ui") or {}).get("icon_path")
-        local_icon = self.prefs_file.parent / "app-icon.ico" if hasattr(self, "prefs_file") else ROOT / ".ui" / "app-icon.ico"
-        if (not path or not Path(path).is_file()) and local_icon.is_file():
-            path = local_icon
+        from .app_icon import DEFAULT_ICON, selected_icon
+        path = selected_icon(ROOT, self.prefs, getattr(self, "prefs_file", None))  # 个人覆盖与项目默认图标共用优先级。
         if not path:
             return
         try:
@@ -180,7 +184,8 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
                 frames = [icon.ico.getimage(size).convert("RGBA") for size in sorted(icon.ico.sizes())]
             self._icon_photos = [ImageTk.PhotoImage(frame, master=self.root) for frame in frames]
             self.root.iconphoto(False, *self._icon_photos)
-            self.v_icon_status.set("已应用自定义图标；以后启动继续使用")
+            self.v_icon_status.set("已应用项目默认图标；可在设置中更换" if path.resolve() == DEFAULT_ICON.resolve()
+                                   else "已应用自定义图标；以后启动继续使用")
         except (OSError, tk.TclError):
             self.v_icon_status.set("图标加载失败，请重新选择 PNG 或 ICO")
 
@@ -265,6 +270,9 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
             self._apply_health(value)
         elif kind == "billing":
             self._apply_billing(value)
+        elif kind == "automation_done":
+            proc, result, error = value
+            self.automation.receive(result if proc is self.proc else {}, error if proc is self.proc else "服务已变化，请重新刷新记录")
         elif kind == "billing_done":
             self._billing_finished(value)
         elif kind == "summary_retry_done":

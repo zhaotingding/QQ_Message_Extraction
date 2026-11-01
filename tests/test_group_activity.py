@@ -156,16 +156,54 @@ class GroupActivityTests(ActivityFixture, unittest.TestCase):
         self.assertEqual(self.store.recent_messages(group_id="' OR 1=1 --"), [])
         self.assertEqual(self.store.recent_messages(group_id="unknown"), [])
 
-    def test_activity_is_one_read_only_query(self):
+    def test_activity_uses_two_bounded_read_only_queries_not_one_query_per_group(self):
         self.add_message()
         statements = []
         before = self.store.conn.total_changes
         self.store.conn.set_trace_callback(statements.append)
         self.activity()
         self.store.conn.set_trace_callback(None)
-        self.assertEqual(len(statements), 1)
+        self.assertEqual(len(statements), 2)  # 榜单一次、所选单群趋势一次，不按每群重复扫描。
         self.assertTrue(statements[0].startswith("WITH known_groups"))
         self.assertEqual(self.store.conn.total_changes, before)
+
+    def test_watch_selection_and_current_account_hide_other_groups(self):
+        self.add_message("wanted", START + 10)
+        self.add_message("unwatched", START + 11)
+        self.store.insert_message(Msg(msg_id="foreign", group_id="foreign", ts=START, text="另一账号消息"),
+                                  bot_uin="account-b")
+        self.store.sync_account_groups("account-a", {"wanted", "unwatched"})
+        activity = self.store.group_activity(NOW, account="account-a", watch_groups=["wanted", "foreign"])
+        self.assertEqual([g["group_id"] for g in activity["groups"]], ["wanted"])
+        self.assertEqual(activity["trend"]["group_id"], "wanted")
+        self.assertEqual(activity["trend"]["counts"][-1], 1)
+
+    def test_trend_zero_fills_beijing_days_and_filters_messages_and_receipts(self):
+        self.add_message("wanted", START - 6 * 86400)
+        self.add_message("wanted", START - 2 * 86400 + 10)
+        self.add_message("wanted", START + 10)
+        self.add_message("wanted", START + 11, filtered=True)
+        self.store.insert_message(Msg(msg_id="other-account", group_id="wanted", ts=START + 12, text="其他账号"),
+                                  bot_uin="account-b")
+        result = self.store.group_activity(NOW, account="account-a", trend_group="wanted", days=7)
+        self.assertEqual(result["trend"]["dates"], ["2026-09-24", "2026-09-25", "2026-09-26",
+                                                    "2026-09-27", "2026-09-28", "2026-09-29", "2026-09-30"])
+        self.assertEqual(result["trend"]["counts"], [1, 0, 0, 0, 1, 0, 1])
+        self.assertIn("清理", result["trend"]["note"])
+        self.assertEqual(result["groups"][0]["count"], 1)
+
+    def test_snapshot_removes_left_groups_without_deleting_history_and_empty_is_explicit(self):
+        self.add_message("kept")
+        self.add_message("left", START + 1)
+        self.store.sync_account_groups("account-a", {"kept"})
+        self.assertEqual([r[0] for r in self.store.group_rows("account-a")], ["kept"])
+        self.assertEqual([g["group_id"] for g in self.store.group_activity(NOW, account="account-a")["groups"]], ["kept"])
+        self.assertIn("left", self.store.group_names())
+        self.assertEqual(len(self.store.recent_messages(group_id="left")), 1)
+        self.store.sync_account_groups("account-a", set())
+        self.assertEqual(self.store.group_rows("account-a"), [])
+        self.assertEqual(self.store.group_activity(NOW, account="account-a")["groups"], [])
+        self.assertEqual(len(self.store.recent_messages()), 2)
 
 
 class GroupActivityRouteTests(ActivityFixture, unittest.IsolatedAsyncioTestCase):

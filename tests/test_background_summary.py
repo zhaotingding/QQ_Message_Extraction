@@ -127,6 +127,42 @@ class BackgroundSummaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["state"], "retry")
         self.assertAlmostEqual(job["next_attempt_at"], 162, delta=1)
 
+    async def test_flex_fallback_tier_survives_restart_without_response_tier(self):
+        responses = [SimpleNamespace(status=429, headers={}, text=AsyncMock(return_value=json.dumps(
+            {"error": {"code": "resource_unavailable"}}))), response("queued")]
+
+        @asynccontextmanager
+        async def post(url, **options):
+            self.posts.append((url, json.loads(options["data"])))
+            yield responses.pop(0)
+
+        self.llm.session.return_value.post = post
+        with patch("msgx.llm.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(BackgroundResponsePending):
+                await self.run_daily()
+        saved = self.store.summary_request(self.key)
+        self.assertEqual(saved["metadata"]["submitted_service_tier"], "default")
+        self.store.close()
+        self.store = Store(self.folder / "messages.db")
+        self.llm.store = self.store
+
+        @asynccontextmanager
+        async def get(url, **options):
+            self.gets.append(url)
+            item = response("completed")
+            value = json.loads(await item.text())
+            value.pop("service_tier")
+            item.text = AsyncMock(return_value=json.dumps(value))
+            yield item
+
+        with patch("msgx.config.api_key", return_value="synthetic-key"), patch.object(LLM, "session", AsyncMock(return_value=SimpleNamespace(post=post, get=get))):
+            await self.run_daily()
+        self.assertEqual([body["service_tier"] for _, body in self.posts], ["flex", "default"])
+        ledger = self.store.api_usage_details()["items"]
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(json.loads(ledger[0]["pricing"])["requested_service_tier"], "default")
+        self.assertAlmostEqual(ledger[0]["cost_cny"], (80*.1+20*.01+10*.5)/1_000_000*7)
+
     async def test_creation_without_id_stays_blocked_until_confirmed(self):
         self.llm._post = AsyncMock(side_effect=AmbiguousResponseError("提交中断，未收到 ID"))
         with self.assertRaises(AmbiguousResponseError):

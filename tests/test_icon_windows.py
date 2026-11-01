@@ -13,6 +13,53 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from msgx.gui import App
+from msgx.app_icon import DEFAULT_ICON, selected_icon
+
+
+class IconSelectionTests(unittest.TestCase):
+    def test_clean_personal_root_uses_source_asset_without_creating_local_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.assertEqual(selected_icon(root), DEFAULT_ICON)
+            self.assertEqual(list(root.iterdir()), [])
+            with Image.open(DEFAULT_ICON) as icon:
+                self.assertTrue({(16, 16), (32, 32), (256, 256)} <= icon.ico.sizes())
+                self.assertEqual(icon.ico.getimage((256, 256)).convert("RGBA").getextrema()[3][0], 0)
+
+    def test_personal_override_then_local_copy_then_default(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            local = root / ".ui" / "app-icon.ico"
+            local.parent.mkdir()
+            local.write_bytes(b"local")
+            custom = root / "custom.ico"
+            custom.write_bytes(b"custom")
+            saved = {"ui": {"icon_path": str(custom)}}
+            self.assertEqual(selected_icon(root, saved), custom)
+            custom.unlink()
+            self.assertEqual(selected_icon(root, saved), local)
+            local.unlink()
+            self.assertEqual(selected_icon(root, saved), DEFAULT_ICON)
+
+    def test_custom_preferences_location_and_build_use_same_rule(self):
+        from importlib.util import module_from_spec, spec_from_file_location
+        from msgx import yaml_config
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            personal = root / "personal"
+            personal.mkdir()
+            local = personal / "app-icon.ico"
+            local.write_bytes(b"local")
+            self.assertEqual(selected_icon(root, {}, personal / "preferences.yaml"), local)
+            custom = root / "custom.ico"
+            custom.write_bytes(b"custom")
+            preferences = root / ".ui" / "preferences.yaml"
+            preferences.parent.mkdir()
+            preferences.write_text(yaml_config.dumps({"ui": {"icon_path": "custom.ico"}}), encoding="utf-8")
+            spec = spec_from_file_location("icon_build_test", Path(__file__).resolve().parents[1] / "tools/build_launcher.py")
+            module = module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.assertEqual(module.selected_icon(root), custom)
 
 
 def window_icon(root, kind):
@@ -66,6 +113,26 @@ def icon_pixels(handle):
 
 @unittest.skipUnless(os.name == "nt", "Windows 图标句柄测试")
 class WindowIconTests(unittest.TestCase):
+    def test_clean_clone_sets_default_small_and_large_window_icons(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = tk.Tk()
+            try:
+                root.attributes("-alpha", 0)
+                app = App.__new__(App)
+                app.root, app.prefs = root, {}
+                app.prefs_file = Path(folder) / "preferences.yaml"
+                app.v_icon_status = tk.StringVar(root)
+                app._apply_app_icon()
+                root.update()
+                with Image.open(DEFAULT_ICON) as icon:
+                    for kind in (0, 1):
+                        actual = window_icon(root, kind)
+                        expected = icon.ico.getimage(actual.size).convert("RGBA")
+                        self.assertEqual(actual.tobytes(), expected.tobytes())
+                self.assertIn("项目默认图标", app.v_icon_status.get())
+            finally:
+                root.destroy()
+
     def test_missing_preference_reuses_saved_local_icon(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "app-icon.ico"

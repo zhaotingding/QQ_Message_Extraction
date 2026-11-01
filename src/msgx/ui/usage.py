@@ -10,7 +10,7 @@ from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 from .. import security
 from ..summarize import BEIJING
-from ..usage_chart import daily_series, day_description, draw_daily_costs
+from ..usage_chart import PURPOSE_COLORS, daily_series, day_description, draw_daily_costs
 from ..local_client import request_json
 from .common import FONT
 
@@ -19,7 +19,7 @@ class UsagePage:
     def _build_usage_tab(self, nb: ttk.Notebook) -> None:
         self.usage_tab = ttk.Frame(nb, padding=12)
         nb.add(self.usage_tab, text="消费明细")
-        self.usage_viewport = tk.Canvas(self.usage_tab, highlightthickness=0, yscrollincrement=24)
+        self.usage_viewport = tk.Canvas(self.usage_tab, highlightthickness=0)  # 不固定24像素对齐，窄窗滚到底时末行也必须完整可达。
         page_scroll = ttk.Scrollbar(self.usage_tab, command=self.usage_viewport.yview)
         self.usage_viewport.configure(yscrollcommand=page_scroll.set)
         page_scroll.pack(side="right", fill="y")
@@ -135,9 +135,9 @@ class UsagePage:
         if data.get("error"):
             self.v_usage.set(f"消费明细读取失败：{security.redact(str(data['error']))}")
             return
-        self.v_usage.set(f"已刷新 {time.strftime('%H:%M:%S')} · 当前用途总金额 ¥{data.get('visible_cost_cny', 0):.6f}；今日消费 ¥{data.get('today_cost_cny', 0):.6f}。"
-                         "仅显示摘要总结、图片理解；金额为本地估算，今日按北京时间。"
-                         "旧记录缺缓存写入、服务层级或美元信息，无法精确对账；未知费用另行标注。")
+        self.v_usage.set(f"已刷新 {time.strftime('%H:%M:%S')} · 当前用途累计 ¥{data.get('visible_cost_cny', 0):.6f}；今日消费 ¥{data.get('today_cost_cny', 0):.6f}（北京·估算）。"
+                         "用途：摘要、图片（手动/自动）、提示词更新。"
+                         "旧记录缺档位、缓存写入或美元信息时无法精确对账；未知费用另列。")
         utc_days = data.get("openai_utc_days", [])
         utc_labels = []
         for day in utc_days[:3]:
@@ -149,7 +149,7 @@ class UsagePage:
         self.usage_groups.delete(*self.usage_groups.get_children())
         self._usage_numbers = {self.usage_groups: {}, self.usage_table: {}}
         for row in data.get("groups", []):
-            if row["purpose"] not in ("摘要总结", "图片理解"):
+            if row["purpose"] not in PURPOSE_COLORS:
                 continue
             iid = self.usage_groups.insert("", "end", values=(row["purpose"], row["source_type"], row["calls"],
                 row["in_tokens"] or 0, row["out_tokens"] or 0,
@@ -161,7 +161,7 @@ class UsagePage:
             self._usage_numbers[self.usage_groups][iid] = dict(calls=row["calls"], input=row["in_tokens"],
                                                               output=row["out_tokens"], cost=row["cost_cny"], today=row.get("today_cost_cny", 0), usd=row.get("cost_usd"))
         self.usage_table.delete(*self.usage_table.get_children())
-        self._usage_items = {str(r["id"]): r for r in data.get("items", []) if r["purpose"] in ("摘要总结", "图片理解")}
+        self._usage_items = {str(r["id"]): r for r in data.get("items", []) if r["purpose"] in PURPOSE_COLORS}
         for iid, row in self._usage_items.items():
             self.usage_table.insert("", "end", iid=iid, values=(datetime.fromtimestamp(row["ts"], BEIJING).strftime("%m-%d %H:%M:%S"),
                 row["purpose"], row["source_label"], *[row[k] if row[k] is not None else "未知" for k in ("in_tokens", "out_tokens", "cache_hit_tokens")],

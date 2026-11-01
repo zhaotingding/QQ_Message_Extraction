@@ -16,7 +16,7 @@ class UsageStore:
         if summary_key and self.summary_request(summary_key)["accounted"]:
             return
         ids = list(dict.fromkeys(source_ids))
-        source_type = ("汇总报告" if purpose in ("日报合并", "摘要合并", "摘要成稿") else "系统检查") if not ids else "多条消息汇总"
+        source_type = ("汇总报告" if purpose in ("日报合并", "摘要合并", "摘要成稿", "提示词更新") else "系统检查") if not ids else "多条消息汇总"
         if len(ids) == 1:
             row = self.get_message(ids[0])
             source_type = {"text": "文字消息", "image": "纯图片", "mixed": "图文/附件"}.get(
@@ -47,7 +47,7 @@ class UsageStore:
         end = start + 86400
         # 仅显示现用流程；旧账不删除、不改写。超上下文步骤仍归入摘要总结。
         purpose = "CASE WHEN purpose IN ('摘要分块','超上下文合并') THEN '摘要总结' ELSE purpose END"
-        where = "WHERE purpose IN ('摘要总结','图片理解','摘要分块','超上下文合并')" if active_only else ""
+        where = "WHERE purpose IN ('摘要总结','图片理解','自动图片理解','提示词更新','摘要分块','超上下文合并')" if active_only else ""
         items = [dict(r) for r in self.conn.execute(f"SELECT * FROM api_calls {where} ORDER BY id DESC LIMIT ?", (limit,))]
         for item in items:
             if active_only and item["purpose"] in ("摘要分块", "超上下文合并"):
@@ -77,7 +77,7 @@ class UsageStore:
             f"SELECT strftime('%Y-%m-%d',ts,'unixepoch','+8 hours') AS day,{purpose} AS purpose,"
             " SUM(cost_cny) AS cost_cny,SUM(cost_cny IS NULL) AS unknown_calls,COUNT(*) AS calls"
             " FROM api_calls WHERE ts>=? AND ts<?"
-            " AND purpose IN ('摘要总结','图片理解','摘要分块','超上下文合并')"
+            " AND purpose IN ('摘要总结','图片理解','自动图片理解','提示词更新','摘要分块','超上下文合并')"
             " GROUP BY 1,2 ORDER BY 1,2", (start - 29 * 86400, end))]
         return {"items": items, "groups": grouped, "recorded_cost_cny": known,
                 "openai_utc_days": utc_days, "today_timezone": "Asia/Shanghai",

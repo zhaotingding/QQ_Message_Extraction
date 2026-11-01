@@ -11,6 +11,8 @@ from .models import message_links
 from .message_store import MessageStore, VISION_MAX_TRIES
 from .summary_store import SummaryStore
 from .usage_store import UsageStore
+from .image_analysis_store import ImageAnalysisStore, IMAGE_COLUMNS
+from .prompt_evolution import PROMPT_SCHEMA
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS groups (
@@ -198,7 +200,10 @@ GROUP_MIGRATIONS = (
     ("bot_uin", "TEXT DEFAULT ''"),
 )
 
-class Store(MessageStore, SummaryStore, UsageStore):
+SCHEMA += PROMPT_SCHEMA  # 新表仅保存动态观察与任务状态，不回填或覆盖旧提示词。
+
+
+class Store(MessageStore, SummaryStore, UsageStore, ImageAnalysisStore):
     def __init__(self, db_path: str | Path, *, filters: dict | None = None, readonly: bool = False):
         self.filters = filters if filters is not None else {}
         p = Path(db_path)
@@ -206,6 +211,7 @@ class Store(MessageStore, SummaryStore, UsageStore):
         if readonly:
             self.conn = sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
             self.conn.row_factory = sqlite3.Row
+            self._has_current_group_snapshots = bool(self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='account_group_snapshots'").fetchone())
             return
         p.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(p), check_same_thread=False)
@@ -240,12 +246,21 @@ class Store(MessageStore, SummaryStore, UsageStore):
                            ("request_id", "TEXT NOT NULL DEFAULT ''"), ("pricing", "TEXT NOT NULL DEFAULT ''"),
                            ("cache_write_tokens", "INTEGER"))),
             ("summaries", (("source_sig", "TEXT NOT NULL DEFAULT ''"),)),
+            ("message_images", IMAGE_COLUMNS),
         ):
             cols = {c[1] for c in self.conn.execute(f"PRAGMA table_info({table})")}
             for name, spec in migs:
                 if name not in cols:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
 
+        self.conn.execute("CREATE TABLE IF NOT EXISTS account_group_snapshots"
+                          "(account TEXT PRIMARY KEY, group_ids TEXT NOT NULL, updated_at REAL NOT NULL)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_image_screen ON message_images(screen_state,id)"
+                          " WHERE media_state='done' AND media_path<>''")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_image_screen_version ON message_images(screen_state,screen_version,id)"
+                          " WHERE media_state='done' AND media_path<>''")  # 新规则扫完后直接命中空范围，不每轮遍历旧 done。
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_image_auto ON message_images(auto_state,screen_score,id)"
+                          " WHERE screen_state='done' AND vision_state<>'ok'")
         self._migrate_accounts(backfill=version < 705)
         if links_missing:
             self.conn.execute("ALTER TABLE messages ADD COLUMN mentioned_ids TEXT NOT NULL DEFAULT '[]'")

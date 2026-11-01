@@ -112,7 +112,7 @@ class RealtimeGuiTests(unittest.TestCase):
     def detail(self):
         return self.app.rt_detail.get("1.0", "end-1c")
 
-    def test_table_previews_each_images_ocr_without_semantics_or_extra_columns(self):
+    def test_table_previews_each_images_best_saved_text_without_extra_columns(self):
         self.render()
         app = self.app
         self.assertNotIn("ocr", app.rt.cget("columns"))
@@ -120,8 +120,8 @@ class RealtimeGuiTests(unittest.TestCase):
         self.assertEqual(app.rt.get_children(), ("3", "2:201", "2:202", "1"))
         self.assertIn("今天比较两组实验结果", app.rt.set("3", "text"))
         self.assertEqual(app.rt.set("2:201", "text"), "[图片] OCR:第一张图片：控制实验条件后再比较结果。")
-        self.assertEqual(app.rt.set("2:202", "text"), "[图片] OCR:第二张图片：学习计划与记录。")
-        self.assertNotIn("学习进度表", app.rt.set("2:202", "text"))
+        self.assertEqual(app.rt.set("2:202", "text"), "[图片] 语义:一张学习进度表，各列对应日期和任务。")
+        self.assertNotIn("学习计划与记录", app.rt.set("2:202", "text"))
         self.assertEqual(app.rt.set("2:201", "image"), "打开")
         self.assertIn("识别", app.rt.set("2:201", "recognize"))
 
@@ -336,6 +336,53 @@ class RealtimeGuiTests(unittest.TestCase):
         self.assertEqual(after, before)
         self.assertIn("失败", self.app.v_rt_status.get())
 
+    def test_activity_trend_uses_compact_group_number_and_only_redraws_changed_series(self):
+        payload = sample_payload()
+        payload["activity"]["trend"] = {"group_id": "1002", "group_name": "同名交流群", "days": 7,
+                                         "dates": ["2026-09-24", "2026-09-25", "2026-09-26"],
+                                         "counts": [5, 0, 3], "note": "保留数据；0不代表真实零活跃"}
+        self.render(payload)
+        self.assertEqual(self.app.rt_activity.item("1002", "values")[:2], ("同名交流群", "1002"))
+        self.assertLessEqual(self.app.rt_activity.column("id", "width"), 110)
+        self.assertEqual(self.app.rt_activity_chart.series["counts"], [5, 0, 3])
+        self.assertIn("0不代表", self.app.rt_activity_chart.note.cget("text"))
+        with patch.object(self.app.rt_activity_chart, "_draw") as draw:
+            self.render(payload)
+        draw.assert_not_called()
+
+    def test_removed_current_group_disappears_from_filter_and_older_trend_result_is_ignored(self):
+        self.render()
+        self.app._rt_group_id = "1002"
+        self.app.v_rt_group.set("同名交流群 (1002)")
+        payload = sample_payload()
+        payload["activity"]["groups"] = [payload["activity"]["groups"][1]]
+        self.app._render_activity(payload["activity"])
+        self.assertEqual(self.app._rt_group_id, "")
+        self.assertNotIn("1002", self.app._rt_group_labels.values())
+        self.app.v_activity_days.set("30")
+        payload["_activity_key"] = ("", 7)
+        with patch.object(self.app, "_render_activity") as render:
+            self.render(payload)
+        render.assert_not_called()
+
+    def test_image_screening_explains_score_and_prevents_duplicate_running_request(self):
+        payload = sample_payload()
+        payload["items"][1]["images"][0].update(screen_score=82, screen_state="done",
+                                               screen_reason="包含技术报错与上下文求助", auto_state="running")
+        self.render(payload)
+        self.select("2:201")
+        self.assertIn("初筛:82", self.app.rt.item("2:201", "values")[3])
+        self.assertIn("本地重要度：82/100", self.detail())
+        self.assertIn("包含技术报错", self.detail())
+        self.assertIn("自动分析状态：正在分析", self.detail())
+        columns = list(self.app.rt.cget("columns"))
+        with patch.object(self.app.rt, "identify_row", return_value="2:201"), \
+                patch.object(self.app.rt, "identify_column", return_value=f"#{columns.index('recognize') + 1}"), \
+                patch.object(self.app, "_start_rt_action") as action:
+            self.app._on_rt_click(SimpleNamespace(x=1, y=1))
+        action.assert_not_called()
+        self.assertIn("避免重复调用", self.app.status.get())
+
     def test_picture_actions_keep_image_identity_after_column_removal(self):
         self.render()
         app = self.app
@@ -469,6 +516,39 @@ class RealtimeGuiTests(unittest.TestCase):
             x, _, width, _ = app.rt.bbox("3", column)
             self.assertGreaterEqual(x, 0)
             self.assertLessEqual(x + width, app.rt.winfo_width())
+
+
+    def test_image_semantics_replace_ocr_preview_and_waiting_is_visible(self):
+        rows = sample_payload()["items"]
+        picture = next(row for row in rows if row.get("images"))
+        image = picture["images"][0]
+        image.update(vision_text="模型已理解的关键语义", ocr_text="原始OCR证据", auto_state="waiting",
+                     auto_ready_at=picture["ts"] + 900)
+        self.app._render_messages(rows)
+        iid = f"{picture['id']}:{image['id']}"
+        preview = self.app.rt.set(iid, "text")
+        self.assertIn("语义:模型已理解的关键语义", preview)
+        self.assertNotIn("原始OCR证据", preview)
+        self.assertIn("待分析", preview)
+        self.app._show_message_detail(self.app._rt_rows[iid])
+        detail = self.app.rt_detail.get("1.0", "end-1c")
+        self.assertIn("原始OCR证据", detail)
+        self.assertIn("最早分析时间", detail)
+
+
+    def test_only_api_attempt_or_saved_semantics_get_green_tag(self):
+        rows = sample_payload()["items"]
+        picture = next(row for row in rows if row.get("images"))
+        first, second = picture["images"]
+        first.update(vision_requested_at=picture["ts"], vision_text="", vision_state="failed")
+        second.update(vision_requested_at=0, vision_text="", auto_state="waiting")
+        picture["relation"] = "reply"
+        self.app._render_messages(rows)
+        first_iid, second_iid = (f"{picture['id']}:{image['id']}" for image in (first, second))
+        self.assertIn("image_api", self.app.rt.item(first_iid, "tags"))
+        self.assertIn("related", self.app.rt.item(first_iid, "tags"))
+        self.assertNotIn("image_api", self.app.rt.item(second_iid, "tags"))
+        self.assertEqual(str(self.app.rt.tag_configure("image_api", "background")), "#dff3e5")
 
 
 if __name__ == "__main__":

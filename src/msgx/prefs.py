@@ -92,6 +92,17 @@ def save(prefs: dict, path: Path | str) -> None:
     tmp.replace(p)
 
 
+def update(values: dict, path: Path | str) -> dict:
+    """局部更新最新本地文件；独立模块保存不能覆盖其他模块刚落盘的值。"""
+    p = Path(path)
+    current = yaml_config.read(p) if p.exists() else {}  # 损坏文件必须报错，不用默认值覆盖原件。
+    if not isinstance(current, dict):
+        raise ValueError("本地偏好必须是 YAML 对象，原文件未修改")
+    result = {**current, **values}  # 调用方明确提供整个模块，false、0与空列表均原样保留。
+    save(result, p)
+    return result
+
+
 def _merge(base: dict, override: dict) -> dict:
     out = dict(base)
     for k, v in override.items():
@@ -145,6 +156,14 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
     这样「界面留空」等于「沿用配置文件」，而不是「清空」。
     """
     out = json.loads(json.dumps(cfg, ensure_ascii=False, default=str))
+    if "image_analysis" in prefs:
+        from .image_policy import validate_analysis
+        media = out.setdefault("media", {})
+        media["analysis"] = validate_analysis({**media.get("analysis", {}), **prefs["image_analysis"]})
+    if "image_api_profile" in prefs:
+        out.setdefault("media", {})["image_api_profile"] = str(prefs["image_api_profile"] or "")
+    if "prompt_evolution" in prefs:
+        out.setdefault("summary", {})["prompt_evolution"] = dict(prefs["prompt_evolution"])
 
     prompt = str(prefs.get("summary_prompt") or "").strip()
     if prompt:
