@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import logging
+import time
 from datetime import date
 
 from aiohttp import WSMsgType, web
@@ -183,19 +184,30 @@ async def _messages_recent(request: web.Request) -> web.Response:
     except ValueError:
         days = 14
     days = days if days in (7, 14, 30) else 14
+    revision = getattr(pipe, "activity_revision", 0)
+    cache_key = (account, tuple(sorted(getattr(pipe, "watch", ()))),
+                 json.dumps(getattr(pipe.store, "filters", {}), sort_keys=True),
+                 request.query.get("activity_group", ""), days, int((time.time()+28800)//86400), revision)
+    cache = getattr(pipe, "activity_cache", None)
+    cached = (cache[2] if cache and cache[0] == cache_key and time.monotonic()-cache[1] < 30
+              and request.query.get("activity_refresh") != "1" else None)
 
     def query(store):
-        # 一个只读事务让消息、本人关联和群统计使用相同快照；不借用接收线程的连接。
+        # 消息仍实时读取；月度统计短暂复用，避免三秒轮询反复扫描整个历史窗口。
         return {"ok": True,
                 "items": [dict(row) for row in store.recent_messages(limit, images_only=images_only,
                            group_id=group_id, account=account)],
                 "related": store.recent_messages(limit, group_id=group_id, account=account,
                             related_only=True) if account else [],
-                "related_account": account, "activity": store.group_activity(
+                "related_account": account, "activity": cached if cached is not None else store.group_activity(
                     account=account, watch_groups=getattr(pipe, "watch", ()),
                     trend_group=request.query.get("activity_group", ""), days=days)}
 
-    return web.json_response(await _read_store(pipe.store, query))
+    result = await _read_store(pipe.store, query)
+    if revision == getattr(pipe, "activity_revision", 0) and cached is None:
+        pipe.activity_cache = (cache_key, time.monotonic(), result["activity"])
+    result["activity"] = {**result["activity"], "refresh_seconds": 30}
+    return web.json_response(result)
 
 
 async def _read_store(source: Store, query):
@@ -285,6 +297,34 @@ async def _prompt_status(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, **request.app["pipe"].prompt_evolution.status()})
 
 
+async def _group_operation(request: web.Request) -> web.Response:
+    if request.remote not in ("127.0.0.1", "::1") or not _local_edit_allowed(request) or not _auth_ok(request):
+        return web.json_response({"ok": False, "error": "仅允许本机授权 JSON 操作"}, status=403)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("请求必须是对象")
+        actions = request.app["pipe"].group_actions
+        operation = request.match_info["operation"]
+        if operation == "preview":
+            result = await actions.prepare(body)
+        elif operation == "confirm":
+            result = await actions.confirm(str(body.get("token", "")), body.get("confirmed") is True)
+        else:
+            actions.cancel(str(body.get("job_id", "")))
+            result = {"note": "已请求停止后续群，正在等待当前提交结果"}
+        return web.json_response({"ok": True, "result": result})
+    except (ValueError, TypeError, KeyError, RuntimeError, OSError, asyncio.TimeoutError) as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=409)
+
+
+async def _group_operation_status(request: web.Request) -> web.Response:
+    if request.remote not in ("127.0.0.1", "::1") or request.headers.get("Origin") or not _auth_ok(request):
+        return web.json_response({"ok": False, "error": "仅允许本机授权读取"}, status=403)
+    result = request.app["pipe"].store.group_job(request.query.get("job_id", ""))
+    return web.json_response({"ok": True, "result": result})
+
+
 async def _prompt_action(request: web.Request) -> web.Response:
     if request.remote not in ("127.0.0.1", "::1") or not _local_edit_allowed(request) or not _auth_ok(request):
         return web.json_response({"ok": False, "error": "仅允许本机授权 JSON 操作"}, status=403)
@@ -338,4 +378,6 @@ def build_app(cfg: dict, pipeline) -> web.Application:
     app.router.add_get("/prompt-evolution", _prompt_status)
     app.router.add_post(r"/prompt-evolution/{action:update|restore}", _prompt_action)
     app.router.add_post("/groups/refresh", _groups_refresh)
+    app.router.add_post(r"/groups/operations/{operation:preview|confirm|cancel}", _group_operation)
+    app.router.add_get("/groups/operations/status", _group_operation_status)
     return app

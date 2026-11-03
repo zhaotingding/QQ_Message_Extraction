@@ -396,7 +396,7 @@ class MessageStore:
 
     def recent_messages(self, limit: int = 60, images_only: bool = False, group_id: str = "",
                         account: str = "", related_only: bool = False,
-                        keyword_rules: tuple | None = None, offset: int = 0) -> list:
+                        keyword_rules: tuple | None = None, offset: int = 0, row_ids=None) -> list:
         """最近入库的消息（倒序）。带群名与图片处理状态，供界面直接展示。"""
         keyword_sql = ""
         if keyword_rules is not None:
@@ -408,6 +408,12 @@ class MessageStore:
                            " (SELECT 1 FROM message_images i WHERE i.message_row=m.id"
                            " AND keyword_match('',i.ocr_text,i.vision_text)))")
         sender_sql, sender_params = self._sender_condition("m.")
+        id_sql, id_params = "", ()
+        if row_ids is not None:
+            id_params = tuple(int(value) for value in row_ids)
+            if not id_params:
+                return []
+            id_sql = f" AND m.id IN ({','.join('?' for _ in id_params)})"  # 上下文定位复用现有详情与多图读取。
         rows = list(
             self.conn.execute(
                 "SELECT m.id, m.group_id, m.sender_name, m.sender_id, m.ts, m.text, m.msg_type,"
@@ -425,9 +431,9 @@ class MessageStore:
                 " AND (?='' OR m.group_id=?)"
                 " AND (?=0 OR (relation<>'' AND m.at_all=0))"
                 f" AND {sender_sql}"
-                + keyword_sql + " ORDER BY m.ts DESC, m.id DESC LIMIT ? OFFSET ?",
+                + keyword_sql + id_sql + " ORDER BY m.ts DESC, m.id DESC LIMIT ? OFFSET ?",
                 (account, account, account, account, account, int(images_only), group_id, group_id,
-                 int(related_only), *sender_params, limit, offset),
+                 int(related_only), *sender_params, *id_params, limit, offset),
             )
         )
         if not rows:
@@ -439,6 +445,27 @@ class MessageStore:
                 " ORDER BY message_row,image_index", tuple(by_id)):
             by_id[image["message_row"]]["images"].append(dict(image))
         return result
+
+    def messages_around(self, row_id: int, account: str = "", radius: int = 40) -> list:
+        """按同群时间和主键定位前后记录；不受实时列表条数及图片筛选限制。"""
+        anchor = self.get_message(row_id)
+        if anchor is None:
+            return []
+        sender_sql, sender_params = self._sender_condition("m.")
+        receipt = " AND EXISTS(SELECT 1 FROM message_receipts r WHERE r.message_row=m.id AND r.account=?)" if account else ""
+        common = f" FROM messages m WHERE m.group_id=? AND {sender_sql}{receipt}"
+        base = (anchor["group_id"], *sender_params, *((account,) if account else ()))
+        allowed = self.conn.execute("SELECT m.id" + common + " AND m.id=?", (*base, row_id)).fetchone()
+        if not allowed:
+            return []  # 已过滤或不属于当前账号的命中不绕过查询范围。
+        ids = [row_id]
+        radius = max(1, min(int(radius), 100))
+        for op, direction in (("<", "DESC"), (">", "ASC")):
+            rows = self.conn.execute("SELECT m.id" + common +
+                f" AND (m.ts,m.id){op}(?,?) ORDER BY m.ts {direction},m.id {direction} LIMIT ?",
+                (*base, anchor["ts"], row_id, radius))
+            ids.extend(row[0] for row in rows)
+        return self.recent_messages(len(ids), account=account, row_ids=ids)
 
     def group_activity(self, now: datetime | None = None, *, account: str = "", watch_groups=None,
                        trend_group: str = "", days: int = 14) -> dict:
@@ -459,15 +486,19 @@ class MessageStore:
         receipt = " AND EXISTS(SELECT 1 FROM message_receipts r WHERE r.message_row=messages.id AND r.account=?)" if account else ""
         rows = self.conn.execute(
             "WITH known_groups AS (SELECT id AS group_id FROM groups UNION SELECT group_id FROM messages),"
-            " today AS (SELECT group_id, COUNT(*) AS count, MAX(ts) AS last_ts FROM messages"
+            " today AS (SELECT group_id, SUM(ts>=?) AS count, SUM(ts>=?) AS count3,"
+            " SUM(ts>=?) AS count7,COUNT(*) AS count30,MAX(CASE WHEN ts>=? THEN ts ELSE 0 END) AS last_ts FROM messages"
             " WHERE ts>=? AND ts<? AND media_state<>'filtered'"
             f" AND {sender_sql}{receipt} GROUP BY group_id)"
             " SELECT k.group_id, COALESCE(g.name, '') AS group_name,"
-            " COALESCE(t.count, 0) AS count, COALESCE(t.last_ts, 0) AS last_ts"
+            " COALESCE(t.count, 0) AS count, COALESCE(t.last_ts, 0) AS last_ts,"
+            " COALESCE(t.count3,0) AS count3,COALESCE(t.count7,0) AS count7,COALESCE(t.count30,0) AS count30,"
+            " COALESCE(t.count*0.1+t.count3*0.2/3+t.count7*0.3/7+t.count30*0.4/30,0) AS score"
             " FROM known_groups k LEFT JOIN groups g ON g.id=k.group_id"
             " LEFT JOIN today t ON t.group_id=k.group_id"
-            f" WHERE {scope} ORDER BY count DESC, last_ts DESC, k.group_id",
-            (window_start, window_end, *sender_params, *((account,) if account else ()), *scope_params),
+            f" WHERE {scope} ORDER BY score DESC, count DESC, last_ts DESC, k.group_id",
+            (window_start, window_start-2*86400, window_start-6*86400, window_start,
+             window_start-29*86400, window_end, *sender_params, *((account,) if account else ()), *scope_params),
         )
         groups = [dict(row) for row in rows]
         selected = next((row for row in groups if row["group_id"] == trend_group), groups[0] if groups else None)

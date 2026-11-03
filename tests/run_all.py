@@ -19,6 +19,7 @@ sys.path.insert(0, str(PROJ / "src"))  # 套件不借用外层项目的运行入
 from msgx import conda_runtime
 
 SUITES = [
+    ("群发二次确认、退群清理与本机接口", "test_group_actions.py"),
     ("可编辑图片主题规则", "test_image_rules.py"),
     ("深浅主题与本地外观保存", "test_theme.py"),
     ("复选框勾选样式", "test_check_style.py"),

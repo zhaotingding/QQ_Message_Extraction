@@ -65,6 +65,95 @@ def sample_payload():
 
 
 class RealtimeGuiTests(unittest.TestCase):
+    def test_manual_refresh_passes_activity_cache_bypass(self):
+        with patch("msgx.ui.realtime.request_json", return_value={}) as request:
+            self.app._fetch_messages(200, False, "", self.app.proc, ("1", 14), True)
+        self.assertEqual(request.call_args.kwargs["query"]["activity_refresh"], "1")
+
+    def test_group_operation_service_switch_unlocks_ui_without_replay(self):
+        panel = self.app.group_operations
+        panel.job_id, panel.job_proc = "existing-job", self.app.proc
+        panel._enabled(False)
+        self.app.service.proc = object()
+        with patch.object(panel, "request") as request:
+            panel._poll()
+            request.assert_not_called()
+        self.assertFalse(panel.busy)
+        self.assertEqual(str(panel.history_button["state"]), "normal")
+        self.assertEqual(str(panel.cancel_button["state"]), "disabled")
+        self.assertIn("读取最近记录", panel.status.get())
+
+    def test_context_selection_is_fixed_and_stale_results_are_discarded(self):
+        app = self.app
+        rows = sample_payload()["items"]
+        app._rt_context_id, app._rt_context_seq = 2, 5
+        app._accept_message_context((4, 1), rows[:1], "")
+        self.assertEqual(app.rt.get_children(), ())
+        app._accept_message_context((5, 2), rows, "")
+        self.assertEqual(app.rt.selection(), ("2:201",))
+        self.assertIn("历史上下文", app.v_rt_status.get())
+        app._accept_messages(app._rt_request_key(), app.proc, {"items": [], "activity": sample_payload()["activity"]})
+        self.assertTrue(app.rt.exists("2:201"))
+        with patch.object(app, "refresh_messages") as refresh:
+            app._return_to_live()
+            refresh.assert_called_once()
+        self.assertIsNone(app._rt_context_id)
+        self.assertEqual(str(app.btn_rt_live["state"]), "disabled")
+
+    def test_click_keyword_starts_context_read_without_api(self):
+        app = self.app
+        store = Store(Path(self.temp.name)/"test.db")
+        try:
+            event = {"post_type": "message", "message_type": "group", "group_id": "42", "user_id": "200", "self_id": "100",
+                     "message_id": "1", "time": 100, "message": "关键词"}
+            row_id = store.insert_message(parse_onebot_event(event, "100"))
+            row = store.recent_messages()[0]
+        finally:
+            store.close()
+        app._rt_keyword_rows = {str(row_id): row}
+        app.rt_keywords.insert("", "end", iid=str(row_id))
+        app.rt_keywords.selection_set(str(row_id))
+        app._keyword_selected()
+        kind, data = app.events.get(timeout=3)
+        self.assertEqual(kind, "message_context")
+        app._accept_message_context(*data)
+        self.assertEqual(app.rt.selection(), (str(row_id),))
+        sequence = app._rt_context_seq
+        app._keyword_selected()
+        self.assertEqual(app._rt_context_seq, sequence)
+
+    def test_broadcast_confirmation_shows_all_ids_and_requires_checked_confirmation(self):
+        panel = self.app.group_operations
+        preview = {"token": "token-once", "kind": "broadcast", "account": "100", "excluded": ["33"],
+                   "groups": [{"group_id": "11", "group_name": "同名"}, {"group_id": "22", "group_name": "同名"}], "text": "完整正文\n下一行"}
+        with patch.object(panel, "request") as request:
+            panel.show_confirmation(preview)
+            body = next(child for child in panel.window.winfo_children() if isinstance(child, tk.Frame))
+            texts = [child for frame in panel.window.winfo_children() for child in frame.winfo_children() if isinstance(child, tk.Text)]
+            content = texts[0].get("1.0", "end")
+            self.assertTrue(all(value in content for value in ("QQ 100", "同名（11）", "同名（22）", "完整正文\n下一行", "33")))
+            widgets = [child for frame in panel.window.winfo_children() for child in frame.winfo_children()]
+            confirm = next(child for child in widgets if isinstance(child, ttk.Button) and str(child["text"]).startswith("确认发送"))
+            check = next(child for child in widgets if isinstance(child, ttk.Checkbutton))
+            self.assertEqual(str(confirm["state"]), "disabled")
+            confirm.invoke()
+            request.assert_not_called()
+            check.invoke()
+            confirm.invoke()
+            request.assert_called_once_with("confirm", {"token": "token-once", "confirmed": True})
+
+    def test_cancel_confirmation_never_submits(self):
+        panel = self.app.group_operations
+        preview = {"token": "cancel", "kind": "leave", "account": "100", "excluded": [], "message_count": 12,
+                   "groups": [{"group_id": "11", "group_name": "测试群"}], "text": ""}
+        with patch.object(panel, "request") as request:
+            panel.show_confirmation(preview)
+            widgets = [child for frame in panel.window.winfo_children() for child in frame.winfo_children()]
+            cancel = next(child for child in widgets if isinstance(child, ttk.Button) and str(child["text"]) == "取消")
+            cancel.invoke()
+            request.assert_not_called()
+            self.assertFalse(panel.busy)
+
     def setUp(self):
         guard = patch("msgx.local_client.urllib.request.build_opener", side_effect=AssertionError("test must not access network"))
         guard.start()

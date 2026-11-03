@@ -41,6 +41,18 @@ class ActivityFixture:
 
 
 class GroupActivityTests(ActivityFixture, unittest.TestCase):
+    def test_weighted_daily_average_uses_all_windows_and_excludes_old_filtered(self):
+        for ts in (START, START-86400, START-2*86400, START-6*86400, START-29*86400):
+            self.add_message("steady", ts)
+        self.add_message("steady", START-30*86400)  # 超出30个北京自然日。
+        self.add_message("steady", START+10, filtered=True)
+        self.add_message("today-only", START+1)
+        groups = self.activity()["groups"]
+        steady = next(row for row in groups if row["group_id"] == "steady")
+        self.assertEqual((steady["count"], steady["count3"], steady["count7"], steady["count30"]), (1, 3, 4, 5))
+        self.assertAlmostEqual(steady["score"], 1*.1+3/3*.2+4/7*.3+5/30*.4)
+        self.assertEqual(groups[0]["group_id"], "steady")
+
     def test_legacy_manager_hidden_before_limits_without_deleting_records(self):
         normal = self.add_message("1", START + 10, images=("normal-image",))
         for mid, sender_id, name, ts in (("bot1", "2854196310", "改名管家", START + 1),
@@ -207,6 +219,29 @@ class GroupActivityTests(ActivityFixture, unittest.TestCase):
 
 
 class GroupActivityRouteTests(ActivityFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_activity_cache_keeps_messages_live_and_invalidates_scope_and_explicit_refresh(self):
+        fake_store = SimpleNamespace(filters={}, recent_messages=Mock(return_value=[]), group_activity=Mock(return_value={"groups": []}))
+        pipe = SimpleNamespace(store=fake_store, watch={"1"}, activity_revision=0)
+        request = SimpleNamespace(query={}, app={"pipe": pipe})
+        with patch("msgx.onebot._read_store", side_effect=lambda source, query: query(source)):
+            await _messages_recent(request)
+            await _messages_recent(request)
+            self.assertEqual(fake_store.group_activity.call_count, 1)
+            self.assertEqual(fake_store.recent_messages.call_count, 2)
+            pipe.activity_revision += 1
+            await _messages_recent(request)
+            self.assertEqual(fake_store.group_activity.call_count, 2)
+            request.query["activity_refresh"] = "1"
+            await _messages_recent(request)
+            self.assertEqual(fake_store.group_activity.call_count, 3)
+            request.query.clear()
+            pipe.watch = {"2"}
+            await _messages_recent(request)
+            self.assertEqual(fake_store.group_activity.call_count, 4)
+            pipe.activity_cache = (pipe.activity_cache[0], -100, pipe.activity_cache[2])
+            await _messages_recent(request)
+            self.assertEqual(fake_store.group_activity.call_count, 5)
+
     async def test_endpoint_preserves_items_and_activity_ignores_message_filters(self):
         wanted = self.add_message("1", images=["image-a"], filtered=True)
         self.add_message("1", ts=START + 2)

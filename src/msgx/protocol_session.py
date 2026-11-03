@@ -14,6 +14,9 @@ from .time_rules import BEIJING as SHANGHAI
 
 log = logging.getLogger("msgx.protocol_session")
 
+class ActionRejected(RuntimeError):
+    """协议明确返回失败；与超时导致的结果未知分别展示。"""
+
 class ProtocolSession:
     def register_ws(self, ws, peer: str) -> None:
         """接入层只提交连接；本职责统一登记状态并安排群同步。"""
@@ -59,6 +62,7 @@ class ProtocolSession:
         self.target_account = str((self.cfg.get("napcat") or {}).get("account") or "").strip()
         self._peer_watch = None
         self._group_refresh_tasks = set()
+        self.activity_revision = 0
 
     def resolve_action(self, resp: dict) -> None:
         """WS 接入层收到 API 响应（带 echo、无 post_type）时转交到这里。"""
@@ -68,22 +72,31 @@ class ProtocolSession:
             fut.set_result(resp)
 
 
-    async def call_action(self, action: str, params: dict | None = None, timeout: float = 8.0):
+    async def call_action(self, action: str, params: dict | None = None, timeout: float = 8.0, *, connection=None):
         """通过反向 WS 向协议端（NapCat）发起 OneBot API 调用，返回 data 字段。"""
         live = [ws for ws in self.ws_conns if not ws.closed]
         if not live:
             raise RuntimeError("协议端未连接")
+        if connection is not None and connection not in live:
+            raise RuntimeError("已确认的协议连接已断开，请重新预览")
+        selected = connection if connection is not None else live[0]  # 写操作必须固定已验证的连接。
         self._echo_seq += 1
         echo = f"msgx-{self._echo_seq}"
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._action_futs[echo] = fut
         try:
-            await live[0].send_str(json.dumps({"action": action, "params": params or {}, "echo": echo}))
+            await selected.send_str(json.dumps({"action": action, "params": params or {}, "echo": echo}))
             resp = await asyncio.wait_for(fut, timeout)
         finally:
             self._action_futs.pop(echo, None)
-        if not isinstance(resp, dict) or resp.get("retcode") != 0:
-            raise RuntimeError(f"{action} 调用失败: {resp!r}")
+        if not isinstance(resp, dict) or not isinstance(resp.get("retcode"), int):
+            raise RuntimeError(f"{action} 未返回有效结果")
+        if resp.get("status") == "async" or resp["retcode"] == 1:
+            raise RuntimeError(f"{action} 已接受异步处理，结果未知，请核对后再操作")
+        if resp.get("retcode") != 0:
+            raise ActionRejected(f"{action} 调用失败: {resp!r}")
+        if resp.get("status", "ok") != "ok":
+            raise RuntimeError(f"{action} 尚未返回明确完成结果")
         return resp.get("data")
 
 
@@ -111,6 +124,7 @@ class ProtocolSession:
                 self.store.upsert_group(gid, str((g or {}).get("group_name") or ""), uin)
         log.info("已从协议端拉取群列表：%d 个群（账号 %s）", len(keep), uin or "未知")
         self.store.sync_account_groups(uin, keep)  # 成功的空列表也有效；退群只影响当前显示，历史仍保留。
+        self.activity_revision += 1  # 群成员范围改变后不能复用旧活跃榜。
         out = {"count": len(keep), "uin": uin, "deleted": [], "protected": []}
         if prune and keep:
             deleted, protected = self.store.prune_groups(keep)

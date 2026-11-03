@@ -68,6 +68,17 @@ async def main() -> None:
             check("同时点名和全体提醒仍不生成告警", not pipe.store.recent_alerts())
             check("收消息没有产生任何 API 消费记录", not pipe.store.api_usage_details()["items"])
 
+            pipe.media.blocked_groups.add("201")  # 模拟退群请求仍在等待响应，仅暂停该群媒体任务。
+            pending_leave = event(77, "退群尚未成功时收到的新消息")
+            pending_leave["group_id"] = 201
+            received = await pipe.handle_event(pending_leave)
+            check("退群确认待回应时仍接收消息，失败后不丢消息", received.get("row_id") is not None)
+            pipe.media.blocked_groups.clear()
+            pipe.store.clear_departed_group("100", "201")
+            pipe.departed_groups["201"] = time.time()
+            replay = await pipe.handle_event(pending_leave)
+            check("已退群清理后的排队旧消息不会重新入库", replay.get("ok") is False and pipe.store.group_message_count("201") == 0)
+
             for mid, name, user_id in ((100, "改名的群管家", 2854196310), (101, "Q群管家", 999)):
                 bot_event = event(mid, [{"type": "image", "data": {"url": "https://invalid.test/bot.png"}},
                                         {"type": "text", "data": {"text": "签到广告"}}])

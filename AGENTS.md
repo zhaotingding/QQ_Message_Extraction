@@ -1,5 +1,6 @@
 # 消息萃取项目约定
 
+- **群发安全置顶：群发必须先展示目标 QQ、完整正文、全部接收群名与群号，并由用户二次明确确认后才能发送。仅允许已明确保存的统计群与当前账号实时群列表的交集；统计群未选择时禁止群发，绝不将空名单扩展为全部群。确认绑定本次正文、账号、名单及连接，变化后重新预览；逐群记录结果，未知结果不得自动重发。开发测试只用模拟发送，真实群发需用户针对具体正文与名单另行确认。**
 - 日常开发、修复与版本迭代统一沿用现有 `zhaoting.ding` 分支；未经用户明确要求，不按版本另建 `feature/*` 分支或新建工作树。开始修改前核对当前分支与未提交改动，保留已有工作。
 - main 仅通过 PR 合入，由项目负责人审查。AGENTS.md、项目 Skill 与 CODEOWNERS 的改动同样适用；远程操作仍须遵守用户授权范围。
 - 架构与功能契约以 [docs/重构开发规范.md](docs/重构开发规范.md) 为准；现用安装与测试入口见 [README.md](README.md)。
@@ -13,6 +14,7 @@
 
 | 触发任务 | Skill |
 | --- | --- |
+| 群发二次确认、逐群结果、退群及消息清理 | [msgx-group-operations](.agents/skills/msgx-group-operations/SKILL.md) |
 | 测试隔离、回归验收、精简或迁移测试用例 | [msgx-maintenance](.agents/skills/msgx-maintenance/SKILL.md) |
 | YAML 配置、偏好、API 配置与凭据保存 | [msgx-config-credentials](.agents/skills/msgx-config-credentials/SKILL.md) |
 | 图片本地初筛、独立图片 API、自动分析限额及语义入库 | [msgx-image-analysis](.agents/skills/msgx-image-analysis/SKILL.md) |

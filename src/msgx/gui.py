@@ -288,6 +288,10 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
             self._accept_messages(*value)
         elif kind == "keyword_messages":
             self._accept_keyword_messages(*value)
+        elif kind == "message_context":
+            self._accept_message_context(*value)
+        elif kind == "group_operation":
+            self.group_operations.receive(*value)
         elif kind == "message_action":
             key, action, result = value
             self._rt_actions.discard(key)

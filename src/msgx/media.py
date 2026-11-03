@@ -114,6 +114,8 @@ class MediaWorker:
         self._min_interval = 60.0 / max(1, int(self.mcfg.get("images_per_minute", 60)))
         self._last_start = 0.0
         self._vision_running: set[int] = set()
+        self._processing_images: set[int] = set()
+        self.blocked_groups: set[str] = set()  # 退群期间不启动同群下载或付费任务。
         from .image_analysis import ImageAnalysis
         self.analysis = ImageAnalysis(self)  # 单独任务负责筛选与付费调用，下载循环不等 API。
 
@@ -227,12 +229,18 @@ class MediaWorker:
                 if gap > 0:
                     await asyncio.sleep(gap)
                 self._last_start = time.monotonic()
+                parent = self.store.get_message(int(row["message_row"]))
+                if parent is None or parent["group_id"] in self.blocked_groups:
+                    continue  # 已取出的旧待办不能在退群清理后再次下载。
+                self._processing_images.add(int(row["id"]))
                 try:
                     await self._process_image(row)
                     done.append(int(row["message_row"]))
                 except Exception as e:  # noqa: BLE001
                     log.warning("媒体处理失败 image_id=%s: %s", row["id"], e)
                     self.store.set_image_result(row["id"], media_state="failed", vision_state="download_failed")
+                finally:
+                    self._processing_images.discard(int(row["id"]))
         return done
 
     async def _process_image(self, row) -> None:
@@ -286,6 +294,9 @@ class MediaWorker:
         row = self.store.get_image(row_id)
         if row is None:
             raise ValueError("这条消息没有可识别的图片")
+        parent = self.store.get_message(int(row["message_row"]))
+        if parent is None or parent["group_id"] in self.blocked_groups:
+            raise ValueError("该群正在退出或消息已清理，未发起图片识别")
         if row_id in self._vision_running:
             return {"state": "running", "text": ""}
         if row["vision_state"] == "ok" and (row["vision_text"] or "").strip():
