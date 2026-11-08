@@ -102,12 +102,30 @@ class GroupActions:
         members = await self._members(preview["connection"], account)
         if self._scope() != (account, watch):
             raise ValueError("读取群列表期间设置发生变化，请重新预览")
-        ids = (sorted(set(watch) & members.keys()) if preview["kind"] == "broadcast"
-               else [group["group_id"] for group in preview["groups"] if group["group_id"] in members])
-        if [{"group_id": gid, "group_name": members[gid]} for gid in ids] != preview["groups"]:
-            raise ValueError("接收群名单或群名已变化，已阻止操作，请重新预览")
+        # 只核对**本次真正要操作的群**：仍属于当前账号、且群名没变。
+        # 界面勾选后接收群是预览名单的子集，这里逐个验证即可，不需要再对整份统计群做全等比较。
+        for group in preview["groups"]:
+            if members.get(group["group_id"]) != group["group_name"]:
+                raise ValueError("接收群名单或群名已变化，已阻止操作，请重新预览")
 
-    async def confirm(self, token: str, confirmed: bool) -> dict:
+    def _narrow(self, preview, groups):
+        """按界面勾选收窄接收群：空选直接拒绝，绝不允许「没勾就全发」。"""
+        if not isinstance(groups, (list, tuple, set)):
+            raise ValueError("请先在确认窗口勾选接收群；未勾选任何群时不会发送")
+        wanted = [str(gid) for gid in groups]
+        if not wanted:
+            raise ValueError("请至少勾选一个接收群；未创建发送任务")
+        known = {group["group_id"] for group in preview["groups"]}
+        unknown = [gid for gid in wanted if gid not in known]
+        if unknown:
+            raise ValueError("勾选的群不在预览范围内，请重新预览；不会发送")
+        chosen = set(wanted)
+        ordered = [group for group in preview["groups"] if group["group_id"] in chosen]
+        if not ordered:
+            raise ValueError("请至少勾选一个接收群；未创建发送任务")
+        return ordered
+
+    async def confirm(self, token: str, confirmed: bool, groups=None) -> dict:
         if confirmed is not True:
             raise ValueError("必须完成二次确认")
         preview = self.previews.pop(token, None)
@@ -115,6 +133,8 @@ class GroupActions:
             raise ValueError("确认已过期或已使用，请重新预览；不会自动重发")
         if self.busy:
             raise ValueError("已有群操作正在执行")
+        if preview["kind"] == "broadcast":
+            preview["groups"] = self._narrow(preview, groups)  # 只保留勾选的群，逐群发送范围与确认一致
         self.busy = True
         try:
             await self._validate(preview)
@@ -134,16 +154,36 @@ class GroupActions:
             raise ValueError("该操作已结束或不属于当前任务")
         self.cancelled = True  # 只停止未发群，已提交或已成功的消息不能视为撤回。
 
+    @staticmethod
+    def _summarize(kind: str, groups) -> tuple[str, str]:
+        """把逐群结果压成一句结论：界面只显示计数，具体原因留在逐群表格里。"""
+        ok = sum(group["state"] in ("sent", "cleaned") for group in groups)
+        failed = sum(group["state"] == "failed" for group in groups)
+        unknown = sum(group["state"] == "unknown" for group in groups)
+        skipped = len(groups) - ok - failed - unknown
+        if ok == len(groups):
+            return "completed", ("群发完成，全部目标群已返回消息 ID" if kind == "broadcast"
+                                 else "退群及消息清理完成；已生成摘要保留")
+        bits = [f"成功 {ok} 个"]
+        for count, label in ((failed, "明确失败"), (unknown, "结果未知"), (skipped, "未发送")):
+            if count:
+                bits.append(f"{label} {count} 个")
+        tail = "失败群不会自动重发，原因见下表" if kind == "broadcast" and failed else "逐群结果见下表"
+        # 还有群没被尝试（被取消或中断）才算 stopped；全部尝试过但有失败是 partial。
+        return ("stopped" if skipped else "partial"), f"共 {len(groups)} 个群：" + "，".join(bits) + f"；{tail}"
+
     async def _run(self, preview, job):
         blocked = self.pipe.media.blocked_groups
+        reason = ""   # 整批被中断/取消时的一句话原因，拼在逐群计数之前
+        fatal = False  # 连接断开、配置变化、结果未知：必须停止整批，不能继续猜
         try:
             for index, group in enumerate(job["groups"]):
                 if self.cancelled:
-                    job["note"] = "已停止后续群；已提交的消息不会撤回"
+                    reason = "已停止后续群；已提交的消息不会撤回"
                     break
                 await self._validate(preview)  # 每群发送前重新验证配置、身份和冻结名单。
                 if self.cancelled:
-                    job["note"] = "已停止后续群；本次核对结束后未提交新消息"
+                    reason = "已停止后续群；本次核对结束后未提交新消息"
                     break  # 用户可能在等待群列表响应期间取消，发送前必须再次检查。
                 gid = group["group_id"]
                 if preview["kind"] == "leave":
@@ -155,11 +195,17 @@ class GroupActions:
                 group["state"] = "sending"
                 self.pipe.store.save_group_job(job)  # 明确记录提交边界，未知结果不能当作失败重试。
                 if preview["kind"] == "broadcast":
-                    data = await self.pipe.call_action("send_group_msg", {"group_id": int(gid),
-                        "message": [{"type": "text", "data": {"text": preview["text"]}}]}, timeout=20, connection=preview["connection"])
-                    if not isinstance(data, dict) or not data.get("message_id"):
-                        raise RuntimeError("未取得消息 ID，发送结果未知，请在 QQ 中核对")
-                    group.update(state="sent", message_id=str(data["message_id"]))
+                    try:
+                        data = await self.pipe.call_action("send_group_msg", {"group_id": int(gid),
+                            "message": [{"type": "text", "data": {"text": preview["text"]}}]}, timeout=20, connection=preview["connection"])
+                        if not isinstance(data, dict) or not data.get("message_id"):
+                            raise RuntimeError("未取得消息 ID，发送结果未知，请在 QQ 中核对")
+                    except ActionRejected as exc:
+                        # 单个群被协议端明确拒绝（禁言／风控／EventChecker 失败等）只记这一群失败，
+                        # 继续发后面的群；本群绝不重试，避免把一次群发变成刷屏。
+                        group.update(state="failed", error=security.redact(str(exc)))
+                    else:
+                        group.update(state="sent", message_id=str(data["message_id"]))
                 else:
                     await self.pipe.call_action("set_group_leave", {"group_id": int(gid), "is_dismiss": False}, timeout=20, connection=preview["connection"])
                     group.update(state="left", note="协议已确认退群，本地清理待完成")
@@ -171,24 +217,24 @@ class GroupActions:
                 self.pipe.store.save_group_job(job)
                 if index+1 < len(job["groups"]):
                     await asyncio.sleep(self.delay)
-            job["state"] = "completed" if all(g["state"] in ("sent", "cleaned") for g in job["groups"]) else "stopped"
-            if job["state"] == "completed":
-                job["note"] = "群发完成，全部目标群已返回消息 ID" if preview["kind"] == "broadcast" else "退群及消息清理完成；已生成摘要保留"
         except asyncio.CancelledError:
-            job.update(state="stopped", note="服务关闭，未恢复或重发操作")
+            reason, fatal = "服务关闭，未恢复或重发操作", True
         except Exception as exc:
-            job.update(state="stopped", note=security.redact(str(exc)))
+            reason, fatal = security.redact(str(exc)), True
             if isinstance(exc, ActionRejected):
                 for group in job["groups"]:
                     if group["state"] == "sending":
-                        group.update(state="failed", error=job["note"])
+                        group.update(state="failed", error=reason)
         finally:
             for group in job["groups"]:
                 if group["state"] == "sending":
-                    group.update(state="unknown", error=job.get("note", "结果未知"))
+                    group.update(state="unknown", error=reason or "结果未知")
                 elif group["state"] == "pending":
-                    group.update(state="not_sent", error=job.get("note", "操作停止"))
+                    group.update(state="not_sent", error=reason or "操作停止")
                 blocked.discard(group["group_id"])
+            state, note = self._summarize(preview["kind"], job["groups"])
+            job["state"] = "stopped" if fatal else state
+            job["note"] = f"{reason}；{note}" if reason else note
             try:
                 self.pipe.store.save_group_job(job)
             finally:

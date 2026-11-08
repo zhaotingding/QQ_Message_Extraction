@@ -17,6 +17,17 @@ log = logging.getLogger("msgx.protocol_session")
 class ActionRejected(RuntimeError):
     """协议明确返回失败；与超时导致的结果未知分别展示。"""
 
+
+def reject_text(resp: dict) -> str:
+    """把协议端失败响应压成一行短句：界面只留 retcode 与首句原因，完整结构进日志。"""
+    text = ""
+    for key in ("message", "wording"):
+        text = " ".join(str(resp.get(key) or "").replace("\\n", " ").split())
+        if text:
+            break
+    text = text[:100] + "…" if len(text) > 100 else text
+    return f"retcode {resp.get('retcode')} · {text}" if text else f"retcode {resp.get('retcode')}"
+
 class ProtocolSession:
     def register_ws(self, ws, peer: str) -> None:
         """接入层只提交连接；本职责统一登记状态并安排群同步。"""
@@ -94,7 +105,9 @@ class ProtocolSession:
         if resp.get("status") == "async" or resp["retcode"] == 1:
             raise RuntimeError(f"{action} 已接受异步处理，结果未知，请核对后再操作")
         if resp.get("retcode") != 0:
-            raise ActionRejected(f"{action} 调用失败: {resp!r}")
+            detail = reject_text(resp)
+            log.warning("%s 被协议端拒绝：%s（完整响应 %r）", action, detail, resp)  # 原始结构只落日志
+            raise ActionRejected(f"{action} 调用失败：{detail}")
         if resp.get("status", "ok") != "ok":
             raise RuntimeError(f"{action} 尚未返回明确完成结果")
         return resp.get("data")

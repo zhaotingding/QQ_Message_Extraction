@@ -153,10 +153,12 @@ class ReaderVoiceTests(unittest.TestCase):
         app._apply_tts_state("idle")
         self.assertFalse(app.report_text.tag_ranges("speaking"))
 
-    def test_unavailable_disables_everything_with_reason(self) -> None:
+    def test_unavailable_keeps_read_all_retryable_with_reason(self) -> None:
+        """引擎不可用时暂停/停止置灰，但「朗读全文」要留着 —— 否则用户被锁死在失败态。"""
         app = self.app
         app._apply_tts_state("unavailable", "未检测到语音合成引擎")
-        for button in (app.btn_speak_all, app.btn_speak_pause, app.btn_speak_stop):
+        self.assertEqual(str(app.btn_speak_all.cget("state")), "normal", "允许重建引擎后重试")
+        for button in (app.btn_speak_pause, app.btn_speak_stop):
             self.assertEqual(str(button.cget("state")), "disabled")
         self.assertEqual(app.v_speak_hint.get(), "未检测到语音合成引擎")
 

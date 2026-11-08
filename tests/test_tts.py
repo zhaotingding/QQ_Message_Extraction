@@ -24,7 +24,12 @@ def wait_for(predicate, timeout: float = 6.0) -> bool:
 
 
 class FakeVoice:
-    """state() 每调用一次计数，超过 finish_after 视为该段读完。"""
+    """模拟真实 SAPI 的两个关键行为：
+
+    * ``state()`` 每调用一次计数，超过 finish_after 视为该段读完；
+    * **暂停是粘性的** —— 暂停期间 Speak 只排队不发声，RunningState 停在
+      SRS_IDLE(0)，不解 Resume 就永远读不出来（真实引擎实测行为）。
+    """
 
     instances: list["FakeVoice"] = []
 
@@ -33,6 +38,7 @@ class FakeVoice:
         self.volume = volume
         self.spoken: list[str] = []
         self.paused = False
+        self.active = False
         self.pause_calls = 0
         self.resume_calls = 0
         self.stop_calls = 0
@@ -44,10 +50,13 @@ class FakeVoice:
     def speak(self, text: str) -> None:
         self.spoken.append(text)
         self.ticks = 0
+        self.active = True
 
     def state(self) -> int:
         if self.paused:
-            return 2
+            return tts.SRS_IDLE
+        if not self.active:
+            return tts.SRS_DONE
         self.ticks += 1
         return tts.SRS_DONE if self.ticks > self.finish_after else tts.SRS_SPEAKING
 
@@ -61,6 +70,7 @@ class FakeVoice:
 
     def stop(self) -> None:
         self.stop_calls += 1
+        self.active = False
 
     def set_rate(self, rate: int) -> None:
         self.rate = rate
@@ -160,27 +170,74 @@ class NarratorTests(unittest.TestCase):
         self.narrator.play(["甲", "乙"])
         self.assertTrue(wait_for(lambda: "playing" in self.states()))
         voice = self.wait_voice()
+        resumes = voice.resume_calls
         self.narrator.pause()
         self.assertTrue(wait_for(lambda: "paused" in self.states()))
         self.assertEqual(voice.pause_calls, 1)
         spoken = list(voice.spoken)
         time.sleep(0.4)
         self.assertEqual(voice.spoken, spoken, "暂停后不应继续推进下一段")
+        self.assertNotIn("unavailable", self.states(), "暂停超过卡死阈值也不能被判成引擎故障")
         self.narrator.resume()
         self.assertTrue(wait_for(lambda: "idle" in self.states()))
-        self.assertEqual(voice.resume_calls, 1)
+        self.assertEqual(voice.resume_calls, resumes + 1)
         self.assertEqual(voice.spoken, ["甲", "乙"])
 
     def test_stop_ends_immediately(self) -> None:
         self.narrator.play(["甲", "乙", "丙"])
         self.assertTrue(wait_for(lambda: "playing" in self.states()))
         voice = self.wait_voice()
+        stops = voice.stop_calls
         self.narrator.stop()
         self.assertTrue(wait_for(lambda: "idle" in self.states()))
-        self.assertEqual(voice.stop_calls, 1)
+        self.assertEqual(voice.stop_calls, stops + 1)
         count = len(voice.spoken)
         time.sleep(0.4)
         self.assertEqual(len(voice.spoken), count, "停止后不应再读新段")
+
+    def test_play_after_pause_is_not_silent(self) -> None:
+        """暂停过之后必须还能出声 —— 这是 1.0.5 修的那个「有时候没声音」。
+
+        SAPI 的 Pause 是粘性的：暂停后直接 Speak，文本只排队不发声，
+        RunningState 永远停在 0，线程永久卡在该段。这里把卡死阈值调到很大，
+        逼着实现只能靠「开读前 Resume」过关，不能靠超时自愈蒙混。
+        """
+        original = tts.STALL_SECONDS
+        tts.STALL_SECONDS = 3600.0
+        try:
+            self.narrator.play(["一", "二"])
+            self.assertTrue(wait_for(lambda: "playing" in self.states()))
+            voice = self.wait_voice()
+            self.narrator.pause()
+            self.assertTrue(wait_for(lambda: "paused" in self.states()))
+            self.narrator.stop()
+            self.assertTrue(wait_for(lambda: "idle" in self.states()))
+            spoken, resumes = len(voice.spoken), voice.resume_calls
+            self.narrator.play(["三"])
+            self.assertTrue(wait_for(lambda: len(voice.spoken) > spoken),
+                            "暂停之后点朗读全文，必须真的把文本送去合成")
+            self.assertTrue(wait_for(lambda: self.states()[-1] == "idle"))
+            self.assertEqual(voice.spoken[-1], "三")
+            self.assertGreater(voice.resume_calls, resumes, "开读前必须解除粘性暂停")
+        finally:
+            tts.STALL_SECONDS = original
+
+    def test_stuck_voice_is_reopened_once(self) -> None:
+        """引擎入队后迟迟不发声（设备被抢占）时，重建语音对象重试一次。"""
+        class StuckVoice(FakeVoice):
+            def state(self) -> int:
+                return tts.SRS_IDLE  # 永远停在「已入队但没开始发声」
+
+        self.narrator._factory = StuckVoice
+        original = tts.STALL_SECONDS
+        tts.STALL_SECONDS = 0.3
+        try:
+            self.narrator.play(["甲"])
+            self.assertTrue(wait_for(lambda: len(StuckVoice.instances) >= 2, timeout=8),
+                            "卡死时必须重建语音对象重试")
+            self.assertTrue(wait_for(lambda: StuckVoice.instances[0].close_calls >= 1))
+        finally:
+            tts.STALL_SECONDS = original
 
     def test_rate_change_reaches_voice(self) -> None:
         self.narrator.play(["甲"])

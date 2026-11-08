@@ -617,9 +617,12 @@ class ReaderPage:
         if buttons[0] is None:
             return
         if state == "unavailable":
-            for button in buttons:
-                button.configure(state="disabled")
-            buttons[1].configure(text="暂停")
+            # 「朗读全文」保持可用：引擎可能只是这一次被抢占/没起来，再点一次
+            # 会重建语音对象重试。把三个按钮全禁用等于把用户锁死在失败态里。
+            buttons[0].configure(state="normal" if getattr(self, "_voice_segments", []) else "disabled")
+            buttons[1].configure(state="disabled", text="暂停")
+            buttons[2].configure(state="disabled")
+            self._clear_speaking()
             self.v_speak_hint.set(note or "未检测到语音合成引擎")
             self.status.set(note or "语音朗读不可用")
             return

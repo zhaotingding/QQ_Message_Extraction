@@ -309,7 +309,9 @@ async def _group_operation(request: web.Request) -> web.Response:
         if operation == "preview":
             result = await actions.prepare(body)
         elif operation == "confirm":
-            result = await actions.confirm(str(body.get("token", "")), body.get("confirmed") is True)
+            # groups 是界面上用户逐一勾选的接收群；不传/传空一律拒绝，绝不做「默认全发」。
+            result = await actions.confirm(str(body.get("token", "")), body.get("confirmed") is True,
+                                           body.get("groups"))
         else:
             actions.cancel(str(body.get("job_id", "")))
             result = {"note": "已请求停止后续群，正在等待当前提交结果"}

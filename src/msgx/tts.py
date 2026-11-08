@@ -9,11 +9,14 @@
 （实为 GetRate），正是这个坑。这里改为 `GetIDsOfNames` 按**方法名**解析，
 索引由 SAPI 自己给（实测 Speak=12 / Status=1 / Rate=5 / Volume=6），不再依赖手算。
 
-两条硬约束：
+三条硬约束：
   * COM 是 STA —— 创建、朗读、暂停、释放必须在**同一个线程**里，所以朗读线程
     独占一个 voice 对象，主线程只投递命令、接收事件，不直接碰 COM。
   * BSTR 指针必须声明 restype：SysAllocString 默认按 32 位 int 返回，
     x64 上会把指针高位截掉，调用时直接 access violation。
+  * ``ISpVoice::Pause`` 是**粘性**的 —— 暂停后 ``Speak`` 只把文本排进队列，
+    ``RunningState`` 永远停在 0（既不发声也不结束）。实测确认：暂停过之后
+    不再 ``Resume`` 就再也读不出声，线程还会卡死在该段。每次开读前必须复位。
 """
 from __future__ import annotations
 
@@ -44,8 +47,17 @@ VT_BOOL = 11
 
 SVSF_ASYNC = 1
 SVSF_PURGE = 2
+# ISpVoice::GetStatus 的 dwRunningState（SPRUNSTATE），探针实测值：
+#   0 = 已入队但还没发声（暂停态下 Speak 会永远停在这里）
+#   1 = 读完   2 = 正在说   3 = 读完且队列已空（读完瞬间的过渡值）
+SRS_IDLE = 0
 SRS_DONE = 1
 SRS_SPEAKING = 2
+SRS_DONE_WITH_QUEUE = 3
+
+# 一段文本入队后迟迟不进入「正在说」就判定引擎卡住（典型原因：暂停没解除、
+# 音频设备被抢占）。留足余量，正常的短句几毫秒就会跳到 2，不会误判。
+STALL_SECONDS = 3.0
 
 # 单段朗读上限（字符）。超过就按句切开：SAPI 一次喂太长会让「停止」的响应变钝，
 # 高亮也会长时间停在同一段上。
@@ -341,6 +353,35 @@ class SapiVoice:
 
 # ---------- 朗读线程 ----------
 
+class _Generation:
+    """一代朗读线程：独占一个命令队列，并带独立的停止信号。
+
+    每一代都有自己的队列，所以即使上一代卡在 COM 调用里没能及时退出，它
+    也不可能再抢到新一代的 play —— 否则两个线程轮流取命令，听感就是
+    「有时候点了没声音」。停止信号让旧线程返回后立刻自行结束。
+    """
+
+    __slots__ = ("cmds", "stopping", "thread")
+
+    def __init__(self) -> None:
+        self.cmds: queue.Queue = queue.Queue()
+        self.stopping = threading.Event()
+        self.thread: threading.Thread | None = None
+
+
+def _drain_cmds(q: queue.Queue):
+    while True:
+        try:
+            yield q.get_nowait()
+        except queue.Empty:
+            return
+
+
+def _segment_timeout(text: str) -> float:
+    """一段最多允许「正在说」多久；真读完会先回 DONE，超时即视为引擎卡住。"""
+    return min(120.0, 8.0 + len(text or "") * 0.6)
+
+
 class Narrator:
     """朗读调度：主线程投递 play/pause/resume/stop，后台线程独占 COM 推进播放。
 
@@ -353,10 +394,8 @@ class Narrator:
         self._factory = voice_factory
         self._rate = rate
         self._volume = volume
-        self._cmds: queue.Queue = queue.Queue()
         self._lock = threading.Lock()
-        self._thread: threading.Thread | None = None
-        self._started = False
+        self._gen: _Generation | None = None
         self.state = "idle"
         self.index = 0
         self.total = 0
@@ -367,38 +406,55 @@ class Narrator:
         texts = [text for text in (segments or []) if text and text.strip()]
         if not texts:
             return False
-        self._spawn()
-        self._cmds.put(("play", {"segments": texts, "start": max(0, min(int(start), len(texts) - 1)),
-                                 "rate": rate}))
+        gen = self._spawn()
+        gen.cmds.put(("play", {"segments": texts, "start": max(0, min(int(start), len(texts) - 1)),
+                               "rate": rate}))
         return True
 
     def pause(self) -> None:
-        self._cmds.put(("pause", None))
+        self._put(("pause", None))
 
     def resume(self) -> None:
-        self._cmds.put(("resume", None))
+        self._put(("resume", None))
 
     def stop(self) -> None:
-        self._cmds.put(("stop", None))
+        self._put(("stop", None))
 
     def set_rate(self, rate: int) -> None:
         """改语速：正在读的段也会立刻跟着变（SAPI 支持运行中改速率）。"""
         self._rate = int(rate)
-        self._cmds.put(("rate", int(rate)))
+        self._put(("rate", int(rate)))
 
     def close(self) -> None:
-        self._cmds.put(("quit", None))
-        thread = self._thread
-        if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=3)
-        self._thread = None
-
-    def _spawn(self) -> None:
         with self._lock:
-            if self._thread and self._thread.is_alive():
-                return
-            self._thread = threading.Thread(target=self._run, name="msgx-tts", daemon=True)
-            self._thread.start()
+            gen, self._gen = self._gen, None
+        if gen is None:
+            return
+        gen.stopping.set()  # 旧线程即使此刻卡在 COM 里，返回后也会立刻自行退出
+        gen.cmds.put(("quit", None))
+        thread = gen.thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=3)
+
+    def _put(self, item) -> None:
+        gen = self._current()
+        if gen is not None:
+            gen.cmds.put(item)
+
+    def _current(self) -> _Generation | None:
+        gen = self._gen
+        return gen if gen is not None and gen.thread is not None and gen.thread.is_alive() else None
+
+    def _spawn(self) -> _Generation:
+        with self._lock:
+            gen = self._gen
+            if gen is not None and gen.thread is not None and gen.thread.is_alive():
+                return gen
+            gen = _Generation()
+            gen.thread = threading.Thread(target=self._run, args=(gen,), name="msgx-tts", daemon=True)
+            self._gen = gen
+            gen.thread.start()
+            return gen
 
     def _emit(self, kind: str, value) -> None:
         try:
@@ -408,61 +464,101 @@ class Narrator:
 
     # --- 后台线程侧 ---
 
-    def _run(self) -> None:
-        try:
-            voice = self._factory(self._rate, self._volume)
-            error = ""
-        except Exception as exc:  # noqa: BLE001
-            voice, error = None, str(exc)
+    def _run(self, gen: _Generation) -> None:
+        def open_voice():
+            try:
+                return self._factory(self._rate, self._volume)
+            except Exception:  # noqa: BLE001 - 引擎建不起来就降级，不能把线程炸掉
+                return None
+
+        def reopen():
+            """丢弃当前语音对象重建一个：设备被抢占、对象处于异常态时用它兜底。"""
+            nonlocal voice
+            try:
+                voice.close()
+            except Exception:  # noqa: BLE001
+                pass
+            voice = open_voice()
+            return voice
+
+        voice = open_voice()
         if voice is None:
             self.state = "unavailable"
-            self._emit("tts_state", ("unavailable", error or "系统未安装可用的语音合成引擎"))
+            self._emit("tts_state", ("unavailable", "系统未安装可用的语音合成引擎"))
             return
 
         segments: list[str] = []
         index = 0
         speaking = False
+        paused = False
         started_at = 0.0
+        stalls = 0
+        bad_reads = 0
         try:
-            while True:
-                if not self._started:
-                    self._started = True
-                for cmd, payload in self._drain_cmds():
+            while not gen.stopping.is_set():
+                for cmd, payload in _drain_cmds(gen.cmds):
                     if cmd == "quit":
-                        voice.stop()
+                        try:
+                            voice.stop()
+                        except (OSError, AttributeError):
+                            pass
                         self._emit("tts_state", ("idle", ""))
                         return
                     if cmd == "play":
-                        if speaking:
-                            voice.stop()
+                        try:
+                            voice.stop()    # 清掉上一轮残留（暂停时排队的文本也要丢）
+                            voice.resume()  # 关键：解除粘性暂停，否则新文本永远不发声
+                            if payload.get("rate") is not None:
+                                voice.set_rate(payload["rate"])
+                        except (OSError, AttributeError):
+                            if reopen() is None:
+                                self.state = "unavailable"
+                                self._emit("tts_state", ("unavailable", "语音引擎无响应，已停止朗读"))
+                                return
                         segments = payload["segments"]
                         index = payload["start"]
-                        speaking = False
-                        if payload.get("rate") is not None:
-                            voice.set_rate(payload["rate"])
+                        speaking, paused = False, False
+                        stalls = bad_reads = 0
                         self.total = len(segments)
                         self.state = "playing"
                         self._emit("tts_state", ("playing", ""))
-                    elif cmd == "pause" and speaking:
-                        voice.pause()
-                        self.state = "paused"
-                        self._emit("tts_state", ("paused", ""))
-                    elif cmd == "resume" and speaking:
-                        voice.resume()
-                        self.state = "playing"
-                        self._emit("tts_state", ("playing", ""))
+                    elif cmd == "pause":
+                        if speaking and not paused:
+                            paused = True
+                            self.state = "paused"
+                            try:
+                                voice.pause()
+                            except (OSError, AttributeError):
+                                pass
+                            self._emit("tts_state", ("paused", ""))
+                    elif cmd == "resume":
+                        if speaking and paused:
+                            paused = False
+                            started_at = time.time()  # 暂停时长不计入「这一段读了多久」
+                            self.state = "playing"
+                            try:
+                                voice.resume()
+                            except (OSError, AttributeError):
+                                pass
+                            self._emit("tts_state", ("playing", ""))
                     elif cmd == "stop":
                         if speaking:
-                            voice.stop()
-                        segments, index, speaking = [], 0, False
+                            try:
+                                voice.stop()
+                            except (OSError, AttributeError):
+                                pass
+                        segments, index, speaking, paused = [], 0, False, False
                         self.state = "idle"
                         self._emit("tts_state", ("idle", ""))
                     elif cmd == "rate":
-                        voice.set_rate(payload)
+                        try:
+                            voice.set_rate(payload)
+                        except (OSError, AttributeError):
+                            pass
 
                 if not segments or index >= len(segments):
                     if segments:
-                        segments, speaking = [], False
+                        segments, speaking, paused = [], False, False
                         self.state = "idle"
                         self._emit("tts_state", ("idle", ""))
                     time.sleep(0.05)
@@ -470,9 +566,24 @@ class Narrator:
 
                 if not speaking:
                     self.index = index
-                    voice.speak(segments[index])
-                    speaking = True
+                    try:
+                        voice.speak(segments[index])
+                    except (OSError, AttributeError):
+                        if reopen() is None:
+                            self.state = "unavailable"
+                            self._emit("tts_state", ("unavailable", "语音引擎无响应，已停止朗读"))
+                            return
+                        try:
+                            voice.stop()
+                            voice.resume()
+                            voice.speak(segments[index])
+                        except (OSError, AttributeError):
+                            self.state = "unavailable"
+                            self._emit("tts_state", ("unavailable", "语音引擎无法发声，已停止朗读"))
+                            return
+                    speaking, paused = True, False
                     started_at = time.time()
+                    stalls = bad_reads = 0
                     self._emit("tts_seg", (index, len(segments)))
                     time.sleep(0.02)
                     continue
@@ -482,22 +593,35 @@ class Narrator:
                     time.sleep(0.05)
                     continue
                 state = voice.state()
-                if state == SRS_DONE:
+                elapsed = time.time() - started_at
+                if state in (SRS_DONE, SRS_DONE_WITH_QUEUE):
                     speaking = False
                     index += 1
                 elif state < 0:
-                    self._emit("tts_state", ("unavailable", "语音引擎状态读取失败，已停止朗读"))
-                    segments, index, speaking = [], 0, False
+                    # 单次读不到状态不算故障（COM 忙），连续读不到才判引擎失效。
+                    bad_reads += 1
+                    if bad_reads >= 40:
+                        self.state = "unavailable"
+                        self._emit("tts_state", ("unavailable", "语音引擎状态读取失败，已停止朗读"))
+                        segments, index, speaking, paused = [], 0, False, False
+                elif not paused and ((state == SRS_IDLE and elapsed > STALL_SECONDS)
+                                     or (state == SRS_SPEAKING and elapsed > _segment_timeout(segments[index]))):
+                    # 已入队却始终不发声：上一版就是对这种状态不设超时，结果永久卡在
+                    # 该段、一点声音都没有。先重建语音对象重试一次，仍不行就明确报错。
+                    if stalls == 0 and reopen() is not None:
+                        stalls = 1
+                        started_at = time.time()
+                        try:
+                            voice.speak(segments[index])
+                            continue
+                        except (OSError, AttributeError):
+                            pass
+                    self.state = "unavailable"
+                    self._emit("tts_state", ("unavailable", "语音引擎没有发声，已停止朗读"))
+                    segments, index, speaking, paused = [], 0, False, False
                 time.sleep(0.05)
         finally:
             try:
                 voice.close()
             except Exception:  # noqa: BLE001
                 pass
-
-    def _drain_cmds(self):
-        while True:
-            try:
-                yield self._cmds.get_nowait()
-            except queue.Empty:
-                return
