@@ -16,6 +16,24 @@ GUI和协议操作共用 `napcat.resolve_dir()`。二维码监视在操作前固
 - 2026-10-15 模拟协议/进程与实际Tk回归：`tests/test_service_recovery.py`、`test_napcat_restart.py`、`test_login.py`、`test_connection.py`、`test_gui.py`。不等于再次真实手机扫码。
 - 2026-10-12历史两次服务退出码1的触发源仍未确认。保留 `data/logs/{gui,service,service-output,service-fault}.log` 排查；底层exit或外部结束可能无Python栈，不能把恢复机制通过当作历史根因已查明。
 
+## 语音朗读（1.0.4，真实 SAPI + 真实界面端到端验证）
+
+SAPI5 由 `src/msgx/tts.py` 通过 **IDispatch 自动化接口按方法名**驱动（`GetIDsOfNames` → `Invoke`），不新增 pywin32／pyttsx3 依赖。**绝不手算 ISpVoice 的 vtable 索引**：索引取决于继承链（IUnknown 3 + ISpNotifySource 7 + ISpEventSource 3，之后才是 ISpVoice），算错一格的表现是「调用返回成功、但一声不出」。1.0.4 首版把 Speak 写到 20 号槽（实为 GetRate），整篇 0.6 秒就"读完"，用户看到的就是「点朗读全文没声音、双击段落没反应」。按名字解析实测：Speak=12／Status=1／Rate=5／Volume=6。
+
+x64 上三个必踩的坑：
+- `SysAllocString` 不声明 `restype = c_void_p` 会按 32 位 int 返回，BSTR 指针高位被截断 → access violation（崩溃地址形如 `0xFFFFFFFF...`）。
+- `DISPPARAMS.rgvarg` 必须**逆序**存放（`rgvarg[0]` 对应最后一个实参）；正序传会让 BSTR 指针被当成 flags。
+- `Status` 每次都返回新的自动化对象，读完必须 `Release`，否则引用计数只涨不落。
+
+- COM 为 STA：`SapiVoice` 的创建、Speak、Pause、Release 全在 `Narrator` 的后台线程里；主线程只往命令队列投递 play／pause／resume／stop／rate，事件经 `events.put` 回主线程。跨线程直接调同一个 voice 对象会崩或静默失效。
+- 分段偏移取**渲染后的 Tk 正文**（`report_text.get`），与批注同样按字符偏移换算 `1.0 + N chars`；用 Markdown 原文会因标题号、`**`、列表符号被清理而高亮错位。单行超过 440 字才按句切。
+- 段完成后才推进下一段，且段启动后 0.2 秒内不判定完成 —— 异步 Speak 起步瞬间 RunningState 仍是上一段的 DONE，过早起判会跳段。
+- 双击正文从被点那段开始读；`_narrate_from_click` 必须在坐标落空时回退到**最近的一段**，不能直接 return（否则用户点空白处会「没反应」）。`state="disabled"` 的 Text 仍会派发 `<Double-Button-1>`，Widget 级绑定优先于类绑定，不受禁用影响。
+- 切换摘要、关闭窗口调用 stop；停止用空串 + `SVSFPurgeBeforeSpeak` 清空发声队列，不是等读完。语速档位存偏好 `tts.rate`（数值，不是文案），播放中改档即时下发。
+- 引擎不可用的判据是 `SapiVoice.create` 返回 None（内部已捕获 OSError／AttributeError／ValueError），只把朗读按钮置灰并给出原因，阅读、标注、心得与摘要生成不受影响。
+- **怎么验证「真的在发声」而不靠耳朵**：把音量设 0 再 speak —— 静音但合成时钟照走，能读到 `SRS_SPEAKING(2)` 就证明 Speak 真的启动了（`test_tts` 的回归守卫）；真实出声另用计时判据，一句 20+ 字必须 > 1 秒，否则说明调用空转。
+
+
 ## 批注、阅读与反馈
 
 1.0.3（2026-11-03，隔离Tk定向验证）：关键词单击进入固定历史上下文，序号使旧结果失效；自动恢复关键词选择不能再次跳转或清空顶表位置，返回实时/切换筛选才退出。群操作独立页签的预览不发送，确认窗口显示完整账号/正文/名单且默认按钮禁用，勾选核对后确认；关闭/取消不提交。外部操作契约见项目 `msgx-group-operations`。

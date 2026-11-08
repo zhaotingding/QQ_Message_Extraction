@@ -10,11 +10,15 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
-from .. import security, summary_review
+from .. import prefs as prefs_mod
+from .. import security, summary_review, tts
 from ..config import abs_path
 from ..store import Store
 from ..summarize import BEIJING, summary_chars
 from .common import FONT, MUTED
+
+# 界面语速档位 → SAPI 语速（-10..10）。存的是数值，改文案不会让旧偏好失效。
+SPEAK_RATES = {"较慢": -3, "正常": 0, "较快": 3, "最快": 6}
 
 
 class ReaderPage:
@@ -89,6 +93,24 @@ class ReaderPage:
         self.btn_open_report.pack(side="left")
         self.btn_copy_report = ttk.Button(actions, text="复制全文", command=self._copy_report, state="disabled", style="Reader.TButton")
         self.btn_copy_report.pack(side="left", padx=6)
+        # 语音朗读：整篇从任意段开始，逐段高亮。引擎在后台线程里创建（COM 是 STA），
+        # 这里只搭控件；不可用时按钮保持禁用并说明原因。
+        # 按钮与「复制全文」同行 —— 最小窗口高度很紧，不能再多吃一整行。
+        self._voice_segments = []
+        self._narrator = None
+        self._tts_state = "idle"
+        self._tts_index = 0
+        self._tts_total = 0
+        self.v_speak_hint = tk.StringVar(value="")
+        self.btn_speak_all = ttk.Button(actions, text="朗读全文", style="Reader.TButton", state="disabled",
+                                        command=lambda: self._narrate(0))
+        self.btn_speak_all.pack(side="left", padx=(5, 0))
+        self.btn_speak_pause = ttk.Button(actions, text="暂停", style="Reader.TButton", state="disabled",
+                                          command=self._toggle_narration)
+        self.btn_speak_pause.pack(side="left", padx=3)
+        self.btn_speak_stop = ttk.Button(actions, text="停止", style="Reader.TButton", state="disabled",
+                                         command=self._stop_narration)
+        self.btn_speak_stop.pack(side="left")
         read_bar = ttk.Frame(reader)
         read_bar.pack(fill="x", pady=(3, 0))
         ttk.Label(read_bar, text="阅读状态：").pack(side="left")
@@ -99,6 +121,14 @@ class ReaderPage:
                                      command=self._set_report_read_state, state="disabled")
             button.pack(side="left", padx=(0, 8))
             self._report_review_buttons.append(button)
+        ttk.Label(read_bar, text="语速").pack(side="left", padx=(6, 0))
+        saved_rate = ((getattr(self, "prefs", {}) or {}).get("tts") or {}).get("rate", 0)
+        self.v_speak_rate = tk.StringVar(
+            value=next((name for name, value in SPEAK_RATES.items() if value == saved_rate), "正常"))
+        self.speak_rate_box = ttk.Combobox(read_bar, textvariable=self.v_speak_rate, state="readonly",
+                                           width=6, values=tuple(SPEAK_RATES))
+        self.speak_rate_box.pack(side="left", padx=(3, 0))
+        self.speak_rate_box.bind("<<ComboboxSelected>>", self._speak_rate_changed)
         marks = ttk.Frame(reader)
         marks.pack(fill="x", pady=(3, 4))
         ttk.Label(marks, text="选中文字：").pack(side="left")
@@ -136,6 +166,8 @@ class ReaderPage:
         self.report_text.tag_configure("review_blue", background="#cfe8ff")
         self.report_text.tag_configure("review_red", background="#ffd5d5")
         self.report_text.tag_configure("review_underline", underline=True)
+        self.report_text.tag_configure("speaking", background="#ffe3a3")  # 主题切换时由 ui.theme 覆盖
+        self.report_text.bind("<Double-Button-1>", self._narrate_from_click)
         self.report_text.pack(fill="both", expand=True)
         self.report_notes_frame = ttk.LabelFrame(reader, text="我的心得（个人观点；切换、刷新及关闭时自动保存）", padding=4)
         ttk.Button(self.report_notes_frame, text="保存心得", style="Reader.TButton",
@@ -143,8 +175,12 @@ class ReaderPage:
         self.report_notes = ScrolledText(self.report_notes_frame, wrap="word", height=2, font=(FONT, 10))
         self.report_notes.pack(side="left", fill="x", expand=True)
         self.v_report_review = tk.StringVar(value="标注与阅读状态保存在本地，不调用 API。")
-        self.report_review_label = ttk.Label(reader, textvariable=self.v_report_review, style="Hint.TLabel", wraplength=620)
-        self.report_review_label.pack(side="bottom", fill="x", pady=(4, 0), before=self.report_text)
+        footer = ttk.Frame(reader)
+        footer.pack(side="bottom", fill="x", pady=(4, 0), before=self.report_text)
+        self.report_review_label = ttk.Label(footer, textvariable=self.v_report_review, style="Hint.TLabel",
+                                            wraplength=620)
+        self.report_review_label.pack(side="left")
+        ttk.Label(footer, textvariable=self.v_speak_hint, style="Hint.TLabel").pack(side="right", padx=(8, 0))
         self.nb.bind("<<NotebookTabChanged>>", self._report_tab_changed, add="+")
 
 
@@ -316,6 +352,7 @@ class ReaderPage:
                 self._report_current = item
                 self._load_report_review(item)
             return True
+        self._stop_narration()  # 切换文章必须掐掉上一篇的朗读，否则会读串
         self._report_current = item
         self.report_outline.delete(0, "end")
         self._report_outline = []
@@ -350,6 +387,9 @@ class ReaderPage:
             self.report_outline.insert("end", "正文未设置主题小标题")
         self.report_text.configure(state="disabled")
         self.report_text.yview_moveto(0)
+        # 分段基于**渲染后的正文**取偏移 —— 与 Tk 文本同源，高亮不会错位。
+        self._voice_segments = tts.segments_from_text(self.report_text.get("1.0", "end-1c"))
+        self._apply_tts_state("idle")
         self._load_report_review(item)
         return True
 
@@ -494,6 +534,125 @@ class ReaderPage:
                 self.status.set("已复制完整摘要")
             except tk.TclError:
                 self.status.set("复制失败：剪贴板暂时不可用，请重试")
+
+    # ---------- 语音朗读 ----------
+
+    def _speak_rate(self) -> int:
+        return SPEAK_RATES.get(self.v_speak_rate.get(), 0)
+
+    def _ensure_narrator(self):
+        """惰性建立朗读调度器；真正创建 COM 对象发生在它的后台线程里。"""
+        if getattr(self, "_narrator", None) is not None:
+            return self._narrator
+        try:
+            self._narrator = tts.Narrator(lambda kind, value: self.events.put((kind, value)))
+        except (OSError, AttributeError, ValueError) as exc:
+            self._narrator = None
+            self._apply_tts_state("unavailable", f"语音朗读不可用：{exc}")
+            return None
+        return self._narrator
+
+    def _narrate(self, start: int = 0) -> None:
+        segments = getattr(self, "_voice_segments", [])
+        if not segments:
+            self.status.set("当前摘要没有可朗读的正文")
+            return
+        # 切换语速档位不该影响正在播的内容，所以每次开读都带上当前档位。
+        narrator = self._ensure_narrator()
+        if narrator is None:
+            return
+        if not narrator.play([seg.text for seg in segments], start=start, rate=self._speak_rate()):
+            self.status.set("朗读未能开始，请重试")
+
+    def _narrate_from_click(self, event):
+        """双击正文某行 → 从该段开始读；不拦截默认选词行为。"""
+        segments = getattr(self, "_voice_segments", [])
+        if not segments:
+            return None
+        try:
+            offset = len(self.report_text.get("1.0", self.report_text.index(f"@{event.x},{event.y}")))
+        except tk.TclError:
+            return None
+        position = next((i for i, seg in enumerate(segments) if seg.start <= offset < seg.end), None)
+        if position is None:
+            position = min(range(len(segments)), key=lambda i: abs(segments[i].start - offset))
+        self._narrate(position)
+        return None
+
+    def _toggle_narration(self) -> None:
+        narrator = getattr(self, "_narrator", None)
+        if narrator is None:
+            return
+        if self._tts_state == "paused":
+            narrator.resume()
+        elif self._tts_state == "playing":
+            narrator.pause()
+
+    def _stop_narration(self) -> None:
+        narrator = getattr(self, "_narrator", None)
+        if narrator is not None:
+            narrator.stop()
+
+    def _speak_rate_changed(self, _event=None) -> None:
+        rate = self._speak_rate()
+        narrator = getattr(self, "_narrator", None)
+        if narrator is not None:
+            narrator.set_rate(rate)
+        path = getattr(self, "prefs_file", None)
+        if path:
+            try:
+                saved = prefs_mod.load_raw(path) if Path(path).exists() else {}
+                data = prefs_mod.update({"tts": {**saved.get("tts", {}), "rate": rate}}, path)
+                self.prefs = {**getattr(self, "prefs", {}), **data}
+            except (OSError, ValueError) as exc:
+                self.status.set(f"语速保存失败：{exc}")
+                return
+        self.status.set(f"朗读语速：{self.v_speak_rate.get()}")
+
+    def _apply_tts_state(self, state: str, note: str = "") -> None:
+        """按钮可见状态与朗读状态一一对应；不可用时说明原因而不是静默禁用。"""
+        self._tts_state = state
+        buttons = (getattr(self, "btn_speak_all", None), getattr(self, "btn_speak_pause", None),
+                   getattr(self, "btn_speak_stop", None))
+        if buttons[0] is None:
+            return
+        if state == "unavailable":
+            for button in buttons:
+                button.configure(state="disabled")
+            buttons[1].configure(text="暂停")
+            self.v_speak_hint.set(note or "未检测到语音合成引擎")
+            self.status.set(note or "语音朗读不可用")
+            return
+        playing = state in ("playing", "paused")
+        buttons[0].configure(state="normal" if getattr(self, "_voice_segments", []) else "disabled")
+        buttons[1].configure(state="normal" if playing else "disabled", text="继续" if state == "paused" else "暂停")
+        buttons[2].configure(state="normal" if playing else "disabled")
+        if state == "idle":
+            self._clear_speaking()
+            self.v_speak_hint.set("")
+        elif state == "paused":
+            self.v_speak_hint.set(f"已暂停 · {self._tts_index + 1}/{self._tts_total} 段")
+
+    def _clear_speaking(self) -> None:
+        text = getattr(self, "report_text", None)
+        if text is not None:
+            text.tag_remove("speaking", "1.0", "end")
+
+    def _highlight_speaking(self, index: int, total: int) -> None:
+        """主线程：高亮正在朗读的段并把它滚进视野。"""
+        segments = getattr(self, "_voice_segments", [])
+        self._tts_index, self._tts_total = index, max(1, total)
+        self._clear_speaking()
+        if not (0 <= index < len(segments)):
+            return
+        segment = segments[index]
+        start = f"1.0 + {segment.start} chars"
+        try:
+            self.report_text.tag_add("speaking", start, f"1.0 + {segment.end} chars")
+            self.report_text.see(start)
+        except tk.TclError:
+            return
+        self.v_speak_hint.set(f"{index + 1}/{total} 段")
 
 
     def _apply_report_review(self, key, review, error, seq):
