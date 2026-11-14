@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from .ui.theme import palette
 
 PURPOSE_COLORS = {"摘要总结": "#2563eb", "图片理解": "#b45309", "自动图片理解": "#15803d", "提示词更新": "#9333ea"}
 FONT = "Microsoft YaHei UI"
@@ -39,6 +38,8 @@ def day_description(series: dict[str, list[dict]], index: int) -> str:
 
 def draw_daily_costs(canvas, series: dict[str, list[dict]]) -> tuple[float, float]:
     """返回绘图区横坐标范围，供界面显示鼠标所在日期的金额。"""
+    from .ui.theme import palette
+
     canvas.delete("all")
     colors = palette(canvas)
     purpose_colors = ({"摘要总结": "#82b6ff", "图片理解": "#f2c16d", "自动图片理解": "#81d6a0", "提示词更新": "#c7a4ff"}

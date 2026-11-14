@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
 import logging
 import time
 from datetime import date
@@ -29,7 +30,11 @@ def _auth_ok(request: web.Request) -> bool:
 
 
 async def _health(request: web.Request) -> web.Response:
-    return web.json_response(request.app["pipe"].health())
+    data = request.app["pipe"].health()
+    instance = os.environ.get("MSGX_DESKTOP_INSTANCE")
+    if instance:
+        data["desktop_instance"] = instance
+    return web.json_response(data)
 
 
 async def _inject(request: web.Request) -> web.Response:
