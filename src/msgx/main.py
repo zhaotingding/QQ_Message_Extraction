@@ -253,7 +253,8 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="该文件一旦出现，服务就安全退出。供图形界面点「停止服务」时使用",
     )
-    sub.add_parser("gui", help="打开图形界面（配置 + 启停 + 实时日志）")
+    gui = sub.add_parser("gui", help="打开 Electron 图形界面")
+    gui.add_argument("--legacy-tk", action="store_true", help="打开供迁移对照的旧界面")
 
     p_inj = sub.add_parser("inject", help="直接向管道注入 OneBot 事件（调试用）")
     p_inj.add_argument("json", help="事件 JSON 字符串")
@@ -265,9 +266,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # 图形界面有自己的事件循环，不能塞进 asyncio.run
     if args.cmd == "gui":
-        from .gui import main as gui_main
-
-        return gui_main(args.config)
+        if args.legacy_tk:
+            from .gui import main as legacy_main
+            return legacy_main(args.config)
+        from .electron_launcher import launch
+        try:
+            return launch(args.config)
+        except (OSError, RuntimeError) as exc:
+            print(f"界面启动失败：{exc}", file=sys.stderr)
+            return 2
 
     try:
         cfg = load(args.config)
