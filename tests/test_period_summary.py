@@ -52,6 +52,24 @@ class PeriodPartsTests(unittest.TestCase):
         self.assertGreater(S.estimate_tokens("1234中文😀"), S.estimate_tokens("abcd"))
         self.assertEqual(summary_chars("# 标题\n\n**主题**\n内容。"), len("标题主题内容。"))
 
+    def test_terra_period_budget_obeys_model_profile_and_context_limits(self):
+        api = dict(model="gpt-6.1-terra", base_url="https://api.openai.com/v1",
+                   reasoning="max", context_tokens=1_050_000, max_output_tokens=1_020_000)
+        self.assertEqual(S.period_token_limits({"api": api}, 40000, 440000), (128000, 911500))
+        self.assertEqual(S.period_token_limits({"api": {**api, "max_output_tokens": 16000}}, 3500, 440000),
+                         (16000, 1023500))
+        self.assertEqual(S.period_token_limits({"api": {**api, "reasoning": "none"}}, 3500, 440000)[0], 11776)
+        compact = {"api": {**api, "context_tokens": 20000, "max_output_tokens": 19500}}
+        self.assertEqual(S.period_token_limits(compact, 3500, 3000), (14952, 3000))
+        self.assertEqual(S.period_token_limits(compact, 3500, 8000), (11776, 6176))
+        for host, model, expected in [
+            ("api.openai.com", "gpt-6-luna", (1050000, 128000)),
+            ("api.deepseek.com", "deepseek-flash", (1000000, 393216)),
+            ("custom.invalid", "gpt-6-luna", (1050000, 1020000)),
+        ]:
+            with self.subTest(host=host, model=model):
+                self.assertEqual(S.model_limits({"api": {**api, "base_url": f"https://{host}", "model": model}}), expected)
+
     def test_month_coverage_including_cross_year_and_leap_year(self):
         for start, end in [(date(2026, 8, 1), date(2026, 9, 1)),
                            (date(2026, 9, 1), date(2026, 10, 1)),

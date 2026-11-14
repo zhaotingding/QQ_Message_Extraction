@@ -733,7 +733,7 @@ class LLM:
             inputs.append({"role": message["role"], "content": content})
         effort = self.cfg.get("api", {}).get("reasoning", payload.get("reasoning_effort", "none"))
         if has_image:
-            effort = payload.get("reasoning_effort", effort)  # 图片提取明确关闭思考，不能再被配置覆盖而吃满输出预算。
+            effort = payload.get("reasoning_effort", effort)  # 图片提取显式关闭推理。
         background = bool(payload.get("background"))
         result = {"model": payload["model"], "input": inputs, "max_output_tokens": payload["max_tokens"],
                   "reasoning": {"effort": effort}, "store": background, "stream": not background}

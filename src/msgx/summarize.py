@@ -132,14 +132,43 @@ def output_token_budget(target_chars: int) -> int:
 
 
 def model_limits(cfg: dict) -> tuple[int, int]:
-    if "api" in cfg:
-        return cfg["api"]["context_tokens"], cfg["api"]["max_output_tokens"]
-    # DeepSeek 官方规格，2026-09-21：
-    # https://api-docs.deepseek.com/quick_start/pricing/
-    model = cfg.get("llm", {}).get("model", "deepseek-flash")
-    if model in ("deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"):
-        return 1_000_000, 393216
+    api = cfg.get("api", {})
+    llm = cfg.get("llm", {})
+    model = api.get("model", llm.get("model", "deepseek-flash"))
+    host = urlsplit(api.get("base_url", llm.get("base_url", "https://api.deepseek.com"))).hostname
+    official = None
+    if host == "api.openai.com" and model in ("gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra"):
+        official = (1_050_000, 128_000)
+    elif (host == "api.deepseek.com" or not api) and model in (
+        "deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"
+    ):
+        official = (1_000_000, 393_216)
+    if api:
+        context, output = api["context_tokens"], api["max_output_tokens"]
+        # 官方模型用规格约束超填的档案，兼容接口使用其自身声明的容量。
+        return (min(context, official[0]), min(output, official[1])) if official else (context, output)
+    if official:
+        return official
     raise ValueError(f"尚未核实模型 {model} 的上下文与输出上限，不能安全计算摘要请求额度")
+
+
+def period_token_limits(cfg: dict, target_chars: int, input_tokens: int) -> tuple[int, int]:
+    """为新周期任务预留正文和推理的共同额度，并据此计算输入空间。"""
+    context, output_cap = model_limits(cfg)
+    output = output_token_budget(target_chars)
+    margin = max(2048, math.ceil(context * 0.01))
+    if output > output_cap:
+        raise ValueError(f"目标字数对应的输出额度 {output} Token 超过模型上限 {output_cap}")
+    input_limit = context - margin - output
+    if cfg.get("api", {}).get("reasoning", "none") != "none":
+        # 优先容纳原材料，再用剩余空间预留推理额度，避免额外余量触发分块。
+        reserve = max(0, min(25_000, output_cap - output, input_limit - input_tokens))
+        return output + reserve, input_limit - reserve
+    return output, input_limit
+
+
+def _estimate_summary_input(system: str, body: str) -> int:
+    return estimate_tokens(system) + estimate_tokens(body) + 128
 
 
 def _rows_to_text_multi(rows: list) -> str:
@@ -401,11 +430,8 @@ class Summarizer:
             [(row["id"], block[0]) for row, block in zip(reports, blocks)] + [limit, system, self.scfg.get("_observations")], ensure_ascii=False,
         ).encode("utf-8")).hexdigest()
         self._add_observations(blocks)  # 计算报告来源对应关系后，附上低权限动态资料。
-        context_tokens, max_output = model_limits(self.cfg)
-        output_tokens = output_token_budget(limit)
-        if output_tokens > max_output:
-            raise ValueError(f"目标字数对应的输出额度 {output_tokens} Token 超过模型上限 {max_output}")
-        input_limit = context_tokens - output_tokens - max(2048, math.ceil(context_tokens * 0.01))
+        input_tokens = _estimate_summary_input(system, "\n\n".join(text for text, _ in blocks))
+        output_tokens, input_limit = period_token_limits(self.cfg, limit, input_tokens)
         self._progress(f"正在根据 {len(reports)} 份已保存摘要生成{PERIOD_LABELS[kind]}，目标约 {limit} 字")
         title = f"{PERIOD_LABELS[kind]}（{start} 至 {end - timedelta(days=1)}）"
         count = sum(int(row["msg_count"]) for row in reports)
@@ -451,12 +477,8 @@ class Summarizer:
         system += self._observation_rule()
         system += (f"\n\n本次只总结北京时间 {day.isoformat()} 的已入库消息。"
                    "保留重要事实、数字、讨论进展、分歧和未解决问题，供多日归纳复用。")
-        context_tokens, max_output = model_limits(self.cfg)
-        output_tokens = output_token_budget(limit)
-        if output_tokens > max_output:
-            raise ValueError(f"目标字数对应的输出额度 {output_tokens} Token 超过模型上限 {max_output}")
-        input_limit = context_tokens - output_tokens - max(2048, math.ceil(context_tokens * 0.01))
-        input_tokens = estimate_tokens(system) + estimate_tokens("\n\n".join(part for part, _ in blocks)) + 128
+        input_tokens = _estimate_summary_input(system, "\n\n".join(part for part, _ in blocks))
+        output_tokens, input_limit = period_token_limits(self.cfg, limit, input_tokens)
         self._progress(f"{day.isoformat()}：已读取 {count} 条有效消息，预估输入 {input_tokens} Token")
         title = f"日摘要（{day.isoformat()}）"
         info = self._prepare_period_request("daily", title, start, end, count, limit, "",
@@ -525,7 +547,7 @@ class Summarizer:
         while True:
             body = header + "\n\n".join(text for text, _ids in blocks)
             source_ids = list(dict.fromkeys(rid for _text, ids in blocks for rid in ids))
-            tokens = estimate_tokens(system) + estimate_tokens(body) + 128
+            tokens = _estimate_summary_input(system, body)
             if tokens <= input_limit:
                 self._progress("正在一次提交全部消息并等待完整摘要" if not checkpoint else "正在一次合并全部分块结果")
                 return await self._request(system, body, source_ids, output_tokens,
