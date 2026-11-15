@@ -92,15 +92,17 @@ async function show(key, record = true) {
   }
 }
 
-window.msgx.onClose(async () => {
+window.msgx.onClose(async ({ forUpdate } = {}) => {
   try {
     if (switching) throw new Error('页面正在切换，请稍后关闭。')
-    const status = await app.call('status.read')
-    if (status.serviceRunning && !(await app.confirm('接收服务仍在运行', '停止接收服务并关闭界面？'))) {
-      await app.call('desktop.cancelClose')
-      return
+    if (!forUpdate) {
+      const status = await app.call('status.read')
+      if (status.serviceRunning && !(await app.confirm('接收服务仍在运行', '停止接收服务并关闭界面？'))) {
+        await app.call('desktop.cancelClose')
+        return
+      }
     }
-    if (active === 'reader') await mounted.get(active)?.cleanup?.()
+    if (active === 'reader') await mounted.get(active)?.cleanup?.({ keepMounted: true })
     await app.call('desktop.finishClose')
   } catch (error) {
     app.notify(error.message)

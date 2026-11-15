@@ -68,6 +68,11 @@ body {
 .title-menu { position: relative; }
 button.menu-trigger { min-height: 26px; padding: 2px 8px; background: none; border-color: transparent; font-size: 12px; }
 button.menu-trigger:hover, button.menu-trigger[aria-expanded="true"] { background: var(--button-hover); }
+.menu-trigger[data-update="available"] { position: relative; padding-right: 16px; }
+.menu-trigger[data-update="available"]::after {
+  content: ""; position: absolute; width: 6px; height: 6px;
+  top: 6px; right: 5px; border-radius: 50%; background: var(--accent);
+}
 .menu-list {
   position: absolute; top: calc(100% + 3px); left: 0; min-width: 158px; padding: 4px;
   background: var(--panel); border: 1px solid var(--border); border-radius: 5px;
@@ -180,6 +185,11 @@ dialog {
   border-radius: 10px; max-width: min(760px, 94vw); max-height: 88vh; padding: 20px;
 }
 dialog::backdrop { background: #0009; }
+.update-dialog { width: min(420px, 90vw); }
+.update-dialog h2 { margin-top: 0; }
+.update-version { font-weight: 600; }
+.update-dialog progress { width: 100%; accent-color: var(--accent); }
+.update-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
 .qr-dialog img { display: block; margin: 12px auto; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .log {

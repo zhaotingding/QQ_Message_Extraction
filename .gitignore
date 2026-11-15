@@ -20,6 +20,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+/installer/dist/
 node_modules/
 .vscode/*
 !.vscode/settings.json

@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.error import HTTPError
@@ -26,6 +26,7 @@ from msgx import __version__, conda_runtime, napcat, prefs, security
 from msgx.app_icon import selected_icon
 from msgx.config import ROOT, abs_path, load
 from msgx.local_client import request_json
+from msgx.runtime_paths import FROZEN
 from msgx.service_process import ServiceProcess
 from msgx.store import Store
 
@@ -297,16 +298,19 @@ class Desktop:
                 "login": self.login_status(health, payload.get("qrMtime")),
                 "account": str(self.cfg.get("napcat", {}).get("account") or "")}
 
-    def close(self):
+    def close(self, *, for_update=False):
         with self.service_lock:
-            self.closing = True
             self.stop()
+            self.closing = True
             proc = self.service.proc
         if proc is not None:
             # 接收服务需要等 WS 和摘要任务收尾，给原有正常关停流程留出时间。
             try:
                 proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
+                if for_update:
+                    self.closing = False
+                    raise RuntimeError("接收服务正在收尾。停止完成后可重新安装更新。") from exc
                 self.service.stop_owned(proc, self.stop_file, cancelled=lambda: False)
         self.stop_file.unlink(missing_ok=True)
         # 朗读有独立的 COM 线程，由阅读模块释放。
@@ -319,7 +323,7 @@ class Desktop:
             return {"version": __version__, "theme": self.prefs["ui"].get("theme", "dark"),
                     "iconPath": str(icon) if icon else None}
         if action == "desktop.close":
-            self.close()
+            self.close(for_update=p.get("forUpdate", False))
             return {}
         if action == "desktop.openPreferences":
             if not self.prefs_file.exists():
@@ -384,34 +388,46 @@ class Desktop:
         raise ValueError(f"未知桌面操作：{action}")
 
 
-def main():
-    conda_runtime.require_environment()
+def main(argv=None):
+    if not FROZEN:
+        conda_runtime.require_environment()
     ap = argparse.ArgumentParser()
     ap.add_argument("--config")
-    ctx = Desktop(ap.parse_args().config)
+    ctx = Desktop(ap.parse_args(argv).config)
     output_lock = threading.Lock()
 
-    def reply(request):
+    def reply(request, *, busy=False):
         ident = request["id"]
         try:
+            if busy:
+                raise RuntimeError("桌面后台还有请求未完成，稍后可重新安装更新。")
             value = ctx.dispatch(request["action"], request["payload"])
             response = {"id": ident, "ok": True, "value": value}
             line = json.dumps(response, ensure_ascii=False)
         except Exception as exc:
             logging.getLogger("msgx.desktop").error("%s: %s", request["action"], security.redact(str(exc)))
-            line = json.dumps({"id": ident, "ok": False, "error": security.redact(str(exc))}, ensure_ascii=False)
+            response = {"id": ident, "ok": False, "error": security.redact(str(exc))}
+            line = json.dumps(response, ensure_ascii=False)
         with output_lock:
             print(line, flush=True)
+        return response["ok"]
 
     # 图片识别、重启等耗时请求不阻塞读取状态和浏览本地历史。
     pool = ThreadPoolExecutor(max_workers=8)
+    tasks = set()
     try:
         for line in sys.stdin:
             request = json.loads(line)
+            tasks = {task for task in tasks if not task.done()}
             if request["action"] == "desktop.close":
-                reply(request)
-                break
-            pool.submit(reply, request)
+                for_update = request["payload"].get("forUpdate", False)
+                # 常规轮询通常很快结束。短暂等待，仍忙时保留后台与窗口供稍后重试。
+                busy = for_update and bool(wait(tasks, timeout=2).not_done)
+                closed = reply(request, busy=busy)
+                if closed or not for_update:
+                    break
+            else:
+                tasks.add(pool.submit(reply, request))
     finally:
         if not ctx.closing:
             ctx.close()

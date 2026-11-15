@@ -3,24 +3,37 @@
 接收 QQ 群消息，在本机检索、查看图片 OCR，并按需调用模型生成日报、周报和月报。
 日常接收不会自动向 QQ 群发送消息。手动群发须先预览并二次确认；启用摘要、提示词更新或图片分析时，会把相应材料发送给你配置的 API 服务商。
 
-**适用：Windows 开发者。运行方式：源码 + 一个项目专用 Conda 环境 + 可选的轻量 EXE 启动器。**
+**适用：Windows 10 / 11 x64。** 日常用户使用安装版。开发者可从源码运行，沿用项目专用 Conda 环境。
 
 当前源码以 **1.0.5** 为业务基线，默认打开 Electron 界面。支持加权群活跃度、确认退群并清理消息（保留摘要）、关键词上下文定位、逐群勾选的二次确认群发和摘要语音朗读。完整变更见 [更新日志](CHANGELOG.md)。
 
 | 你现在要做什么 | 从这里开始 |
 |---|---|
-| 第一次克隆，先把界面打开 | [首次安装](#快速开始) |
-| 已装好，只想每天使用 | [日常启动](#日常启动) |
-| 更新源码，保留原设置和历史 | [更新项目](#更新项目) |
+| 安装或更新桌面应用 | [安装版](#安装版) |
+| 从源码开发、测试 | [源码快速开始](#快速开始) |
+| 启动或更新源码版 | [日常启动](#日常启动) · [更新项目](#更新项目) |
 | 亲自核对安装与升级是否成功 | [两条手动验收路线](docs/使用与排障.md#手动验收与恢复个人设置) |
 | 接入自己的 QQ 群 | [接入 QQ 与 NapCat](#接入-qq-与-napcat) |
 | 报权限错误、不收消息、摘要失败 | [常见问题](#常见问题) |
 | 改代码、跑测试、构建 EXE | [参与开发](#参与开发) |
 | 查功能细节、配置或日志 | [使用与排障](docs/使用与排障.md) |
 
+## 安装版
+
+公开安装包和稳定更新通过 [GitHub Releases](https://github.com/zhaotingding/QQ_Message_Extraction/releases) 提供。目前尚无公开 Release，拿到本机构建的安装包后可先本地试用。
+
+1. 双击 Windows x64 安装包，为当前用户安装。安装后从开始菜单打开「消息萃取」。程序和业务运行时随包提供，无需先安装 Conda、Node.js 或 Git。
+2. 收取群消息时另行准备 QQ 和 NapCat，按 [接入 QQ 与 NapCat](#接入-qq-与-napcat) 配置。模型密钥仍由当前 Windows 用户的凭据管理器保存。
+3. 已有源码版资料的用户可显式选用原资料根。全新安装默认将资料写入 `%LOCALAPPDATA%\msgx\profile`。升级或卸载会保留资料。见 [资料位置与复用](docs/使用与排障.md#安装版资料位置与复用)。
+
+安装版的「帮助 → 检查更新」查询公开稳定 Release。发现可用新版后，「帮助」旁显示蓝点，选择「更新并重启」才开始下载安装。程序保存摘要编辑、停止所持有的接收服务后再安装。公开更新尚需上传首个稳定 Release 及其更新文件。
+
+安装、卸载和更新实现统一在 [installer/](installer/)；新安装包输出到 `installer/dist/release/<版本>/`，隔离验收包在 `installer/dist/test/<版本>/`。已有 `.ui/installer-build/` 成品保留原位。测试包只用于本机更新验收，不作为正式发行包。
+
+卸载时先正常关闭目标应用，再在 Windows「设置 → 应用 → 已安装的应用」选择「消息萃取」。仓库用户也可先运行 `./installer/uninstall.ps1 -WhatIf` 核对目标，再运行 `./installer/uninstall.ps1` 并确认。该入口只调用当前用户注册的卸载器，保留个人资料；测试实例需显式加 `-TestBuild`。详见 [卸载说明](docs/使用与排障.md#卸载安装版)。
 
 ## 先看权限要求
-**日常使用普通 PowerShell；创建环境和安装依赖是否需要管理员，取决于选定目录的写权限。**
+源码版在普通 PowerShell 中运行。创建环境和安装依赖需要目标目录的写权限。
 
 | 操作 | 使用什么权限 | 需要注意什么 |
 |---|---|---|
@@ -35,6 +48,8 @@
 [权限错误](docs/使用与排障.md#权限错误)。
 
 ## 快速开始
+
+以下步骤适用于源码版。
 
 ### 1. 环境要求
 - Windows 10 / 11，64 位。
@@ -103,11 +118,11 @@ conda run -n msgx python -B -s -c "import msgx; from pathlib import Path; print(
 
 ```powershell
 npm.cmd ci --prefix desktop
-npm.cmd exec --prefix desktop -- install-electron
+npm.cmd run setup-runtime --prefix desktop
 conda run -n msgx --no-capture-output python -s -m msgx.main gui
 ```
 
-前两条安装桌面依赖和 Electron 运行时。锁文件变化后重新执行。
+前两条安装桌面依赖并生成带项目名称和默认图标的 Electron 界面程序。首次安装及桌面依赖锁文件变化后，先关闭项目窗口再执行这两条命令。
 **成功标志：** 出现“消息萃取”窗口，左栏有运行状态、实时消息、设置、用量明细、摘要阅读。
 干净安装先只核对“待配置”状态，不点击启动服务；不复制旧 `.ui/` 或 `data/`。
 没有 API 密钥也能打开界面；同一 Windows 用户的新克隆仍可能读到已有凭据，不能据此认定密钥已隔离。
@@ -147,7 +162,7 @@ qqnt.json
 | QQ.exe 路径（可选） | 自动定位失败时再指定 |
 | 统计哪些群 | 选择要关注的群；不选表示全部群 |
 
-设置保存在本机 `.ui/preferences.yaml`，不会改写仓库的共享 `config.yaml`。
+设置保存在资料根的 `.ui/preferences.yaml`。具体偏好位置显示在设置页。
 需要自定义端口、OneBot Token 或数据路径时，用可选的 [`.ui/config.local.yaml`](docs/使用与排障.md#配置保存位置)，不修改共享文件。
 群列表尚未出现时，先完成连接，再点“刷新群列表”。
 
@@ -190,7 +205,7 @@ conda run -n msgx --no-capture-output python -s -m msgx.main gui
 
 已有设置随原目录读取。首次填写或修改接收设置时，先点击“保存设置”，再到运行状态点击“启动服务”。
 
-**也可以使用已有的主 EXE：** Conda 能从系统 PATH 或 `CONDA_EXE` 找到，且默认 `msgx` 指向目标环境时，
+**也可以使用仓库里的轻量 EXE：** Conda 能从系统 PATH 或 `CONDA_EXE` 找到，且默认 `msgx` 指向目标环境时，
 直接双击仓库根目录的 `QQ_Message_Extraction.exe`。桌面使用快捷方式，不移动 EXE。
 若环境名或目录只在当前 PowerShell 中临时指定，从同一窗口执行 `& .\QQ_Message_Extraction.exe`；
 这些临时变量不会传给已打开的资源管理器，不能仅凭双击成功认定用了指定位置的环境。
@@ -318,12 +333,27 @@ conda run -n msgx --no-capture-output python -s tools\build_launcher.py
 构建优先使用个人图标，否则使用仓库的 [默认图标](assets/app-icon.ico)。窗口与 EXE 共用选择规则；
 别人克隆后无需复制你的 `.ui/` 也有默认图标，个人仍可在设置中更换。构建产物不进入版本库。
 
+### 构建 Windows 安装包
+
+在仓库根目录的普通 PowerShell 中操作，先确认项目 Conda 环境已安装 `.[build]`（见上节），并准备发布者的 Windows 代码签名。运行以下命令前请确认构建目录可写。
+
+```powershell
+conda run -n msgx --no-capture-output python -s installer/build_backend.py
+npm.cmd ci --prefix desktop
+npm.cmd run build:installer --prefix desktop
+```
+
+正式构建从源码读取版本号，输出到 `installer/dist/release/<版本>/`。核对 `msgx-setup-<版本>-x64.exe`、`latest.yml` 和更新所需的配套文件。后台和中间构建文件也在 `installer/dist/`；此目录不入库，安装实现本身需要入库。命令仅在本机构建，上传稳定 Release 需要单独执行。
+
+没有代码签名时，可使用隔离身份在本机验证双版本安装和更新。详见[安装版与公开更新](.agents/skills/msgx-windows-release/references/windows.md#安装版与公开更新)。
+
 ### 文件分工
 
 | 位置 | 用途 |
 |---|---|
 | [src/msgx/](src/msgx/) | Python 业务、进程控制与 Tk 对照界面 |
 | [desktop/](desktop/) | Electron 界面、进程通信与桌面依赖锁文件 |
+| [installer/](installer/) | 安装构建、NSIS 扩展、卸载入口及更新实现；`dist/` 为忽略的构建产物 |
 | [tests/](tests/) | 隔离测试 |
 | [tools/](tools/) | 构建、诊断和协议端辅助实现 |
 | [pyproject.toml](pyproject.toml) | Python 依赖声明和包配置 |

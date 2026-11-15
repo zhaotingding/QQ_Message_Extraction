@@ -50,6 +50,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import ROOT
+from .runtime_paths import FROZEN, PROGRAM_ROOT
 
 # 起子进程查进程表时不要闪出控制台窗口（本模块整个存在的意义就是「没有黑框」）
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -145,11 +146,13 @@ def log_path(cfg: dict) -> Path:
 def vbs_path() -> Path | None:
     """确保隐藏启动器存在且内容与源码一致，返回它的路径。
 
-    优先写到 ``tools/``（进版本库、可审查）；不可写就退到 ``.ui/``（本地目录）。
+    源码模式优先写到 ``tools/``；安装模式只写入资料目录的 ``.ui/``。
     内容不一致时直接覆盖 —— 这个文件是本模块的派生物，不是用户资产。
     """
     payload = VBS_SOURCE.encode("ascii")
-    for p in (ROOT / "tools" / VBS_NAME, ROOT / ".ui" / VBS_NAME):
+    folders = (ROOT / ".ui",) if FROZEN else (ROOT / "tools", ROOT / ".ui")
+    for folder in folders:
+        p = folder / VBS_NAME
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             if not p.exists() or p.read_bytes() != payload:
@@ -317,7 +320,8 @@ def restart_target(cfg: dict, wait_seconds: float = 120) -> dict:
     pf = preflight(dir_, cfg)
     if not pf["ok"]:
         return {"ok": False, "note": "NapCat 安装目录或 QQ 程序不完整，未重启"}
-    script = ROOT / "tools" / "restart_napcat_target.ps1"
+    # 安装版提权脚本始终来自程序资源，个人资料根只保存本次请求及结果。
+    script = (PROGRAM_ROOT if FROZEN else ROOT) / "tools" / "restart_napcat_target.ps1"
     if not script.is_file():
         return {"ok": False, "note": "缺少定向重启脚本，未重启"}
     folder = ROOT / ".ui" / "napcat-restart"

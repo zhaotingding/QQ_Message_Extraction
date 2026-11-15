@@ -7,7 +7,7 @@ const { spawn, execFileSync } = require('node:child_process')
 
 const root = path.resolve(__dirname, '..')
 const desktop = path.join(root, 'desktop')
-const runtime = path.join(desktop, 'node_modules', 'electron', 'dist', 'electron.exe')
+const runtime = path.join(desktop, 'node_modules', 'electron', 'dist', 'msgx-desktop.exe')
 const python = path.join(process.env.CONDA_PREFIX || '', 'python.exe')
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -104,6 +104,7 @@ async function run() {
       await fs.writeFile(path.join(isolated, filename), Buffer.from(shot.result.data, 'base64'))
     }
     await wait(() => evaluate("document.querySelectorAll('#navigation button').length === 5"), '主导航未构建')
+    assert.equal(await evaluate("window.msgx.call('desktop.update.status').then(s => s.phase)"), 'unavailable')
     await wait(() => evaluate("document.querySelector('#inspector-title').textContent === '自动摘要'"), '运行状态未挂载摘要侧栏')
     await light('idle')
     const activeLog = 'document.querySelector(".status-console .log:not([hidden])")'

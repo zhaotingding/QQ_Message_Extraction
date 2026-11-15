@@ -334,13 +334,13 @@ export function mount(container, app) {
         app.notify(error.message);
     });
 
-    return async () => {
+    return async ({ keepMounted = false } = {}) => {
         if (busy) throw new Error("摘要正在读取或保存，请稍后再切换");
         await guarded(async () => {
             await saveNotes();
             await stopVoice();
             app.state.readerView = {id: report?.id, hash: report?.review.content_hash, scroll: article.scrollTop};
-            closed = true;
+            closed = !keepMounted;
         });
     };
 }

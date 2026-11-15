@@ -6,7 +6,7 @@ from pathlib import Path
 
 from msgx import api_settings, credentials, prefs, security, yaml_config
 from msgx.app_icon import selected_icon
-from msgx.config import abs_path
+from msgx.config import abs_path, config_path
 from msgx.image_policy import default_keyword_rules, screen_image, validate_analysis
 from msgx.summarize import DEFAULT_DIGEST_PROMPT, DIGEST_DEFAULT_CHARS
 
@@ -43,15 +43,13 @@ def _settings(ctx, saved):
     summary = ctx.base_cfg.get("summary", {})
     filters = {**prefs.DEFAULTS["filters"], **saved.get("filters", {})}
     napcat = ctx.base_cfg.get("napcat", {})
-    local_cfg = ctx.root / ".ui/config.local.yaml"
-    config_path = ctx.config_path or (local_cfg if local_cfg.exists() else ctx.root / "config.yaml")
     try:
         target_chars = int(saved.get("summary_target_chars") or summary.get("target_chars") or DIGEST_DEFAULT_CHARS)
     except (TypeError, ValueError):
         target_chars = DIGEST_DEFAULT_CHARS
     return {
         **_api_state(ctx, saved), "theme": _theme(saved), "prefsPath": str(ctx.prefs_file),
-        "configPath": str(config_path), "defaultPrompt": DEFAULT_DIGEST_PROMPT,
+        "configPath": str(config_path(ctx.config_path, root=ctx.root)), "defaultPrompt": DEFAULT_DIGEST_PROMPT,
         "summaryPrompt": saved.get("summary_prompt") or summary.get("prompt") or DEFAULT_DIGEST_PROMPT,
         "targetChars": target_chars if 1 <= target_chars <= 100000 else DIGEST_DEFAULT_CHARS,
         "promptEvolution": {"enabled": False, "days": 7, "interval_days": 7,
