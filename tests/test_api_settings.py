@@ -648,6 +648,53 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(used, ["gpt-6-luna", "gpt-6-luna", "deepseek-flash", "deepseek-flash"])
         self.assertEqual(summary.progress["state"], "done")
 
+    async def test_period_summary_reserves_reasoning_space_for_each_api_profile(self):
+        folder = Path(self.tmp.name)
+        start, end = date(2026, 8, 3), date(2026, 8, 4)
+        stamp = Summarizer._day_bounds(start)[0]
+        self.store.conn.execute("INSERT INTO messages(group_id,msg_id,ts,text) VALUES('g','1',?,'有效消息')", (stamp,))
+        self.store.conn.commit()
+        profiles, _ = api_settings.catalog({}, {})
+        cases = [
+            ({**profiles["openai"], "reasoning": "max"}, 36776),
+            ({**profiles["deepseek"], "reasoning": "medium"}, 36776),
+            ({**profiles["openai"], "model": "custom-model", "base_url": "https://custom.invalid/v1",
+              "reasoning": "high", "context_tokens": 20000, "max_output_tokens": 19000}, None),
+            ({**profiles["deepseek"], "reasoning": "none"}, 11776),
+        ]
+        for profile, expected in cases:
+            with self.subTest(model=profile["model"], effort=profile["reasoning"]):
+                # 每个档案都走完整日报生成，避免复用前一个档案的成稿。
+                self.store.conn.execute("DELETE FROM summaries")
+                self.store.conn.commit()
+                cfg = api_settings.apply(self.cfg, profile)
+                cfg["app"] = {**cfg["app"], "report_dir": str(folder / "reports")}
+                cfg["summary"] = {**cfg["summary"], "target_chars": 3500}
+                llm = LLM(cfg, self.store)
+                llm.configure(KEY)
+                session = Mock()
+                session.post.return_value = Response({**self.response(), "id": "resp_budget_test"})
+                with patch.object(llm, "session", AsyncMock(return_value=session)), patch.dict(os.environ, {prefs.ENV_PREFS: ""}):
+                    report = await Summarizer(cfg, self.store, llm).run_period("daily", start, end)
+                self.assertEqual(report["content"], "完整摘要")
+                session.post.assert_called_once()
+                args, options = session.post.call_args
+                self.assertEqual(args[0], profile["base_url"] + "/responses")
+                body = json.loads(options["data"])
+                self.assertEqual(body["reasoning"], {"effort": profile["reasoning"]})
+                if expected is None:
+                    self.assertGreater(body["max_output_tokens"], 11776)
+                    self.assertLess(body["max_output_tokens"], 17951)
+                else:
+                    self.assertEqual(body["max_output_tokens"], expected)
+                if profile["base_url"] == api_settings.DEFAULTS["base_url"]:
+                    self.assertTrue(body["background"])
+                    self.assertEqual(body["service_tier"], "flex")
+                else:
+                    self.assertTrue(body["stream"])
+                    self.assertNotIn("background", body)
+                    self.assertNotIn("service_tier", body)
+
     async def test_catalog_migrates_single_settings_and_isolates_same_address_keys(self):
         profiles, active = api_settings.catalog({}, {"api": {**api_settings.DEFAULTS, "model": "existing-model"}})
         self.assertEqual(active, "openai")

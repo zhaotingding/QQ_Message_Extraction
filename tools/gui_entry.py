@@ -36,25 +36,10 @@ def main() -> int:
     except RuntimeError as exc:
         _report(str(exc))
         return 1
-    # tkinter 是标准库，但**部分精简发行版不带**（例如某些便携版、
-    # 由工具链自带的精简 Python）。这里显式检查，避免只报一句 ImportError。
     try:
-        import tkinter  # noqa: F401
-    except ImportError:
-        _report(
-            "当前 Python 解释器不带 tkinter，无法打开图形界面。\n\n"
-            f"解释器：{sys.executable}\n\n"
-            "tkinter 属于标准库，但精简发行版常常删掉了它。\n"
-            f"请检查项目环境：conda install -n {conda_runtime.environment_name()} tk\n"
-            "不要覆盖已有环境或向公共 base 安装项目依赖。\n\n"
-            "详见 README 的「环境要求」一节。"
-        )
-        return 1
+        from msgx.electron_launcher import launch
 
-    try:
-        from msgx.gui import main as gui_main
-
-        return gui_main()
+        return launch()
     except Exception:  # noqa: BLE001
         _report(traceback.format_exc())
         return 1

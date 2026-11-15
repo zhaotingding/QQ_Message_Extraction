@@ -1,0 +1,13 @@
+{
+  "name": "msgx-desktop",
+  "private": true,
+  "productName": "消息萃取",
+  "type": "module",
+  "main": "main.cjs",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "devDependencies": {
+    "electron": "45.3.2"
+  }
+}

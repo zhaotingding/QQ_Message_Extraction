@@ -19,6 +19,7 @@ sys.path.insert(0, str(PROJ / "src"))  # 套件不借用外层项目的运行入
 from msgx import conda_runtime
 
 SUITES = [
+    ("群发二次确认、退群清理与本机接口", "test_group_actions.py"),
     ("可编辑图片主题规则", "test_image_rules.py"),
     ("深浅主题与本地外观保存", "test_theme.py"),
     ("复选框勾选样式", "test_check_style.py"),
@@ -43,6 +44,8 @@ SUITES = [
     ("日周月摘要、完整材料与分块恢复", "test_period_summary.py"),
     ("摘要阅读元数据", "test_summary_review.py"),
     ("摘要批注与阅读界面", "test_reader_review_gui.py"),
+    ("摘要朗读：分段、调度与引擎降级", "test_tts.py"),
+    ("摘要朗读界面：按钮、高亮与切文停读", "test_reader_voice_gui.py"),
     ("自动周期任务与失败恢复", "test_period_scheduler.py"),
     ("媒体校验", "test_media.py"),
     ("群列表属主", "test_groups.py"),

@@ -1,0 +1,116 @@
+#page-reader { height: 100%; }
+:root {
+    --reader-skimmed: #223955;
+    --reader-deep: #213d30;
+}
+[data-theme="light"] {
+    --reader-skimmed: #dcecff;
+    --reader-deep: #dcf2e5;
+}
+.reader-layout {
+    display: grid;
+    grid-template-columns: minmax(215px, 24%) minmax(0, 1fr);
+    gap: 14px;
+    height: 100%;
+    min-height: 485px;
+}
+.reader-side, .reader-reading {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    gap: 8px;
+}
+.reader-side .toolbar { justify-content: space-between; }
+.reader-filters { display: flex; flex-wrap: wrap; gap: 3px 12px; }
+.reader-filters label { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.reader-filters input { margin: 0; }
+.reader-side, .reader-head, .reader-notes { margin-bottom: 0; }
+.reader-list {
+    overflow: auto;
+    min-height: 140px;
+    flex: 2 1 140px;
+}
+.reader-outline {
+    min-height: 64px;
+    flex: 1 1 95px;
+    overflow: auto;
+}
+.reader-entry, .reader-outline button {
+    display: block;
+    width: 100%;
+    text-align: left;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    margin-bottom: 4px;
+}
+.reader-entry[aria-current="true"] { border-color: var(--accent, #6ea8ff); }
+.reader-entry[data-read-state="skimmed"] { background-color: var(--reader-skimmed); }
+.reader-entry[data-read-state="deep"] { background-color: var(--reader-deep); }
+.reader-entry span, .reader-entry strong { display: block; }
+.reader-entry-meta, .reader-meta, .reader-location {
+    font-size: .88rem;
+    color: var(--muted, #919bad);
+    margin: 2px 0 5px;
+}
+.reader-location { overflow-wrap: anywhere; }
+.reader-head, .reader-notes { flex: 0 0 auto; }
+.reader-head .toolbar { margin-top: 8px; }
+.reader-article {
+    flex: 1 1 240px;
+    overflow: auto;
+    min-height: 160px;
+    background: var(--panel, transparent);
+    border: 1px solid var(--border, #57627660);
+    border-radius: 9px;
+    font-size: 1rem;
+    line-height: 1.72;
+    padding: 12px 20px;
+}
+.reader-line {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    min-height: 1em;
+    margin: 0;
+}
+.reader-body { padding: 3px 0; }
+.reader-heading { color: var(--accent, #6ea8ff); margin-top: 6px; }
+.reader-title { line-height: 1.4; margin: 8px 0; }
+.reader-gap { height: 10px; min-height: 0; overflow: hidden; }
+.reader-notes { display: grid; grid-template-columns: 1fr auto; gap: 6px 8px; }
+.reader-notes label { grid-column: 1 / -1; }
+.reader-notes textarea { min-width: 0; width: 100%; resize: vertical; }
+.reader-notes button { align-self: start; }
+.reader-mark-blue { background: #4c9bf54d; }
+.reader-mark-red { background: #ed4e6654; }
+.reader-mark-underline { text-decoration: underline; }
+.reader-speaking { box-shadow: inset 0 -3px #ebaf40; background: #ebaf4042; }
+.usage-page { display: grid; gap: 14px; align-content: start; }
+.usage-section { min-width: 0; }
+.usage-section h3 { margin: 0 0 6px; }
+.usage-table-wrap { max-width: 100%; max-height: 360px; overflow: auto; }
+.usage-table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+.usage-table td, .usage-table th { white-space: nowrap; text-align: left; padding: 6px 10px; }
+.usage-table th { position: sticky; top: 0; background: var(--panel, var(--bg)); z-index: 1; }
+.usage-table td { border-bottom: 1px solid var(--border, #57627660); }
+.usage-table th button, .usage-source { padding: 2px 5px; }
+.usage-chart svg { display: block; max-height: 260px; width: 100%; }
+.usage-chart svg text { fill: var(--muted, currentColor); font-size: 11px; }
+.usage-grid { stroke: var(--border, #57627660); }
+.usage-legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 4px 0; }
+.usage-legend span::before {
+    content: "";
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    background: var(--series-color);
+}
+.usage-message { white-space: pre-wrap; overflow-wrap: anywhere; padding: 8px 0; }
+.usage-sources { max-height: 380px; overflow: auto; }
+@media (max-width: 850px) {
+    .reader-layout { grid-template-columns: minmax(180px, 28%) minmax(0, 1fr); }
+    .reader-side .toolbar { justify-content: flex-start; }
+    .reader-article { padding-inline: 12px; }
+}

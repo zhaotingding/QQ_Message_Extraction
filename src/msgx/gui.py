@@ -288,6 +288,10 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
             self._accept_messages(*value)
         elif kind == "keyword_messages":
             self._accept_keyword_messages(*value)
+        elif kind == "message_context":
+            self._accept_message_context(*value)
+        elif kind == "group_operation":
+            self.group_operations.receive(*value)
         elif kind == "message_action":
             key, action, result = value
             self._rt_actions.discard(key)
@@ -313,6 +317,10 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
             self._report_review_saved(*value)
         elif kind == "report_history":
             self._render_report_history(*value)
+        elif kind == "tts_state":
+            self._apply_tts_state(*value)
+        elif kind == "tts_seg":
+            self._highlight_speaking(*value)
         elif kind == "login_done":
             self._login_finished(value)
         elif kind == "receiver_recovered":
@@ -371,6 +379,7 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
             self.service.wanted = False
             self._cancel_service_recovery()
             self.qr_watching = False
+            self._stop_narration()  # 关窗立即哑掉，别让语音比窗口活得更久
             self.v_rt_auto.set(False)
             self.root.destroy()
             return
@@ -382,6 +391,7 @@ class App(StatusPage, SettingsPage, UsagePage, ReaderPage, RealtimePage, LoginAc
             self.status.set("已取消关闭，服务继续运行")
             return
         self.qr_watching = False  # 确认关闭后再停止二维码监视和实时刷新。
+        self._stop_narration()
         self.v_rt_auto.set(False)
         self.closing = True
         self.stop_service()

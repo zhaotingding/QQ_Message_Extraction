@@ -70,6 +70,39 @@ class BackgroundSummaryTests(unittest.IsolatedAsyncioTestCase):
         return await Summarizer(self.llm.cfg, self.store, self.llm).run_period(
             "daily", date(2026, 10, 8), date(2026, 10, 9))
 
+    async def test_confirmed_retry_keeps_terra_reasoning_and_reserves_output(self):
+        self.cfg["api"].update(model="gpt-6.1-terra", reasoning="max", max_output_tokens=11776)
+        self.llm.llm["model"] = "gpt-6.1-terra"
+        self.cfg["summary"]["target_chars"] = 3500
+        # 模拟已计账的截断结果。确认补生成应发一次新请求，旧任务不再查询或记账。
+        failed = response("incomplete", identity="resp_exhausted")
+        body = json.loads(await failed.text())
+        body["usage"] = {"input_tokens": 330392, "output_tokens": 11776}
+        failed.text = AsyncMock(return_value=json.dumps(body))
+        self.llm._retrieve_response = AsyncMock(return_value=await self.llm._read_response(failed))
+        with patch("msgx.llm.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(IncompleteResponse):
+                await self.run_daily()
+        self.assertEqual(self.posts[0][1]["max_output_tokens"], 11776)
+        self.assertEqual(self.posts[0][1]["reasoning"], {"effort": "max"})
+        self.store.save_summary_job(*self.key, "blocked", now=101, attempts=1)
+        pipe = Pipeline.__new__(Pipeline)
+        pipe.store = self.store
+        pipe._summary_wake = asyncio.Event()
+        pipe.retry_summary_job(*self.key, confirmed=True, revision=101)
+        self.cfg["api"]["max_output_tokens"] = 128000
+        self.llm._retrieve_response.return_value = await self.llm._read_response(response("completed"))
+        with patch("msgx.llm.asyncio.sleep", new=AsyncMock()):
+            result = await self.run_daily()
+        self.assertEqual(len(self.posts), 2)
+        payload = self.posts[-1][1]
+        self.assertEqual(payload["reasoning"], {"effort": "max"})
+        self.assertEqual(payload["max_output_tokens"], 36776)
+        self.assertEqual(payload["service_tier"], "flex")
+        self.assertEqual(self.cfg["api"]["reasoning"], "max")
+        self.assertEqual(result["content"], "完整摘要")
+        self.assertEqual(len(self.store.api_usage_details()["items"]), 2)
+
     async def test_disconnect_restart_preserves_material_profile_and_single_bill(self):
         with patch("msgx.llm.asyncio.sleep", new=AsyncMock()):
             with self.assertRaises(BackgroundResponsePending):

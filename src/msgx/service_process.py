@@ -27,7 +27,7 @@ class ServiceProcess:
         self.restart_cancelled = False
 
     def spawn(self, *, root: Path, prefs_file: Path, stop_file: Path,
-              config_path=None, automatic: bool = False):
+              config_path=None, automatic: bool = False, desktop_instance: str = ""):
         stop_file.unlink(missing_ok=True)
         env = os.environ.copy()
         env.update(MSGX_PREFS=str(prefs_file), PYTHONUTF8="1", PYTHONNOUSERSITE="1",
@@ -36,6 +36,7 @@ class ServiceProcess:
                    NO_PROXY="127.0.0.1,localhost")
         for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
             env.pop(name, None)
+        env["MSGX_DESKTOP_INSTANCE"] = desktop_instance
         args = ["-u", "-m", "msgx.main"]
         if config_path:
             args += ["--config", str(config_path)]

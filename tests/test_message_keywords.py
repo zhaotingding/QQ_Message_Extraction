@@ -43,6 +43,31 @@ class MessageKeywordTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, expected):
                 compile_rules(lines)
 
+    def test_historical_context_is_same_group_bounded_ordered_and_multi_image_aware(self):
+        before = [self.add("前文") for _ in range(50)]
+        anchor = self.add("关键词", images=True)
+        self.add("智能客服消息", sender="智能客服")
+        after = [self.add("后文") for _ in range(50)]
+        self.add("工作群", group="other")
+        for _ in range(250):
+            self.add("最新消息")
+        self.assertNotIn(anchor, [row["id"] for row in self.store.recent_messages(200)])
+        rows = self.store.messages_around(anchor, radius=40)
+        self.assertEqual([row["id"] for row in rows], list(reversed(before[-40:]+[anchor]+after[:40])))
+        self.assertEqual({row["group_id"] for row in rows}, {"1"})
+        self.assertEqual(len(next(row for row in rows if row["id"] == anchor)["images"]), 2)
+        self.assertEqual(self.store.messages_around(anchor, account="unrelated-account"), [])
+        self.store.conn.execute("DELETE FROM messages WHERE id=?", (anchor,))
+        self.store.conn.commit()
+        self.assertEqual(self.store.messages_around(anchor), [])
+
+    def test_context_handles_identical_timestamps_without_duplicates(self):
+        ids = [self.add("文字") for _ in range(12)]
+        self.store.conn.execute("UPDATE messages SET ts=100")
+        self.store.conn.commit()
+        rows = self.store.messages_around(ids[6], radius=2)
+        self.assertEqual([row["id"] for row in rows], list(reversed(ids[4:9])))
+
     def test_text_ocr_semantics_any_rule_and_sender_group_filters(self):
         text = self.add("Codex 的价格：30")
         image = self.add("图片说明", images=True)

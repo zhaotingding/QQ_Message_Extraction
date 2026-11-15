@@ -63,6 +63,8 @@ class ImageAnalysis:
             self.status = {"state": "idle", "message": "暂无达到阈值的待分析图片", **usage}
             return count
         row = dict(rows[0])
+        if row["group_id"] in self.media.blocked_groups:
+            return count  # 退群确认后的等待窗口不能新提交图片 API。
         if row["auto_ready_at"] > time.time():
             remaining = max(1, int(row["auto_ready_at"]-time.time()))
             self.status = {"state": "waiting", "message": f"图片 #{row['id']} 已标记（{row['screen_score']}分），等待后续群聊约{remaining//60}分{remaining%60}秒",

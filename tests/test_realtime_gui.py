@@ -65,6 +65,141 @@ def sample_payload():
 
 
 class RealtimeGuiTests(unittest.TestCase):
+    def test_manual_refresh_passes_activity_cache_bypass(self):
+        with patch("msgx.ui.realtime.request_json", return_value={}) as request:
+            self.app._fetch_messages(200, False, "", self.app.proc, ("1", 14), True)
+        self.assertEqual(request.call_args.kwargs["query"]["activity_refresh"], "1")
+
+    def test_group_operation_service_switch_unlocks_ui_without_replay(self):
+        panel = self.app.group_operations
+        panel.job_id, panel.job_proc = "existing-job", self.app.proc
+        panel._enabled(False)
+        self.app.service.proc = object()
+        with patch.object(panel, "request") as request:
+            panel._poll()
+            request.assert_not_called()
+        self.assertFalse(panel.busy)
+        self.assertEqual(str(panel.history_button["state"]), "normal")
+        self.assertEqual(str(panel.cancel_button["state"]), "disabled")
+        self.assertIn("读取最近记录", panel.status.get())
+
+    def test_context_selection_is_fixed_and_stale_results_are_discarded(self):
+        app = self.app
+        rows = sample_payload()["items"]
+        app._rt_context_id, app._rt_context_seq = 2, 5
+        app._accept_message_context((4, 1), rows[:1], "")
+        self.assertEqual(app.rt.get_children(), ())
+        app._accept_message_context((5, 2), rows, "")
+        self.assertEqual(app.rt.selection(), ("2:201",))
+        self.assertIn("历史上下文", app.v_rt_status.get())
+        app._accept_messages(app._rt_request_key(), app.proc, {"items": [], "activity": sample_payload()["activity"]})
+        self.assertTrue(app.rt.exists("2:201"))
+        with patch.object(app, "refresh_messages") as refresh:
+            app._return_to_live()
+            refresh.assert_called_once()
+        self.assertIsNone(app._rt_context_id)
+        self.assertEqual(str(app.btn_rt_live["state"]), "disabled")
+
+    def test_click_keyword_starts_context_read_without_api(self):
+        app = self.app
+        store = Store(Path(self.temp.name)/"test.db")
+        try:
+            event = {"post_type": "message", "message_type": "group", "group_id": "42", "user_id": "200", "self_id": "100",
+                     "message_id": "1", "time": 100, "message": "关键词"}
+            row_id = store.insert_message(parse_onebot_event(event, "100"))
+            row = store.recent_messages()[0]
+        finally:
+            store.close()
+        app._rt_keyword_rows = {str(row_id): row}
+        app.rt_keywords.insert("", "end", iid=str(row_id))
+        app.rt_keywords.selection_set(str(row_id))
+        app._keyword_selected()
+        kind, data = app.events.get(timeout=3)
+        self.assertEqual(kind, "message_context")
+        app._accept_message_context(*data)
+        self.assertEqual(app.rt.selection(), (str(row_id),))
+        sequence = app._rt_context_seq
+        app._keyword_selected()
+        self.assertEqual(app._rt_context_seq, sequence)
+
+    @staticmethod
+    def _find(widget, kind):
+        found = []
+        for child in widget.winfo_children():
+            if isinstance(child, kind):
+                found.append(child)
+            found.extend(RealtimeGuiTests._find(child, kind))
+        return found
+
+    def test_broadcast_confirmation_defaults_to_no_selection_and_sends_only_checked(self):
+        panel = self.app.group_operations
+        preview = {"token": "token-once", "kind": "broadcast", "account": "100", "excluded": ["33"],
+                   "groups": [{"group_id": "11", "group_name": "同名"}, {"group_id": "22", "group_name": "同名"}], "text": "完整正文\n下一行"}
+        with patch.object(panel, "request") as request:
+            panel.show_confirmation(preview)
+            body = self._find(panel.window, tk.Text)[0]
+            self.assertEqual(body.get("1.0", "end-1c"), "完整正文\n下一行")
+            labels = " ".join(str(widget.cget("text")) for widget in self._find(panel.window, ttk.Label))
+            self.assertIn("QQ 100", labels)
+            self.assertIn("33", labels, "不属于当前账号的统计群仍要显示出来")
+            self.assertEqual([str(widget.cget("text")) for widget in self._find(panel.window, ttk.Checkbutton)
+                              if str(widget.cget("text")).startswith("同名")],
+                             ["同名（11）", "同名（22）"], "每个群都要单独列成可勾选项")
+            self.assertEqual(panel._group_order, ["11", "22"])
+            self.assertEqual(panel._selected_groups(), [], "默认一个群都不预选")
+            self.assertEqual(str(panel._confirm_button["state"]), "disabled")
+            panel._ack_check.invoke()
+            self.assertEqual(str(panel._confirm_button["state"]), "disabled", "只勾核对、没勾群时不许发")
+            panel._confirm_button.invoke()
+            request.assert_not_called()
+            panel._group_vars["22"].set(True)
+            panel._refresh_selection()
+            self.assertIn("1 个群", str(panel._confirm_button["text"]))
+            panel._confirm_button.invoke()
+            request.assert_called_once_with("confirm", {"token": "token-once", "confirmed": True, "groups": ["22"]})
+            self.assertEqual(self.app.prefs.get("broadcast_groups"), ["22"], "勾选结果要记住")
+
+    def test_broadcast_confirmation_restores_last_selection(self):
+        panel = self.app.group_operations
+        self.app.prefs = {**self.app.prefs, "broadcast_groups": ["22", "99"]}
+        preview = {"token": "restore", "kind": "broadcast", "account": "100", "excluded": [],
+                   "groups": [{"group_id": "11", "group_name": "甲"}, {"group_id": "22", "group_name": "乙"}], "text": "正文"}
+        panel.show_confirmation(preview)
+        self.assertEqual(panel._selected_groups(), ["22"], "只恢复仍在候选里的群")
+        panel._check_all(True)
+        self.assertEqual(panel._selected_groups(), ["11", "22"])
+        panel._check_all(False)
+        self.assertEqual(panel._selected_groups(), [])
+
+    def test_cancel_confirmation_never_submits(self):
+        panel = self.app.group_operations
+        preview = {"token": "cancel", "kind": "leave", "account": "100", "excluded": [], "message_count": 12,
+                   "groups": [{"group_id": "11", "group_name": "测试群"}], "text": ""}
+        with patch.object(panel, "request") as request:
+            panel.show_confirmation(preview)
+            widgets = [child for frame in panel.window.winfo_children() for child in frame.winfo_children()]
+            cancel = next(child for child in widgets if isinstance(child, ttk.Button) and str(child["text"]) == "取消")
+            cancel.invoke()
+            request.assert_not_called()
+            self.assertFalse(panel.busy)
+
+    def test_finished_broadcast_status_shows_counts_only_and_keeps_reason_in_table(self):
+        panel = self.app.group_operations
+        job = {"id": "job-1", "account": "100", "state": "partial", "kind": "broadcast", "created_at": 0,
+               "note": "共 26 个群：成功 12 个，明确失败 1 个，未发送 13 个；失败群不会自动重发，原因见下表",
+               "groups": [
+                   {"group_id": "11", "group_name": "甲", "state": "sent", "message_id": "900"},
+                   {"group_id": "22", "group_name": "乙", "state": "failed", "error": "send_group_msg 调用失败：retcode 1200 · EventChecker Failed"},
+                   {"group_id": "33", "group_name": "丙", "state": "not_sent", "error": "操作停止"}]}
+        panel.receive(self.app.proc, "status", {"ok": True, "result": job})
+        text = panel.status.get()
+        self.assertIn("明确失败 1 个", text)
+        self.assertNotIn("成功 12/26", text, "结束状态不再重复写一次成功数")
+        self.assertNotIn("retcode", text, "协议原始响应不能出现在状态栏")
+        self.assertEqual(str(panel.cancel_button["state"]), "disabled")
+        detail = panel.results.item(panel.results.get_children()[1], "values")[3]
+        self.assertIn("retcode 1200", detail, "逐群失败原因仍可在表格里核对")
+
     def setUp(self):
         guard = patch("msgx.local_client.urllib.request.build_opener", side_effect=AssertionError("test must not access network"))
         guard.start()

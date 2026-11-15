@@ -223,7 +223,7 @@ app.service.proc = object()
 app.v_rt_filter.set("仅看图片")
 with patch("threading.Thread") as thread:
     app.refresh_messages()
-    check("仅看图片筛选发送到服务端查询", thread.call_args.kwargs["args"] == (200, True, "", app.proc, app._activity_request_key()))
+    check("仅看图片筛选发送到服务端查询", thread.call_args.kwargs["args"] == (200, True, "", app.proc, app._activity_request_key(), False))
 app._rt_busy = False
 app.service.proc = old_proc
 app.v_rt_filter.set("全部消息")

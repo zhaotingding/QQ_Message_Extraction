@@ -10,6 +10,10 @@
 
 有ID不表示永远禁止补生成：当前 `retry_summary_job()` 先检查 `confirmed`、blocked状态和最新修订；已有成稿则直接恢复完成，否则只在无ID或已持久化结果的 `finish_reason != "stop"` 分支清理原请求，再交原调度处理。单次取回失败不等于已确认生成失败，也不构成重提授权。此分支为2026-10-15源码静态核对；未据此执行真实取回或补生成。
 
+2026-11-14，基于 1.0.5 的官方 Terra 周期摘要故障：3500 字目标的 11776 Token 额度同时供 `reasoning=max` 和正文使用，响应耗尽额度，正文为空。旧归一化结果没有独立推理计数。用户确认周期摘要应沿用所有 API 档案的推理强度。新任务先算正文预算，有推理的档案额外留至多 25,000 Token。余量受档案、已知官方模型、和容纳原材料后剩余空间的限制。兼容接口使用档案声明的容量。已有响应的预算、材料与 GET 恢复沿用冻结快照。Luna、DeepSeek Flash 和兼容接口的请求回归见 `tests/test_api_settings.py`，模拟覆盖客户端请求与成稿，供应商执行能力以实际接口为准。[OpenAI 输出预算](https://developers.openai.com/api/docs/guides/reasoning#controlling-costs) · [DeepSeek Responses](https://api-docs.deepseek.com/api/create-response/)
+
+2026-11-14 真实验收（当时仅启用 Terra 修复）：经用户授权补生成 11 月 13 日日报。21:04 提交一次 Terra / `max` / Flex 请求，输出上限 36,776 Token，21:08 成稿入库。该请求返回输入 330,392、输出 23,499 Token，用量账本新增一笔，按档案估算 ¥3.38。证据为本机忽略的 `data/logs/service.log` 同期调度日志和 `data/msgx.db` 对应摘要及账目。这个结果验证该次报告，其他输入的推理用量仍可变化。
+
 - 源码：`summarize.py`、`summary_scheduler.py`、`llm.py`、`summary_store.py`、`usage_store.py`。
 - 2026-10-15 模拟验证：`tests/test_background_summary.py`、`test_summary_recovery.py`、`test_period_summary.py`、`test_period_scheduler.py`；涵盖断线、重开、分块、保存失败、一次POST/记账与依赖恢复。不是再次真实付费验收。
 - 2026-10-09 实际补生成证据：`data/diagnostics/v0.9.4/live-summary.json`；只说明当次请求。已废止流式恢复与旧对账差额留在Git历史，不作当前方案。

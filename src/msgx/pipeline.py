@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime
 
@@ -48,6 +49,9 @@ class Pipeline(ProtocolSession, BillingCoordinator, SummaryScheduler):
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
         self._init_protocol_session()
+        from .group_actions import GroupActions
+        self.departed_groups = self.store.departure_cutoffs(self.target_account)
+        self.group_actions = GroupActions(self, prefs_path=os.environ.get("MSGX_PREFS"))
         self._init_billing_coordinator()
         self._init_summary_scheduler()
         self.started_at = time.time()
@@ -92,6 +96,7 @@ class Pipeline(ProtocolSession, BillingCoordinator, SummaryScheduler):
         if n:
             log.info("已把 %d 张上次下载失败的图片重新排入处理队列", n)
     async def stop(self) -> None:
+        await self.group_actions.close()  # 先固定外部操作结果，再关闭协议与数据库。
         self._stop.set()
         # 连接后群同步和延迟断线检查也归本进程，停止时取消并等待后再关闭 Store。
         tasks = [*self._tasks, *self._group_refresh_tasks]
@@ -145,6 +150,10 @@ class Pipeline(ProtocolSession, BillingCoordinator, SummaryScheduler):
         if msg is None:
             self.counters["skipped"] += 1
             return {"ok": False, "reason": "非群消息或空消息"}
+
+        if msg.ts <= self.departed_groups.get(msg.group_id, -1):
+            self.counters["skipped"] += 1
+            return {"ok": False, "reason": "已确认退群的旧消息，未重新入库"}
 
         if self.watch and msg.group_id not in self.watch:
             self.counters["skipped"] += 1

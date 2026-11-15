@@ -1,11 +1,11 @@
 # 消息萃取（msgx）
 
 接收 QQ 群消息，在本机检索、查看图片 OCR，并按需调用模型生成日报、周报和月报。
-应用不向 QQ 群发送消息；启用摘要、提示词更新或图片分析时，会把相应材料发送给你配置的 API 服务商。
+日常接收不会自动向 QQ 群发送消息。手动群发须先预览并二次确认；启用摘要、提示词更新或图片分析时，会把相应材料发送给你配置的 API 服务商。
 
 **适用：Windows 开发者。运行方式：源码 + 一个项目专用 Conda 环境 + 可选的轻量 EXE 启动器。**
 
-当前版本 **1.0.2**：可编辑图片主题与分数、就地保存个人图片设置、API 图片消息标绿、深浅主题切换；完整变更见 [更新日志](CHANGELOG.md)。
+当前源码以 **1.0.5** 为业务基线，默认打开 Electron 界面。支持加权群活跃度、确认退群并清理消息（保留摘要）、关键词上下文定位、逐群勾选的二次确认群发和摘要语音朗读。完整变更见 [更新日志](CHANGELOG.md)。
 
 | 你现在要做什么 | 从这里开始 |
 |---|---|
@@ -40,6 +40,7 @@
 - Windows 10 / 11，64 位。
 - 自行安装 Miniconda 或 Anaconda，并准备 Git（克隆仓库时使用）。
 - Python 推荐 **3.13**，最低 **3.12**；下一步会把它安装进独立 Conda 环境。
+- 首次安装桌面依赖需要 **Node.js 22.12 或更新版本**。日常由项目中安装的 Electron 运行界面。
 - 把仓库放在当前用户可写的开发目录，避免放在需要提权才能写入的位置。
 
 **执行位置：仓库根目录；权限：普通 PowerShell。** 根目录应能看到 `pyproject.toml`、`config.yaml` 和 `src`。
@@ -101,10 +102,13 @@ conda run -n msgx python -B -s -c "import msgx; from pathlib import Path; print(
 如果刚才使用管理员窗口安装，现在新开普通窗口，进入仓库并重新设置前述两个环境变量。
 
 ```powershell
+npm.cmd ci --prefix desktop
+npm.cmd exec --prefix desktop -- install-electron
 conda run -n msgx --no-capture-output python -s -m msgx.main gui
 ```
 
-**成功标志：** 出现“消息萃取”窗口，可浏览设置。此时还不等于已经接入 QQ。
+前两条安装桌面依赖和 Electron 运行时。锁文件变化后重新执行。
+**成功标志：** 出现“消息萃取”窗口，左栏有运行状态、实时消息、设置、用量明细、摘要阅读。
 干净安装先只核对“待配置”状态，不点击启动服务；不复制旧 `.ui/` 或 `data/`。
 没有 API 密钥也能打开界面；同一 Windows 用户的新克隆仍可能读到已有凭据，不能据此认定密钥已隔离。
 
@@ -184,21 +188,21 @@ $env:MSGX_CONDA_ENV = 'msgx'
 conda run -n msgx --no-capture-output python -s -m msgx.main gui
 ```
 
-无需重新创建环境或填写设置。然后按需点击“启动服务”。
+已有设置随原目录读取。首次填写或修改接收设置时，先点击“保存设置”，再到运行状态点击“启动服务”。
 
 **也可以使用已有的主 EXE：** Conda 能从系统 PATH 或 `CONDA_EXE` 找到，且默认 `msgx` 指向目标环境时，
 直接双击仓库根目录的 `QQ_Message_Extraction.exe`。桌面使用快捷方式，不移动 EXE。
 若环境名或目录只在当前 PowerShell 中临时指定，从同一窗口执行 `& .\QQ_Message_Extraction.exe`；
 这些临时变量不会传给已打开的资源管理器，不能仅凭双击成功认定用了指定位置的环境。
-EXE 依赖完整仓库源码和 Conda 环境，不能作为独立安装包复制使用；新克隆没有 EXE 是正常的，可直接运行源码或按下文构建。
+EXE 从完整仓库调用项目 Conda 环境和已安装的 Electron。需要对照旧界面时，可用 `conda run -n msgx --no-capture-output python -s -m msgx.main gui --legacy-tk`。同一资料目录的接收服务只使用一个窗口启动。
 
 | 页面 | 主要用途 |
 |---|---|
 | 运行状态 | 启停服务、查看协议连接、自动摘要进度和日志 |
 | 实时消息 | 查看消息、OCR 与图片初筛理由；按群查看 7／14／30 天活跃趋势、与我相关及关键词消息 |
 | 设置 | 摘要与图片 API、自动分析限制、动态提示词、过滤规则、目标 QQ、NapCat 路径及图标 |
-| 消费明细 | 每次请求的 Token、费用估算、结果及消费趋势 |
-| 摘要全文 | 阅读日报／周报／月报，保存阅读状态、重点和心得 |
+| 用量明细 | 每次请求的 Token、费用估算、结果及消费趋势 |
+| 摘要阅读 | 阅读日报／周报／月报，保存阅读状态、重点和心得，可整篇或分段语音朗读 |
 
 **停止接收：** 点击“停止服务”，等待完成提示；这与退出 QQ / NapCat 是不同的操作。
 服务未运行时不会生成自动摘要，但仍可查看已经保存的历史内容。
@@ -254,6 +258,7 @@ conda run -n msgx --no-capture-output python -s -m pip --isolated check
 ```
 
 前提是已设置首次安装时的环境选择；成功后按日常方式启动，核对原设置和历史。
+如果 `desktop/package-lock.json` 更新，执行“打开界面”前两条 npm 命令更新桌面依赖。
 跨目录复制数据库不属于普通升级，库内绝对路径不会自动改写；恢复清单及验收见[手动验收与恢复个人设置](docs/使用与排障.md#手动验收与恢复个人设置)。
 
 ## 常见问题
@@ -278,6 +283,12 @@ conda run -n msgx --no-capture-output python -s -m pip --isolated check
 ## 参与开发
 
 ### 测试与修改
+
+在仓库根目录用普通 PowerShell 运行实际 Electron 验收。它打开临时窗口、通过独立端口启动接收服务，使用合成数据库和模拟群发。
+
+```powershell
+conda run -n msgx --no-capture-output node tests/electron_smoke.cjs
+```
 
 **执行位置：仓库根目录；权限：普通 PowerShell；需已安装依赖并设置上述环境选择。**
 
@@ -311,10 +322,11 @@ conda run -n msgx --no-capture-output python -s tools\build_launcher.py
 
 | 位置 | 用途 |
 |---|---|
-| [src/msgx/](src/msgx/) | 业务代码、界面和进程控制 |
+| [src/msgx/](src/msgx/) | Python 业务、进程控制与 Tk 对照界面 |
+| [desktop/](desktop/) | Electron 界面、进程通信与桌面依赖锁文件 |
 | [tests/](tests/) | 隔离测试 |
 | [tools/](tools/) | 构建、诊断和协议端辅助实现 |
-| [pyproject.toml](pyproject.toml) | 唯一依赖声明和 Python 包配置 |
+| [pyproject.toml](pyproject.toml) | Python 依赖声明和包配置 |
 | [config.yaml](config.yaml) | 团队共享默认配置 |
 | [assets/](assets/) | 随源码分发的默认应用图标 |
 | `.ui/` | 可选本机主配置、界面偏好、图标、启动器备份；不提交 |
@@ -329,7 +341,7 @@ conda run -n msgx --no-capture-output python -s tools\build_launcher.py
 
 ## 验证范围与许可
 
-1.0.2 完整 **41 组隔离回归通过**，配置边界收尾后相关四组复验通过；另已查看六张深浅主题合成截图。真实图片筛选效果及生产业务仍需实际验收。
+1.0.3 完整 **42 组隔离回归通过**，安全审查及统计缓存收尾后相关 **9 组复验通过**，包含19项群操作、31项实时Tk和19项活跃度测试；已核对5张合成界面截图，并完成20万条合成消息查询测量。未执行真实群发、退群或付费API；这些外部操作须在应用中针对实际目标确认，不能把模拟测试当作生产验收。
 
 1.0.1 在项目 Conda 环境通过完整 **39 组隔离回归**，包含勾选样式、API 配置、图片延迟队列及 Flex 回退；真实图片筛选准确率、服务商请求和生产 QQ 仍须另行验收。
 

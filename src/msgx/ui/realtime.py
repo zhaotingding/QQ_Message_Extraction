@@ -38,6 +38,8 @@ class RealtimePage:
         self._rt_group_id = ""
         self._rt_group_labels = {"全部群": ""}
         self._rt_rendered = {}  # 已绘制值与标签；未变行不向 Tk 重复提交。
+        self._rt_context_id, self._rt_context_seq = None, 0
+        self._rt_activity_data, self._activity_ascending = {}, False
 
         bar = ttk.Frame(tab)
         bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -47,7 +49,7 @@ class RealtimePage:
             bar, text="自动刷新（每 3 秒）", variable=self.v_rt_auto,
             command=lambda: self.status.set("已开启自动刷新" if self.v_rt_auto.get() else "已暂停自动刷新，可点击立即刷新")
         ).grid(row=0, column=0)
-        ttk.Button(bar, text="立即刷新", width=9, command=self.refresh_messages).grid(row=0, column=1, padx=6)
+        ttk.Button(bar, text="立即刷新", width=9, command=lambda: self.refresh_messages(force_activity=True)).grid(row=0, column=1, padx=6)
         self.v_rt_limit = tk.StringVar(value="200")
         ttk.Label(bar, text="显示条数").grid(row=0, column=2, padx=(6, 4))
         ttk.Entry(bar, textvariable=self.v_rt_limit, width=4).grid(row=0, column=3)
@@ -103,6 +105,8 @@ class RealtimePage:
         ttk.Label(hint, text="点击消息查看详情；图片默认仅 OCR，手动识别才调用 API。",
                   style="Hint.TLabel").pack(side="left")
         ttk.Label(hint, textvariable=self.v_rt_status, style="Hint.TLabel").pack(side="right")
+        self.btn_rt_live = ttk.Button(hint, text="返回实时", command=self._return_to_live, state="disabled")
+        self.btn_rt_live.pack(side="right", padx=8)
         self.rt_bottom = ttk.Notebook(tab)
         self.rt_bottom.grid(row=4, column=0, sticky="nsew")
         self.rt_activity_tab = ttk.Frame(self.rt_bottom)
@@ -176,21 +180,27 @@ class RealtimePage:
         activity_panes = ttk.Panedwindow(self.rt_activity_tab, orient="horizontal")
         activity_panes.pack(fill="both", expand=True)
         activity_wrap = ttk.Frame(activity_panes)
-        activity_panes.add(activity_wrap, weight=1)
+        activity_panes.add(activity_wrap, weight=2)
         self.rt_activity_chart = ActivityChart(activity_panes)
         activity_panes.add(self.rt_activity_chart, weight=1)
-        self.rt_activity = ttk.Treeview(activity_wrap, columns=("group", "id", "count", "last"),
+        self.rt_activity = ttk.Treeview(activity_wrap, columns=("group", "id", "count", "count3", "count7", "count30", "score", "last"),
                                         show="headings", height=5)
-        for key, title, width in (("group", "群名", 190), ("id", "群号", 105), ("count", "今日有效", 78),
+        for key, title, width in (("group", "群名", 170), ("id", "群号", 105), ("count", "今日有效", 75),
+                                  ("count3", "近3天", 65), ("count7", "近7天", 65), ("count30", "近30天", 70), ("score", "综合日均 ↓", 100),
                                   ("last", "最近消息", 86)):
             self.rt_activity.heading(key, text=title)
             self.rt_activity.column(key, width=width, stretch=key == "group",
                                     anchor="w" if key == "group" else "center")
         activity_sb = ttk.Scrollbar(activity_wrap, orient="vertical", command=self.rt_activity.yview)
-        self.rt_activity.configure(yscrollcommand=activity_sb.set)
+        activity_xsb = ttk.Scrollbar(activity_wrap, orient="horizontal", command=self.rt_activity.xview)
+        self.rt_activity.configure(yscrollcommand=activity_sb.set, xscrollcommand=activity_xsb.set)
+        activity_xsb.pack(side="bottom", fill="x")
         activity_sb.pack(side="right", fill="y")
         self.rt_activity.pack(side="left", fill="both", expand=True)
         self.rt_activity.bind("<ButtonRelease-1>", self._on_rt_activity_click)
+        self.rt_activity.heading("score", command=self._toggle_activity_sort)
+        from .group_actions import GroupActionsPanel
+        self.group_operations = GroupActionsPanel(self, self.rt_bottom, activity_bar)
         self.rt_detail = ScrolledText(self.rt_details_tab, height=5, wrap="word", font=(FONT, 10))
         self.rt_detail.pack(fill="both", expand=True)
         self.rt_detail.configure(state="disabled")
@@ -219,7 +229,7 @@ class RealtimePage:
         return "完成"
 
 
-    def refresh_messages(self) -> None:
+    def refresh_messages(self, *, force_activity=False) -> None:
         self._refresh_keyword_messages()
         if self.proc is None:
             self.status.set("服务未运行 —— 启动服务后才能看到实时消息")
@@ -232,7 +242,7 @@ class RealtimePage:
         self.v_rt_status.set("正在刷新消息…")
         self._rt_limit = self._read_rt_limit()
         threading.Thread(target=self._fetch_messages,
-                         args=(*self._rt_request_key(), self.proc, self._activity_request_key()), daemon=True).start()
+                         args=(*self._rt_request_key(), self.proc, self._activity_request_key(), force_activity), daemon=True).start()
 
 
     def _rt_request_key(self) -> tuple:
@@ -240,6 +250,7 @@ class RealtimePage:
 
 
     def _on_rt_filter_changed(self, _event=None) -> None:
+        self._exit_context()
         self._rt_keyword_offset = 0
         self._render_messages([])
         self.v_rt_status.set("正在读取筛选结果…")
@@ -282,13 +293,15 @@ class RealtimePage:
 
 
     def _fetch_messages(self, limit: int, images_only: bool = False, group_id: str = "", proc=None,
-                        activity_key=None) -> None:
+                        activity_key=None, force_activity=False) -> None:
         port = int(self.cfg["onebot"]["http_port"])
         payload = None
         try:
             query = {"limit": limit, "images": int(images_only), "group_id": group_id}
             if activity_key is not None:
                 query.update(activity_group=activity_key[0], activity_days=activity_key[1])
+            if force_activity:
+                query["activity_refresh"] = "1"
             payload = request_json(port, "/messages/recent", timeout=5, query=query)
             if activity_key is not None:
                 payload["_activity_key"] = activity_key  # 只携带主线程快照，工作线程不读 Tk 变量。
@@ -309,7 +322,10 @@ class RealtimePage:
             self._render_related(payload.get("related") or [], payload.get("related_account") or "")
         else:
             self.v_rt_related.set("与我相关的消息刷新失败；保留上次结果")
-        self._render_messages(payload.get("items") if payload else None)
+        if self._rt_context_id is None:
+            self._render_messages(payload.get("items") if payload else None)
+        else:
+            self.v_rt_status.set("历史上下文已固定；点击返回实时恢复最新消息")
 
 
     def _configure_message_keywords(self) -> None:
@@ -434,9 +450,60 @@ class RealtimePage:
         selected = self.rt_keywords.selection()
         row = self._rt_keyword_rows.get(selected[0]) if selected else None
         if row:
+            if self._rt_context_id == int(row["id"]):
+                return  # 列表自动恢复选中时不能反复跳转、清掉顶表阅读位置。
             self.rt.selection_remove(*self.rt.selection())
             self.rt_related.selection_remove(*self.rt_related.selection())
             self._show_collected_message(row)
+            if self._rt_context_id != int(row["id"]):
+                self._jump_to_message(row)
+
+    def _exit_context(self):
+        self._rt_context_id = None
+        self._rt_context_seq += 1  # 作废已在读取的历史结果。
+        self.btn_rt_live.configure(state="disabled")
+
+    def _return_to_live(self):
+        self._exit_context()
+        self.rt_keywords.selection_remove(*self.rt_keywords.selection())
+        self.refresh_messages()
+
+    def _jump_to_message(self, row):
+        self._rt_context_id = int(row["id"])
+        self._rt_context_seq += 1
+        key = self._rt_context_seq, self._rt_context_id
+        self.btn_rt_live.configure(state="normal")
+        self.v_rt_status.set("正在定位同群前后消息…")
+        path = abs_path(self.cfg, "db_path")
+        filters = dict(self.prefs.get("filters") or {})
+        account = str(self.prefs.get("qq_account") or self.cfg.get("napcat", {}).get("account") or "")
+        def read():
+            rows, error = [], ""
+            try:
+                store = Store(path, filters=filters, readonly=True)
+                try:
+                    store.conn.execute("BEGIN")
+                    rows = store.messages_around(key[1], account)
+                finally:
+                    store.close()
+            except (OSError, sqlite3.Error) as exc:
+                error = str(exc)
+            self.events.put(("message_context", (key, rows, error)))
+        threading.Thread(target=read, daemon=True).start()
+
+    def _accept_message_context(self, key, rows, error):
+        if key != (self._rt_context_seq, self._rt_context_id):
+            return
+        if error or not rows:
+            self.v_rt_status.set("定位失败："+(error or "消息已清理或不在当前账号范围"))
+            return
+        self._render_messages(rows)
+        target = next((iid for iid in self.rt.get_children() if iid.split(":", 1)[0] == str(key[1])), "")
+        if target:
+            self.rt.selection_set(target)
+            self.rt.focus(target)
+            self.rt.see(target)
+        self.v_rt_status.set(f"同群历史上下文 · 命中前后各最多40条 · 共{len(rows)}条 · 已暂停顶表实时滚动")
 
 
     def _render_related(self, rows: list, account: str) -> None:
@@ -474,7 +541,10 @@ class RealtimePage:
 
 
     def _render_activity(self, activity: dict) -> None:
+        self._rt_activity_data = activity
         groups = activity.get("groups") or []
+        if self._activity_ascending:
+            groups = sorted(groups, key=lambda group: (group.get("score", 0), group["count"], group["group_id"]))
         labels = {"全部群": ""}
         for group in groups:
             group_id = str(group["group_id"])
@@ -499,7 +569,8 @@ class RealtimePage:
             count = int(group["count"])
             total += count
             ts = group.get("last_ts") or 0
-            values = (group.get("group_name") or "未命名", group_id, count,
+            values = (group.get("group_name") or "未命名", group_id, count, group.get("count3", 0), group.get("count7", 0),
+                      group.get("count30", 0), f"{group.get('score', 0):.2f}",
                       datetime.fromtimestamp(ts, BEIJING).strftime("%H:%M:%S") if ts else "—")
             if self.rt_activity.exists(group_id):
                 if self.rt_activity.item(group_id, "values") != tuple(str(value) for value in values):
@@ -512,11 +583,17 @@ class RealtimePage:
             self.rt_activity.selection_set(selection[0])
         self.rt_activity.yview_moveto(scroll)
         self.v_rt_activity_status.set(
-            f"{activity.get('date') or '今日'} · 统计 {len(groups)} 群 · 今日未过滤 {total} 条 · 点击群查看趋势")
+            f"{activity.get('date') or '今日'} · 统计 {len(groups)} 群 · 今日未过滤 {total} 条 · 活跃度约30秒更新")
         trend = activity.get("trend") or {}
         self.rt_activity_chart.set_series(trend)
         if trend.get("group_id") and not self._rt_activity_group:
             self._rt_activity_group = str(trend["group_id"])
+
+    def _toggle_activity_sort(self):
+        self._activity_ascending = not self._activity_ascending
+        self.rt_activity.heading("score", text="综合日均 ↑" if self._activity_ascending else "综合日均 ↓")
+        self._render_activity(self._rt_activity_data)
+        self.status.set("综合日均 = 今日×10% + 近3天/3×20% + 近7天/7×30% + 近30天/30×40%；含今日，按保留数据统计")
 
 
     def _render_messages(self, rows) -> None:
@@ -617,7 +694,8 @@ class RealtimePage:
         row = self._rt_rows.get(str(selection[0])) if selection else None
         if row:
             self.rt_related.selection_remove(*self.rt_related.selection())
-            self.rt_keywords.selection_remove(*self.rt_keywords.selection())
+            if self._rt_context_id is None:
+                self.rt_keywords.selection_remove(*self.rt_keywords.selection())
         elif self.rt_related.selection() or self.rt_keywords.selection():
             return
         self._show_message_detail(row)

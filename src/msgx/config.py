@@ -133,7 +133,7 @@ def _merge(base: dict, override: dict) -> dict:
     return out
 
 
-def load(path: str | Path | None = None) -> dict:
+def load(path: str | Path | None = None, *, include_preferences: bool = True) -> dict:
     local_path = ROOT / ".ui/config.local.yaml"  # 本机主配置独立于 Git 共享默认配置。
     if path:
         cfg_path = Path(path)  # 显式路径优先，保留缺文件时使用内置默认值的既有行为。
@@ -157,7 +157,7 @@ def load(path: str | Path | None = None) -> dict:
     # 这样界面改设置无需改写受 Git 管理的 config.yaml，多人协作不会冲突。
     from .prefs import apply_to_config, load_from_env
 
-    prefs = load_from_env()
+    prefs = load_from_env() if include_preferences else None
     if prefs:
         cfg = apply_to_config(cfg, prefs)
     return cfg

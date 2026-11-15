@@ -95,7 +95,7 @@ class ImageAnalysisStore:
             self.conn.executemany("UPDATE message_images SET auto_state='waiting',auto_ready_at=? WHERE id=? AND auto_state=''",
                                   [(time.time()+ANALYSIS_DELAY_SECONDS, row["id"]) for row in new])
             self.conn.commit()
-        return list(self.conn.execute("SELECT i.*" + eligible + " AND i.auto_state='waiting'"
+        return list(self.conn.execute("SELECT i.*,m.group_id" + eligible + " AND i.auto_state='waiting'"
                                       " ORDER BY (i.auto_ready_at>?),i.screen_score DESC,i.id DESC LIMIT 1", (*params, time.time())))
 
     def claim_auto_image(self, image_id: int) -> bool:

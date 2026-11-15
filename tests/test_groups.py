@@ -112,7 +112,7 @@ st = new_store()
 st.upsert_group("1", "有消息的群", "111")
 st.upsert_group("2", "空群", "222")
 st.insert_message(msg("1", "m1"), "有消息的群", "111")
-pipe = SimpleNamespace(store=st, target_account="111", login_uin=AsyncMock(return_value="111"),
+pipe = SimpleNamespace(store=st, target_account="111", activity_revision=0, login_uin=AsyncMock(return_value="111"),
                        call_action=AsyncMock(return_value=[]))  # 模拟协议暂时返回空群列表。
 result = asyncio.run(ProtocolSession.refresh_group_names(pipe, prune=True))
 check("空协议列表不会删除任何已有群", set(st.group_names()) == {"1", "2"})

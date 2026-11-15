@@ -14,12 +14,12 @@ PALETTES = {
                   border="#b8c2cf", selected="#cce2ff", selected_fg="#142b48", accent="#2468b8",
                   success="#197647", error="#b42332", warning="#9b5d00", keyword="#fff2a8",
                   odd="#f4f6f9", related="#c62828", image_api="#dff3e5", grid="#dfe5ed",
-                  card0="#f0f5fb", card1="#f7f3e9", review_blue="#cfe8ff", review_red="#ffd5d5"),
+                  card0="#f0f5fb", card1="#f7f3e9", review_blue="#cfe8ff", review_red="#ffd5d5", speaking="#ffe3a3"),
     "dark": dict(name="dark", bg="#181c23", surface="#242a34", field="#202630", fg="#e4e9f2", muted="#a6b2c4",
                  border="#465163", selected="#355373", selected_fg="#ffffff", accent="#82b6ff",
                  success="#7ee787", error="#ff7b72", warning="#f2c16d", keyword="#554718",
                  odd="#252d39", related="#ff919b", image_api="#183d2b", grid="#36404e",
-                 card0="#293645", card1="#3a352a", review_blue="#224d72", review_red="#66323b"),
+                 card0="#293645", card1="#3a352a", review_blue="#224d72", review_red="#66323b", speaking="#4b3d20"),
 }
 
 
@@ -113,7 +113,8 @@ class ThemeManager:
                 for tag, color in (("heading", p["accent"]), ("warn", p["error"]), ("good", p["success"])):
                     if tag in widget.tag_names():
                         widget.tag_configure(tag, foreground=color)
-                for tag, key in (("card0", "card0"), ("card1", "card1"), ("review_blue", "review_blue"), ("review_red", "review_red")):
+                for tag, key in (("card0", "card0"), ("card1", "card1"), ("review_blue", "review_blue"),
+                                 ("review_red", "review_red"), ("speaking", "speaking")):
                     if tag in widget.tag_names():
                         widget.tag_configure(tag, background=p[key])
             elif isinstance(widget, tk.Listbox):
