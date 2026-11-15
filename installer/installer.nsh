@@ -50,20 +50,73 @@
 
   !macro customPageAfterChangeDir
     !define MUI_PAGE_CUSTOMFUNCTION_PRE MsgxDirectoryPre
-    !define MUI_PAGE_CUSTOMFUNCTION_LEAVE MsgxValidateNewDirectory
+    !define MUI_PAGE_CUSTOMFUNCTION_SHOW MsgxDirectoryShow
+    !define MUI_PAGE_CUSTOMFUNCTION_LEAVE MsgxDirectoryLeave
     !insertmacro MUI_PAGE_DIRECTORY
+
+    Function MsgxDirectoryShow
+      ${If} $MsgxRegisteredInstallDir != ""
+        !insertmacro MUI_HEADER_TEXT "确认安装目录" "已有安装将在原目录覆盖。"
+        SendMessage $mui.DirectoryPage.Text ${WM_SETTEXT} 0 "STR:确认下方目录并继续安装。程序将原位更新，个人资料保持原位。"
+        SendMessage $mui.DirectoryPage.Directory ${EM_SETREADONLY} 1 0
+        EnableWindow $mui.DirectoryPage.BrowseButton 0
+      ${EndIf}
+    FunctionEnd
+
+    Function MsgxDirectoryPre
+      ; 手动安装显示原目录供确认，应用内更新直接沿用原目录。
+      ${If} $MsgxRegisteredInstallDir != ""
+        StrCpy $INSTDIR $MsgxRegisteredInstallDir
+      ${EndIf}
+      ${If} ${isUpdated}
+        Abort
+      ${EndIf}
+    FunctionEnd
+
+    Function MsgxDirectoryLeave
+      ${If} $MsgxRegisteredInstallDir != ""
+        StrCpy $INSTDIR $MsgxRegisteredInstallDir
+        Call MsgxValidateInstallLocation
+      ${Else}
+        Call MsgxValidateNewDirectory
+      ${EndIf}
+    FunctionEnd
   !macroend
 
-  Function MsgxDirectoryPre
-    ; 模板的安装范围步骤可能重读 /D，因此在交互升级跳过页面前再次锁定。
-    ${If} $MsgxRegisteredInstallDir != ""
-      StrCpy $INSTDIR $MsgxRegisteredInstallDir
-      Abort
-    ${EndIf}
-  FunctionEnd
+  !macro customFinishPage
+    !ifndef HIDE_RUN_AFTER_FINISH
+      !define MUI_FINISHPAGE_RUN
+      !define MUI_FINISHPAGE_RUN_TEXT "打开消息萃取并进行基础设置"
+      !define MUI_FINISHPAGE_RUN_FUNCTION "MsgxLaunchFromFinishPage"
+      !define MUI_PAGE_CUSTOMFUNCTION_SHOW MsgxFinishPageShow
+    !endif
+    !insertmacro MUI_PAGE_FINISH
+
+    !ifndef HIDE_RUN_AFTER_FINISH
+      Function MsgxFinishPageShow
+        ${If} ${isUpdated}
+        ${AndIf} $mui.FinishPage.Run != 0
+          SendMessage $mui.FinishPage.Run ${WM_SETTEXT} 0 "STR:打开消息萃取"
+        ${EndIf}
+      FunctionEnd
+
+      Function MsgxLaunchFromFinishPage
+        ${If} ${isUpdated}
+          StrCpy $1 "--updated"
+        ${Else}
+          StrCpy $1 "--msgx-open-setup"
+        ${EndIf}
+        ${StdUtils.ExecShellAsUser} $0 "$INSTDIR\${APP_EXECUTABLE_FILENAME}" "open" "$1"
+      FunctionEnd
+    !endif
+  !macroend
 
   !macro MsgxCheckProfilePath PROFILE
-    GetFullPathName $3 "${PROFILE}"
+    System::Call 'kernel32::GetFullPathNameW(w "${PROFILE}", i ${NSIS_MAX_STRLEN}, w .r3, p 0) i .r7'
+    ${If} $7 == 0
+    ${OrIf} $7 >= ${NSIS_MAX_STRLEN}
+      Goto msgxInvalidLocation
+    ${EndIf}
     StrCpy $3 "$3\"
     StrLen $4 $3
     StrCpy $5 $2 $4
@@ -77,7 +130,12 @@
 
   Function MsgxValidateInstallLocation
     ; 安装与卸载处理整棵程序目录，不能选盘根或覆盖默认个人资料目录。
-    GetFullPathName $2 "$INSTDIR"
+    ; 使用 Win32 规范化路径，允许用户输入尚未创建的文件夹。
+    System::Call 'kernel32::GetFullPathNameW(w "$INSTDIR", i ${NSIS_MAX_STRLEN}, w .r2, p 0) i .r7'
+    ${If} $7 == 0
+    ${OrIf} $7 >= ${NSIS_MAX_STRLEN}
+      Goto msgxInvalidLocation
+    ${EndIf}
     ${GetRoot} "$2" $3
     ${If} "$2" == "$3"
     ${OrIf} "$2" == "$3\"
@@ -93,6 +151,10 @@
 
     msgxProtectedLocation:
       MessageBox MB_OK|MB_ICONSTOP "安装目录不能是盘根，也不能与应用的默认资料目录重叠。" /SD IDOK
+      Goto msgxStopLocation
+    msgxInvalidLocation:
+      MessageBox MB_OK|MB_ICONSTOP "无法识别安装目录，请选择有效的程序文件夹。" /SD IDOK
+    msgxStopLocation:
       ${If} ${Silent}
         SetErrorLevel 1
         Quit

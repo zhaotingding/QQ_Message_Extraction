@@ -10,7 +10,7 @@
 
 安装版查询 [公开的稳定 Release](https://github.com/zhaotingding/QQ_Message_Extraction/releases)。发现新版在「帮助」显示蓝点。用户确认「更新并重启」后才下载和验证，完成摘要编辑保存和应用持有的接收服务退出后再安装。源码版用 Git 更新。正式签名和上传 Release 需分别确认，不能从实现或本地安装测试推定已有公开更新。
 
-新装显示程序目录页，接受新建或空目录。安装器在交互及静默覆盖时都以当前用户已有的安装注册路径为准。资料先复用已记住的根或默认目录中的已有资料，再考虑从仓库 `installer/` 下启动安装包时可识别的源码资料。首次设置仅使用现有主题和凭据接口，留空保持原密钥。使用 `npm.cmd run build:installer --prefix desktop -- --local-preview` 生成同安装身份的未签名本地验收包，输出到 `installer/dist/release/<版本>-setup-local/`，该包关闭在线更新。
+新装显示程序目录页，接受新建或空目录。手动覆盖安装显示已注册的原路径供确认，静默更新也沿用原路径。资料先复用已记住的根或默认目录中的已有资料，再考虑从仓库 `installer/` 下启动安装包时可识别的源码资料。手动安装的完成页可以直接打开基础设置，自动更新重启进入工作台。基础设置复用现有主题和凭据接口，留空保持原密钥。使用 `npm.cmd run build:installer --prefix desktop -- --local-preview` 生成同安装身份的未签名本地验收包，输出到 `installer/dist/release/<版本>-wizard-local/`，该包关闭在线更新。
 
 实际验证使用隔离资料根，核对安装程序及后台解释器归属、设置和数据库保留、系统卸载入口、更新重启后的版本及收尾。记录本地源验证和公开 Release 验证的各自结果。用户步骤见 [README 安装版](../../../../README.md#安装版) 和 [安装版资料使用指南](../../../../docs/使用与排障.md#安装版资料位置与复用)。
 
@@ -29,6 +29,8 @@ conda run -n msgx --no-capture-output python -s -m http.server 17391 --bind 127.
 2026-11-15 目录整理后，以 `installer/dist/test/` 的 1.0.10 和 1.0.11 复验回环升级。隔离后台就绪后，应用显示蓝点，确认才下载，正常退出并在原位置重开 1.0.11。新版注册项经 `uninstall.ps1 -TestBuild -WhatIf` 核对，实际卸载移除主程序与注册项，隔离数据库和两份配置的 SHA-256 保持一致。本机日志在 `.ui/installer-layout-20261115-194755/`。实测 NSIS 卸载项的 `DisplayName` 带版本号，主程序路径取 `DisplayIcon`。脚本执行前拒绝同名进程仍在运行的情况，避免 NSIS 回退按名称终止进程，这一保护已通过卸载入口的替身测试。正式签名及 GitHub 更新未验收。
 
 安装向导本地验收见 `installer/dist/wizard-verification/in-place.json`。隔离的 1.0.12 装在 A，1.0.13 带 `/D=B` 覆盖后只有 A 的 EXE 和唯一注册项。NSIS 会先创建显式 `/D` 的空目录，实际文件仍写入注册位置。资料选择测试及隔离窗口验证覆盖已有主题、档案回显、局部保存和首次设置状态。正式身份的交互安装留给使用者确认。
+
+目录页与首次设置的后续验收见 `installer/dist/wizard-feedback/nsis-pages.log` 和 `open-setup.log`。对隔离安装器 1.0.14 操作了实际控件，确认新装可选尚不存在的非默认目录，覆盖安装显示原地址且浏览禁用，完成页可见且默认勾选基础设置。完成页启动参数在隔离应用中验证能打开基础设置，即使已有完成标记。比较目录时使用 Win32 `GetFullPathNameW`，NSIS 的同名指令会因新目录尚不存在而返回空值。
 
 ## 权限与安装说明维护时读取
 

@@ -114,12 +114,12 @@ async function main() {
   app.state = await app.call('desktop.bootstrap')
   app.setTheme(app.state.theme)
   document.querySelector('#version').textContent = 'v' + app.state.version + ' · Electron'
-  await show('status')
-  setInterval(refreshServiceLight, 2000)
   if (app.state.setupPending) {
     const { showFirstRun } = await import('./first-run.js')
     showFirstRun(app)
   }
+  await show('status')
+  setInterval(refreshServiceLight, 2000)
 }
 
 main().catch(error => { container.textContent = error.message })

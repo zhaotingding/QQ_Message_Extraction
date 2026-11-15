@@ -9,6 +9,8 @@ const entry = 'msgx://app/index.html'
 const resources = path.join(__dirname, 'renderer')
 // 重命名后的源码 Electron 在 Windows 也可能报告 isPackaged，安装器另写入分发标记。
 const installed = app.isPackaged && msgxInstalled === true
+const installerRestart = process.argv.includes('--updated')
+let openSetup = installed && process.argv.includes('--msgx-open-setup')
 // 安装包收集 installer 运行模块；源码版读取仓库根的同一实现。
 const installerRoot = path.join(__dirname, installed ? 'installer' : '../installer')
 const { createUpdates } = require(path.join(installerRoot, 'update.cjs'))
@@ -127,6 +129,7 @@ async function desktopCall(event, action, payload) {
   if (action === 'desktop.update.install') return updates.updateAndRestart()
   if (action === 'desktop.setup.complete' && installed) {
     profile.completeSetup()
+    openSetup = false
     return {}
   }
   if (action === 'desktop.confirm') {
@@ -233,7 +236,8 @@ async function desktopCall(event, action, payload) {
   const result = await backend(action, payload)
   if (installed && action === 'desktop.bootstrap') {
     result.version = app.getVersion()
-    result.setupPending = profile.setupPending()
+    // 用户从手动安装的完成页打开时可配置基础设置，自动更新重启照常进入工作台。
+    result.setupPending = !installerRestart && (openSetup || profile.setupPending())
   }
   if (action === 'settings.icon' && result.iconPath) window.setIcon(result.iconPath)
   return result
