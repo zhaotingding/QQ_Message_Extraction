@@ -190,6 +190,11 @@ dialog::backdrop { background: #0009; }
 .update-version { font-weight: 600; }
 .update-dialog progress { width: 100%; accent-color: var(--accent); }
 .update-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+.first-run-dialog { width: min(430px, 90vw); }
+.first-run-dialog h2 { margin: 0 0 16px; }
+.first-run-form { display: grid; gap: 12px; }
+.first-run-form p { margin: 0; overflow-wrap: anywhere; }
+.first-run-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .qr-dialog img { display: block; margin: 12px auto; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .log {

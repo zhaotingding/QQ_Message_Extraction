@@ -14,8 +14,17 @@ const { values: options } = parseArgs({ options: {
   'test-feed': { type: 'string' },
   'test-version': { type: 'string' },
   'electron-zip': { type: 'string' },
+  'local-preview': { type: 'boolean' },
 } })
 const test = Boolean(options['test-feed'])
+const preview = Boolean(options['local-preview'])
+if (preview && (test || options['test-version'])) throw new Error('本地安装验收与双版本更新验收请分别构建。')
+const signed = !test && !preview
+if (preview) {
+  // 本地验收包保留安装身份，构建进程不读取发布签名凭据。
+  process.env.CSC_IDENTITY_AUTO_DISCOVERY = 'false'
+  for (const key of ['WIN_CSC_LINK', 'WIN_CSC_KEY_PASSWORD', 'CSC_LINK', 'CSC_KEY_PASSWORD']) delete process.env[key]
+}
 const version = fs.readFileSync(path.join(root, 'src', 'msgx', '__init__.py'), 'utf8')
   .match(/^__version__\s*=\s*"([^"]+)"/m)?.[1]
 if (!version) throw new Error('读取消息萃取的源码版本失败。')
@@ -38,7 +47,7 @@ const backend = path.join(installer, 'dist', 'backend', 'msgx-backend')
 if (!fs.existsSync(path.join(backend, 'msgx-backend.exe'))) {
   throw new Error('请先在仓库根目录用项目 Conda 环境运行 python -s installer/build_backend.py。')
 }
-const output = path.join(installer, 'dist', test ? 'test' : 'release', appVersion)
+const output = path.join(installer, 'dist', test ? 'test' : 'release', preview ? appVersion + '-setup-local' : appVersion)
 const icon = path.join(root, 'assets', 'app-icon.ico')
 
 // 本地双版本验收用独立安装标识和下载源。正式包必须由发布者签名，并只读 GitHub 正式版本。
@@ -47,7 +56,7 @@ const config = {
   productName: test ? '消息萃取（更新验收）' : '消息萃取',
   executableName: test ? 'msgx-update-test' : 'msgx-desktop',
   extraMetadata: { name: test ? 'msgx-update-test' : manifest.name,
-    version: appVersion, msgxInstalled: true, msgxLocalUpdateTest: test },
+    version: appVersion, msgxInstalled: true, msgxLocalUpdateTest: test, msgxLocalPreview: preview },
   electronVersion: manifest.devDependencies.electron,
   ...(options['electron-zip'] ? { electronDist: path.resolve(options['electron-zip']) } : {}),
   directories: { output, buildResources: path.dirname(icon) },
@@ -59,26 +68,27 @@ const config = {
     { from: icon, to: 'assets/app-icon.ico' },
     { from: path.join(root, 'tools', 'restart_napcat_target.ps1'), to: 'tools/restart_napcat_target.ps1' },
   ],
-  publish,
+  publish: preview ? null : publish,
   npmRebuild: false,
-  forceCodeSigning: !test,
-  win: { icon, verifyUpdateCodeSignature: !test },
+  forceCodeSigning: signed,
+  win: { icon, verifyUpdateCodeSignature: signed },
   nsis: {
     include: path.join(installer, 'installer.nsh'),
-    oneClick: true,
+    oneClick: false,
     perMachine: false,
     deleteAppDataOnUninstall: false,
-    artifactName: test ? 'msgx-update-test-${version}-${arch}.exe' : 'msgx-setup-${version}-${arch}.exe',
+    artifactName: preview ? 'msgx-setup-preview-${version}-${arch}-unsigned.exe'
+      : test ? 'msgx-update-test-${version}-${arch}.exe' : 'msgx-setup-${version}-${arch}.exe',
   },
 }
 
 await build({ projectDir: desktop, targets: Platform.WINDOWS.createTarget(['nsis'], Arch.x64),
   publish: 'never', config })
 
-if (!fs.existsSync(path.join(output, 'latest.yml'))) {
+if (!preview && !fs.existsSync(path.join(output, 'latest.yml'))) {
   throw new Error('安装包未生成更新清单 latest.yml。')
 }
-if (!test) {
+if (signed) {
   const updaterConfig = fs.readFileSync(path.join(output, 'win-unpacked', 'resources', 'app-update.yml'), 'utf8')
   if (!/^publisherName:(?:[ \t]+\S|\r?\n[ \t]*-[ \t]+\S)/m.test(updaterConfig)) {
     throw new Error('正式安装包缺少更新发布者身份，不能作为更新产物分发。')

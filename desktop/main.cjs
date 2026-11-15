@@ -3,7 +3,7 @@ const { spawn } = require('node:child_process')
 const { createInterface } = require('node:readline')
 const { pathToFileURL } = require('node:url')
 const path = require('node:path')
-const { msgxInstalled, msgxLocalUpdateTest = false } = require('./package.json')
+const { msgxInstalled, msgxLocalUpdateTest = false, msgxLocalPreview = false } = require('./package.json')
 
 const entry = 'msgx://app/index.html'
 const resources = path.join(__dirname, 'renderer')
@@ -18,7 +18,7 @@ let profile
 let profileError
 if (installed) {
   try {
-    profile = installedProfile(app, msgxLocalUpdateTest)
+    profile = installedProfile(app, msgxLocalUpdateTest, programRoot)
   } catch (error) {
     profileError = error
   }
@@ -125,6 +125,10 @@ async function desktopCall(event, action, payload) {
   if (action === 'desktop.update.status') return updates.status()
   if (action === 'desktop.update.check') return updates.check()
   if (action === 'desktop.update.install') return updates.updateAndRestart()
+  if (action === 'desktop.setup.complete' && installed) {
+    profile.completeSetup()
+    return {}
+  }
   if (action === 'desktop.confirm') {
     const value = await dialog.showMessageBox(window, {
       type: 'question', title: String(payload.title), message: String(payload.text),
@@ -227,7 +231,10 @@ async function desktopCall(event, action, payload) {
     picked.delete(key)
   }
   const result = await backend(action, payload)
-  if (installed && action === 'desktop.bootstrap') result.version = app.getVersion()
+  if (installed && action === 'desktop.bootstrap') {
+    result.version = app.getVersion()
+    result.setupPending = profile.setupPending()
+  }
   if (action === 'settings.icon' && result.iconPath) window.setIcon(result.iconPath)
   return result
 }
@@ -266,7 +273,8 @@ if (!app.requestSingleInstanceLock()) {
     })
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     window.webContents.on('will-navigate', event => event.preventDefault())
-    const updater = installed && process.platform === 'win32' ? require('electron-updater').autoUpdater : null
+    const updater = installed && !msgxLocalPreview && process.platform === 'win32'
+      ? require('electron-updater').autoUpdater : null
     updates = createUpdates(updater, {
       notify: state => {
         if (!window.isDestroyed()) window.webContents.send('msgx:update', state)

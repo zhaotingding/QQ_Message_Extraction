@@ -116,6 +116,10 @@ async function main() {
   document.querySelector('#version').textContent = 'v' + app.state.version + ' · Electron'
   await show('status')
   setInterval(refreshServiceLight, 2000)
+  if (app.state.setupPending) {
+    const { showFirstRun } = await import('./first-run.js')
+    showFirstRun(app)
+  }
 }
 
 main().catch(error => { container.textContent = error.message })

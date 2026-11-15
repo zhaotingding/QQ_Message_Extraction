@@ -1,13 +1,41 @@
 const fs = require('node:fs')
 const path = require('node:path')
 
-function installedProfile(app, testBuild) {
+function hasProfileData(root) {
+  return ['.ui/preferences.yaml', '.ui/config.local.yaml', 'data/msgx.db']
+    .some(name => fs.existsSync(path.join(root, name)))
+}
+
+function sourceProfile(programRoot) {
+  let from
+  try {
+    from = fs.readFileSync(path.join(programRoot, 'installer-origin.txt'), 'utf16le').trim()
+  } catch (error) {
+    if (error.code === 'ENOENT') return undefined
+    throw error
+  }
+  if (!path.isAbsolute(from)) return undefined
+  // 只有从原源码仓库的 installer/ 目录运行安装包，才有依据自动沿用该仓库资料。
+  let dir = path.resolve(from)
+  while (dir !== path.dirname(dir)) {
+    if (path.basename(dir).toLowerCase() === 'installer') {
+      const root = path.dirname(dir)
+      if (fs.existsSync(path.join(root, 'src/msgx/__init__.py')) && hasProfileData(root)) return root
+    }
+    dir = path.dirname(dir)
+  }
+  return undefined
+}
+
+function installedProfile(app, testBuild, programRoot) {
   const base = path.join(process.env.LOCALAPPDATA || app.getPath('appData'),
     testBuild ? 'msgx-update-test' : 'msgx')
   const defaultRoot = path.join(base, 'profile')
   const selectionFile = path.join(base, 'profile-path.yaml')
+  const setupFile = path.join(base, 'setup-complete.yaml')
   const index = process.argv.indexOf('--msgx-data-root')
   let selected
+  let remember = index >= 0
   if (index >= 0) {
     selected = process.argv[index + 1]
     if (!selected || !path.isAbsolute(selected)) {
@@ -26,6 +54,12 @@ function installedProfile(app, testBuild) {
     }
   }
 
+  // 已记住的选择和已在使用的安装版资料都优先于安装器所在位置。
+  if (selected === undefined && !testBuild && !hasProfileData(defaultRoot)) {
+    selected = sourceProfile(programRoot)
+    remember = selected !== undefined
+  }
+
   const root = selected === undefined ? defaultRoot : path.resolve(selected)
   if (root === defaultRoot) {
     fs.mkdirSync(root, { recursive: true })
@@ -35,8 +69,13 @@ function installedProfile(app, testBuild) {
 
   return {
     root,
+    setupPending: () => !fs.existsSync(setupFile),
+    completeSetup() {
+      fs.mkdirSync(base, { recursive: true })
+      fs.writeFileSync(setupFile, 'true\n', 'utf8')
+    },
     saveSelection() {
-      if (index < 0) return
+      if (!remember) return
       fs.mkdirSync(base, { recursive: true })
       // JSON 带引号字符串也是 YAML 标量。升级后的首次启动无需重传启动参数。
       const pending = selectionFile + '.' + process.pid + '.tmp'
