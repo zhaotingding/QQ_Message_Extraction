@@ -26,6 +26,8 @@
 2. 完成页默认勾选「打开消息萃取并进行基础设置」。点击「完成」后可选择深色或浅色主题，为已有 API 档案填写密钥，也可直接跳过。留空保留已保存的密钥，密钥由当前 Windows 用户的凭据管理器保存。收取群消息时另行准备 QQ 和 NapCat。见 [接入 QQ 与 NapCat](#接入-qq-与-napcat)。
 3. 应用原地沿用已有资料。首次从已有资料的源码仓库 `installer/` 下运行安装包时，可自动识别该仓库。没有原资料的用户默认使用 `%LOCALAPPDATA%\msgx\profile`。见 [资料位置与复用](docs/使用与排障.md#安装版资料位置与复用)。
 
+如果想把安装后的程序和源码放在同一个项目里，在目录页选择项目根下的 `installed/`。例如项目在 `D:\Dev\MCP\消息萃取-MCP`，程序便装到 `D:\Dev\MCP\消息萃取-MCP\installed`。该子目录不入库，既有资料继续在原处读写。
+
 安装版的「帮助 → 检查更新」查询公开稳定 Release。发现可用新版后，「帮助」旁显示蓝点，选择「更新并重启」才开始下载安装。程序保存摘要编辑、停止所持有的接收服务后再安装。公开更新尚需上传首个稳定 Release 及其更新文件。
 
 安装、卸载和更新实现统一在 [installer/](installer/)；新安装包输出到 `installer/dist/release/<版本>/`，隔离验收包在 `installer/dist/test/<版本>/`。已有 `.ui/installer-build/` 成品保留原位。测试包只用于本机更新验收，不作为正式发行包。
@@ -345,7 +347,7 @@ npm.cmd run build:installer --prefix desktop
 
 正式构建从源码读取版本号，输出到 `installer/dist/release/<版本>/`。核对 `msgx-setup-<版本>-x64.exe`、`latest.yml` 和更新所需的配套文件。后台和中间构建文件也在 `installer/dist/`；此目录不入库，安装实现本身需要入库。命令仅在本机构建，上传稳定 Release 需要单独执行。
 
-本地安装向导验收可在最后一条命令添加 `-- --local-preview`，输出到 `installer/dist/release/<版本>-move-local/`，包名带 `unsigned`，沿用同一安装标识，在线更新关闭。隔离的双版本更新验证见 [安装版与公开更新](.agents/skills/msgx-windows-release/references/windows.md#安装版与公开更新)。
+本地安装向导验收可在最后一条命令添加 `-- --local-preview`，输出到 `installer/dist/release/<版本>-project-local/`，包名带 `unsigned`，沿用同一安装标识，在线更新关闭。隔离的双版本更新验证见 [安装版与公开更新](.agents/skills/msgx-windows-release/references/windows.md#安装版与公开更新)。
 
 ### 文件分工
 

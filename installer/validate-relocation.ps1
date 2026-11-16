@@ -113,21 +113,44 @@ public static class MsgxRelocationLocation {
             throw '原程序目录内还有应用资料，无法安全迁移。'
         }
     }
+    # 旧版卸载器递归清理程序目录。不要让程序里的目录联接指向原资料或其他位置。
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+    $pending.Push($old.Full)
+    while ($pending.Count) {
+        foreach ($item in Get-ChildItem -LiteralPath ($pending.Pop()) -Force) {
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw '原程序目录内有目录联接或符号链接，无法安全迁移。'
+            }
+            if ($item.PSIsContainer) { $pending.Push($item.FullName) }
+        }
+    }
 
     # 程序卸载器会移除整个原程序目录。默认根和已记住的资料根都要保护。
     if (-not $env:LOCALAPPDATA) { throw '无法确认当前用户的资料位置。' }
-    $protected = @(Join-Path $env:LOCALAPPDATA 'msgx'; Join-Path $env:LOCALAPPDATA 'msgx-update-test')
+    $protected = foreach ($name in @('msgx', 'msgx-update-test')) {
+        @{ Path = (Join-Path $env:LOCALAPPDATA $name); AllowProjectInstall = $false }
+    }
     $selectionFile = Join-Path (Join-Path $env:LOCALAPPDATA $profileName) 'profile-path.yaml'
     if (Test-Path -LiteralPath $selectionFile) {
         try { $selected = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($selectionFile)) }
         catch { throw '无法读取已保存的资料位置，已停止迁移。' }
         if ($selected -isnot [string]) { throw '已保存的资料位置无效，已停止迁移。' }
-        $protected += $selected
+        $protected += @{ Path = $selected; AllowProjectInstall = $true }
     }
     foreach ($folder in $protected) {
-        $profile = Get-CheckedLocation $folder '个人资料目录'
-        if ((Test-Overlap $old.Key $profile.Key) -or (Test-Overlap $new.Key $profile.Key)) {
-            throw '原目录和新目录都必须与个人资料目录分开。'
+        $profile = Get-CheckedLocation $folder.Path '个人资料目录'
+        $allowed = $null
+        # 原资料根就是源码项目时，可把程序放在其专用子目录。卸载只处理 installed/。
+        if ($folder.AllowProjectInstall -and
+            (Test-Path -LiteralPath (Join-Path $profile.Full 'src/msgx/__init__.py') -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $profile.Full 'installer') -PathType Container)) {
+            $allowed = $profile.Key + '\installed'
+        }
+        foreach ($program in $old, $new) {
+            if (-not $program.Key.Equals($allowed, [StringComparison]::OrdinalIgnoreCase) -and
+                (Test-Overlap $program.Key $profile.Key)) {
+                throw '原目录和新目录都必须与个人资料目录分开。'
+            }
         }
     }
 

@@ -21,6 +21,7 @@ __pycache__/
 build/
 dist/
 /installer/dist/
+/installed/
 node_modules/
 .vscode/*
 !.vscode/settings.json

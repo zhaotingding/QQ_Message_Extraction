@@ -22,7 +22,7 @@ def main() -> int | None:
     resources = Path(os.environ.get("MSGX_PROGRAM_RESOURCES", ""))
     if not FROZEN or resources.resolve() != PROGRAM_ROOT:
         parser.error("后台必须由安装版消息萃取从程序资源目录启动。")
-    if not data_root.is_absolute() or data_root.resolve().is_relative_to(PROGRAM_ROOT):
+    if not data_root.is_absolute() or data_root.resolve().is_relative_to(PROGRAM_ROOT.parent):
         parser.error("安装版需要与程序资源分开的个人资料目录。")
 
     config = ["--config", args.config] if args.config else []

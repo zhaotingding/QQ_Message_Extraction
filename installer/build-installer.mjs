@@ -47,7 +47,7 @@ const backend = path.join(installer, 'dist', 'backend', 'msgx-backend')
 if (!fs.existsSync(path.join(backend, 'msgx-backend.exe'))) {
   throw new Error('请先在仓库根目录用项目 Conda 环境运行 python -s installer/build_backend.py。')
 }
-const output = path.join(installer, 'dist', test ? 'test' : 'release', preview ? appVersion + '-move-local' : appVersion)
+const output = path.join(installer, 'dist', test ? 'test' : 'release', preview ? appVersion + '-project-local' : appVersion)
 const icon = path.join(root, 'assets', 'app-icon.ico')
 
 // 本地双版本验收用独立安装标识和下载源。正式包必须由发布者签名，并只读 GitHub 正式版本。
@@ -77,7 +77,7 @@ const config = {
     oneClick: false,
     perMachine: false,
     deleteAppDataOnUninstall: false,
-    artifactName: preview ? 'msgx-setup-move-${version}-${arch}-unsigned.exe'
+    artifactName: preview ? 'msgx-setup-project-${version}-${arch}-unsigned.exe'
       : test ? 'msgx-update-test-${version}-${arch}.exe' : 'msgx-setup-${version}-${arch}.exe',
   },
 }

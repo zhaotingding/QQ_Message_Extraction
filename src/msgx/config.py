@@ -167,6 +167,11 @@ def load(path: str | Path | None = None, *, include_preferences: bool = True) ->
     prefs = load_from_env() if include_preferences else None
     if prefs:
         cfg = apply_to_config(cfg, prefs)
+    if FROZEN:
+        # 安装目录会被覆盖或卸载，数据库与输出不能借配置写到程序目录内。
+        for key in ("db_path", "media_dir", "report_dir"):
+            if abs_path(cfg, key).resolve().is_relative_to(PROGRAM_ROOT.parent):
+                raise ValueError(f"app.{key} 不能位于程序安装目录内，请使用独立的资料位置。")
     return cfg
 
 

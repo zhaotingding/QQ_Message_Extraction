@@ -6,6 +6,9 @@ $localAppData = $env:LOCALAPPDATA
 $helper = Join-Path $scratch 'validate-relocation.ps1'
 $exeName = 'msgx-update-test.exe'
 $link = Join-Path $scratch '程序联接'
+$project = Join-Path $scratch '消息萃取项目'
+$installed = Join-Path $project 'installed'
+$oldProgramLink = Join-Path $installed '资料联接'
 $envNames = @('MSGX_RELOCATION_OLD_DIRECTORY', 'MSGX_RELOCATION_NEW_DIRECTORY',
     'MSGX_RELOCATION_EXECUTABLE_NAME', 'MSGX_RELOCATION_UNINSTALL_COMMAND')
 $previousEnv = @{}
@@ -65,17 +68,45 @@ try {
     $preference = Join-Path $testProfileFolder 'profile-path.yaml'
     [IO.File]::WriteAllText($preference, (ConvertTo-Json $profile), [Text.UTF8Encoding]::new($false))
     Assert-Validation $old (Join-Path $profile '子目录') $uninstallCommand '个人资料目录分开'
+    Assert-Validation $old (Join-Path $profile 'installed') $uninstallCommand '个人资料目录分开'
     Assert-Validation $old (Join-Path $env:LOCALAPPDATA 'msgx/profile') $uninstallCommand '个人资料目录分开'
+
+    # 只有保存的源码项目根的直属 installed/ 能与资料同处一个项目。
+    New-Item -ItemType Directory -Path (Join-Path $project 'src/msgx'), (Join-Path $project 'installer') | Out-Null
+    New-Item -ItemType File -Path (Join-Path $project 'src/msgx/__init__.py') | Out-Null
+    [IO.File]::WriteAllText($preference, (ConvertTo-Json $project), [Text.UTF8Encoding]::new($false))
+    Assert-Validation $old $installed $uninstallCommand ''
+    Assert-Validation $old $project $uninstallCommand '个人资料目录分开'
+    Assert-Validation $old (Join-Path $project '.ui/installed') $uninstallCommand '个人资料目录分开'
+    Assert-Validation $old (Join-Path $project 'data/installed') $uninstallCommand '个人资料目录分开'
+
+    New-Item -ItemType Junction -Path $installed -Target $new | Out-Null
+    Assert-Validation $old $installed $uninstallCommand '目录联接或符号链接'
+    [IO.Directory]::Delete($installed, $false)
+
+    New-Item -ItemType Directory -Path $installed | Out-Null
+    $projectUninstaller = Join-Path $installed "Uninstall $exeName"
+    New-Item -ItemType File -Path $projectUninstaller, (Join-Path $installed $exeName) | Out-Null
+    $projectUninstallCommand = '"' + $projectUninstaller + '" /currentuser'
+    Assert-Validation $installed (Join-Path $scratch '迁出程序') $projectUninstallCommand ''
+    New-Item -ItemType Junction -Path $oldProgramLink -Target $project | Out-Null
+    Assert-Validation $installed (Join-Path $scratch '迁出程序') $projectUninstallCommand '原程序目录内有目录联接'
+    [IO.Directory]::Delete($oldProgramLink, $false)
+    New-Item -ItemType Directory -Path (Join-Path $installed 'data') | Out-Null
+    Assert-Validation $installed (Join-Path $scratch '迁出程序') $projectUninstallCommand '原程序目录内还有应用资料'
 
     New-Item -ItemType Junction -Path $link -Target $old | Out-Null
     Assert-Validation $old (Join-Path $link '新位置') $uninstallCommand '目录联接或符号链接'
     if (-not (Test-Path -LiteralPath $uninstaller)) { throw '预检修改了既有安装' }
-    '迁移预检通过：新目录、重叠拒绝、卸载登记、非空目录、资料保护、目录联接。'
+    '迁移预检通过：新目录、重叠拒绝、卸载登记、非空目录、资料保护、目录联接、迁入或迁出项目专用子目录。'
 } finally {
     $env:LOCALAPPDATA = $localAppData
     foreach ($name in $envNames) { [Environment]::SetEnvironmentVariable($name, $previousEnv[$name]) }
     if ($testDirectory.FullName -ne $scratch -or
         -not $scratch.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw '测试目录边界异常' }
     if (Test-Path -LiteralPath $link) { [IO.Directory]::Delete($link, $false) }
+    if (Test-Path -LiteralPath $oldProgramLink) { [IO.Directory]::Delete($oldProgramLink, $false) }
+    $installedItem = Get-Item -LiteralPath $installed -Force -ErrorAction SilentlyContinue
+    if ($installedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { [IO.Directory]::Delete($installed, $false) }
     Remove-Item -LiteralPath $scratch -Recurse -Force
 }
