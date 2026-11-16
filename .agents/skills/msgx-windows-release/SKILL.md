@@ -7,6 +7,16 @@ description: 验证或修改 msgx 的 Windows 源码启动、轻量 EXE、安装
 
 适用：Windows 源码版和当前用户安装版。历史验收的日期与适用范围见参考资料。
 
+先确定此次交付模式，不能用一条链的成功替代另一条：
+
+| 任务 | 当前归属与验收 |
+|---|---|
+| 开发源码或轻量 EXE | 项目 Conda、`desktop/` 与 `tools/build_launcher.py`；检查实际解释器和源码入口 |
+| 面向使用者的安装、卸载、迁移或应用更新 | `installer/`；随包运行时、独立资料根、安装登记与更新重启分别核对 |
+| 正式发布或 GitHub 更新 | 先核对版本、签名/Release 和授权；本机回环更新成功不表示公开更新可用 |
+
+2026-11-16 的当前布局已采用 `installer/`；参考中的旧目录和测试版本号是历史证据，不是另一个维护源，也不是本次建议执行的版本升级。
+
 - 开发者自行准备Conda，一项目一个独立环境，默认名 `msgx`；PowerShell统一使用 `conda run -n msgx --no-capture-output python -s ...` 安装、源码运行和测试。业务依赖只维护 `pyproject.toml`，pip使用 `--isolated install --no-user`；不向公共 `base`、全局Python或用户site-packages安装，不创建或嵌套venv。不得借用作者目录、未跟踪EXE、凭据或数据作为启动前提。
 - 源码版沿用独立 Conda 和轻量 EXE。NapCat 的 BAT/VBS 和目标重启 PS1 属于协议/UAC 实现，保留现有用途。
 - 安装、卸载与更新源码在 `installer/`；新产物在忽略的 `installer/dist/`，旧 `.ui/installer-build/` 成品原位保留。`desktop/package.json` 仍是桌面依赖及 npm 命令入口，不能因移动构建脚本另建依赖清单。
