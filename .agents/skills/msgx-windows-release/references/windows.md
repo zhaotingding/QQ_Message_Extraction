@@ -10,7 +10,7 @@
 
 安装版查询 [公开的稳定 Release](https://github.com/zhaotingding/QQ_Message_Extraction/releases)。发现新版在「帮助」显示蓝点。用户确认「更新并重启」后才下载和验证，完成摘要编辑保存和应用持有的接收服务退出后再安装。源码版用 Git 更新。正式签名和上传 Release 需分别确认，不能从实现或本地安装测试推定已有公开更新。
 
-新装显示程序目录页，接受新建或空目录。手动覆盖安装显示已注册的原路径供确认，静默更新也沿用原路径。资料先复用已记住的根或默认目录中的已有资料，再考虑从仓库 `installer/` 下启动安装包时可识别的源码资料。手动安装的完成页可以直接打开基础设置，自动更新重启进入工作台。基础设置复用现有主题和凭据接口，留空保持原密钥。使用 `npm.cmd run build:installer --prefix desktop -- --local-preview` 生成同安装身份的未签名本地验收包，输出到 `installer/dist/release/<版本>-wizard-local/`，该包关闭在线更新。
+手动安装显示程序目录页，接受新建或空目录。覆盖安装默认显示已注册的原路径。换目录时先验证目标写权限、原卸载记录及新旧程序目录与实际资料目录的关系，再确认迁移。NSIS 复用旧卸载器保留资料，卸载失败不得在新目录解包。静默更新仍沿用原路径。资料先复用已记住的根或默认目录中的已有资料，再考虑从仓库 `installer/` 下启动安装包时可识别的源码资料。手动安装的完成页可以直接打开基础设置，自动更新重启进入工作台。基础设置复用现有主题和凭据接口，留空保持原密钥。使用 `npm.cmd run build:installer --prefix desktop -- --local-preview` 生成同安装身份的未签名本地验收包，输出到 `installer/dist/release/<版本>-move-local/`，该包关闭在线更新。
 
 实际验证使用隔离资料根，核对安装程序及后台解释器归属、设置和数据库保留、系统卸载入口、更新重启后的版本及收尾。记录本地源验证和公开 Release 验证的各自结果。用户步骤见 [README 安装版](../../../../README.md#安装版) 和 [安装版资料使用指南](../../../../docs/使用与排障.md#安装版资料位置与复用)。
 
@@ -31,6 +31,8 @@ conda run -n msgx --no-capture-output python -s -m http.server 17391 --bind 127.
 安装向导本地验收见 `installer/dist/wizard-verification/in-place.json`。隔离的 1.0.12 装在 A，1.0.13 带 `/D=B` 覆盖后只有 A 的 EXE 和唯一注册项。NSIS 会先创建显式 `/D` 的空目录，实际文件仍写入注册位置。资料选择测试及隔离窗口验证覆盖已有主题、档案回显、局部保存和首次设置状态。正式身份的交互安装留给使用者确认。
 
 目录页与首次设置的后续验收见 `installer/dist/wizard-feedback/nsis-pages.log` 和 `open-setup.log`。对隔离安装器 1.0.14 操作了实际控件，确认新装可选尚不存在的非默认目录，覆盖安装显示原地址且浏览禁用，完成页可见且默认勾选基础设置。完成页启动参数在隔离应用中验证能打开基础设置，即使已有完成标记。比较目录时使用 Win32 `GetFullPathNameW`，NSIS 的同名指令会因新目录尚不存在而返回空值。
+
+2026-11-16 交互迁移验收见 `installer/dist/relocation-verification/interactive.log`。对隔离 1.0.15 包验证了覆盖时原路径预填、浏览可用、迁移确认、A 到 B 迁移。旧主程序已移除，Windows 只保留 B 的安装记录，开始菜单快捷方式指向 B，合成偏好、数据库和资料路径指针的哈希不变。`tests/test_installer_relocation.ps1` 单独验证目录、旧卸载登记和资料保护。验收使用隔离身份，正式身份的安装留给使用者。
 
 ## 权限与安装说明维护时读取
 

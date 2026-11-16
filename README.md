@@ -22,7 +22,7 @@
 
 公开安装包和稳定更新通过 [GitHub Releases](https://github.com/zhaotingding/QQ_Message_Extraction/releases) 提供。目前尚无公开 Release，拿到本机构建的安装包后可先本地试用。
 
-1. 双击 Windows x64 安装包，为当前用户安装。全新安装可以使用默认位置，也可以选择新的或空的程序目录。手动覆盖安装时，向导会显示注册的原目录供确认。程序和业务运行时随包提供，无需先安装 Conda、Node.js 或 Git。
+1. 双击 Windows x64 安装包，为当前用户安装。安装向导默认显示原程序目录或新装默认位置，也可以点「浏览」选择新的或空的程序目录。手动换目录时，确认后由原卸载器移除旧程序，再安装到新位置，个人资料留在原地。程序和业务运行时随包提供，无需先安装 Conda、Node.js 或 Git。
 2. 完成页默认勾选「打开消息萃取并进行基础设置」。点击「完成」后可选择深色或浅色主题，为已有 API 档案填写密钥，也可直接跳过。留空保留已保存的密钥，密钥由当前 Windows 用户的凭据管理器保存。收取群消息时另行准备 QQ 和 NapCat。见 [接入 QQ 与 NapCat](#接入-qq-与-napcat)。
 3. 应用原地沿用已有资料。首次从已有资料的源码仓库 `installer/` 下运行安装包时，可自动识别该仓库。没有原资料的用户默认使用 `%LOCALAPPDATA%\msgx\profile`。见 [资料位置与复用](docs/使用与排障.md#安装版资料位置与复用)。
 
@@ -345,7 +345,7 @@ npm.cmd run build:installer --prefix desktop
 
 正式构建从源码读取版本号，输出到 `installer/dist/release/<版本>/`。核对 `msgx-setup-<版本>-x64.exe`、`latest.yml` 和更新所需的配套文件。后台和中间构建文件也在 `installer/dist/`；此目录不入库，安装实现本身需要入库。命令仅在本机构建，上传稳定 Release 需要单独执行。
 
-本地安装向导验收可在最后一条命令添加 `-- --local-preview`，输出到 `installer/dist/release/<版本>-wizard-local/`，包名带 `unsigned`，沿用同一安装标识，在线更新关闭。隔离的双版本更新验证见 [安装版与公开更新](.agents/skills/msgx-windows-release/references/windows.md#安装版与公开更新)。
+本地安装向导验收可在最后一条命令添加 `-- --local-preview`，输出到 `installer/dist/release/<版本>-move-local/`，包名带 `unsigned`，沿用同一安装标识，在线更新关闭。隔离的双版本更新验证见 [安装版与公开更新](.agents/skills/msgx-windows-release/references/windows.md#安装版与公开更新)。
 
 ### 文件分工
 

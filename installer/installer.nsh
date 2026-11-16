@@ -3,10 +3,13 @@
   !include LogicLib.nsh
   !include FileFunc.nsh
 
+  !define MSGX_RELOCATION_SCRIPT "${__FILEDIR__}\validate-relocation.ps1"
   Var MsgxRegisteredInstallDir
+  Var MsgxRelocating
 
   !macro customInit
-    ; 检查实际安装记录，已有安装只允许在原目录升级或覆盖安装。
+    ; 检查实际安装记录，默认沿用原目录。手动安装可在目录页确认迁移。
+    StrCpy $MsgxRelocating "0"
     ReadRegStr $0 HKLM "${INSTALL_REGISTRY_KEY}" InstallLocation
     ReadRegStr $1 HKLM "${UNINSTALL_REGISTRY_KEY}" UninstallString
     ${If} $0 != ""
@@ -56,10 +59,8 @@
 
     Function MsgxDirectoryShow
       ${If} $MsgxRegisteredInstallDir != ""
-        !insertmacro MUI_HEADER_TEXT "确认安装目录" "已有安装将在原目录覆盖。"
-        SendMessage $mui.DirectoryPage.Text ${WM_SETTEXT} 0 "STR:确认下方目录并继续安装。程序将原位更新，个人资料保持原位。"
-        SendMessage $mui.DirectoryPage.Directory ${EM_SETREADONLY} 1 0
-        EnableWindow $mui.DirectoryPage.BrowseButton 0
+        !insertmacro MUI_HEADER_TEXT "选择安装目录" "默认沿用原目录，也可以迁移程序。"
+        SendMessage $mui.DirectoryPage.Text ${WM_SETTEXT} 0 "STR:保留当前路径以原位更新，或浏览并选择新的或空的程序目录。个人资料仍保留在原位。"
       ${EndIf}
     FunctionEnd
 
@@ -74,12 +75,34 @@
     FunctionEnd
 
     Function MsgxDirectoryLeave
-      ${If} $MsgxRegisteredInstallDir != ""
-        StrCpy $INSTDIR $MsgxRegisteredInstallDir
-        Call MsgxValidateInstallLocation
-      ${Else}
+      StrCpy $MsgxRelocating "0"
+      ${If} $MsgxRegisteredInstallDir == ""
         Call MsgxValidateNewDirectory
+        Return
       ${EndIf}
+
+      ; 把当前输入与注册路径统一成带末尾反斜杠的绝对路径后再判断是否迁移。
+      Call MsgxValidateInstallLocation
+      System::Call 'kernel32::GetFullPathNameW(w "$MsgxRegisteredInstallDir", i ${NSIS_MAX_STRLEN}, w .r8, p 0) i .r7'
+      ${If} $7 == 0
+      ${OrIf} $7 >= ${NSIS_MAX_STRLEN}
+        MessageBox MB_OK|MB_ICONSTOP "无法识别原安装目录，已停止。请修复现有安装后再试。" /SD IDOK
+        Abort
+      ${EndIf}
+      StrCpy $4 $8 1 -1
+      ${If} $4 != "\"
+        StrCpy $8 "$8\"
+      ${EndIf}
+      ${If} $2 == $8
+        StrCpy $INSTDIR $MsgxRegisteredInstallDir
+        Return
+      ${EndIf}
+
+      Call MsgxValidateNewDirectory
+      Call MsgxValidateRelocation
+      MessageBox MB_OKCANCEL|MB_ICONQUESTION|MB_DEFBUTTON2 "将程序迁移到：$\r$\n$INSTDIR$\r$\n$\r$\n旧卸载器会清理原程序目录，个人资料仍保留在原位。继续安装？" /SD IDCANCEL IDOK +2
+      Abort
+      StrCpy $MsgxRelocating "1"
     FunctionEnd
   !macroend
 
@@ -196,6 +219,87 @@
       ${EndIf}
       Abort
   FunctionEnd
+
+  !macro customHeader
+    Function MsgxValidateRelocation
+      InitPluginsDir
+      File /oname=$PLUGINSDIR\validate-relocation.ps1 "${MSGX_RELOCATION_SCRIPT}"
+      Delete "$PLUGINSDIR\relocation-error.txt"
+      ReadRegStr $0 HKCU "${UNINSTALL_REGISTRY_KEY}" UninstallString
+
+      ; 通过当前安装器进程的环境传递原始路径与注册命令，避免命令参数重新解释引号。
+      StrCpy $2 "error"
+      StrCpy $3 $MsgxRegisteredInstallDir
+      StrCpy $4 $INSTDIR
+      System::Call 'kernel32::SetEnvironmentVariableW(w "MSGX_RELOCATION_OLD_DIRECTORY", w r3) i .r7'
+      ${If} $7 == 0
+        Goto msgxRelocationClearEnvironment
+      ${EndIf}
+      System::Call 'kernel32::SetEnvironmentVariableW(w "MSGX_RELOCATION_NEW_DIRECTORY", w r4) i .r7'
+      ${If} $7 == 0
+        Goto msgxRelocationClearEnvironment
+      ${EndIf}
+      System::Call 'kernel32::SetEnvironmentVariableW(w "MSGX_RELOCATION_EXECUTABLE_NAME", w "${APP_EXECUTABLE_FILENAME}") i .r7'
+      ${If} $7 == 0
+        Goto msgxRelocationClearEnvironment
+      ${EndIf}
+      System::Call 'kernel32::SetEnvironmentVariableW(w "MSGX_RELOCATION_UNINSTALL_COMMAND", w r0) i .r7'
+      ${If} $7 == 0
+        Goto msgxRelocationClearEnvironment
+      ${EndIf}
+      nsExec::Exec /TIMEOUT=15000 '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\validate-relocation.ps1" -FromEnvironment'
+      Pop $2
+
+      msgxRelocationClearEnvironment:
+      System::Call 'kernel32::SetEnvironmentVariableW(w "MSGX_RELOCATION_OLD_DIRECTORY", p 0)'
+      System::Call 'kernel32::SetEnvironmentVariableW(w "MSGX_RELOCATION_NEW_DIRECTORY", p 0)'
+      System::Call 'kernel32::SetEnvironmentVariableW(w "MSGX_RELOCATION_EXECUTABLE_NAME", p 0)'
+      System::Call 'kernel32::SetEnvironmentVariableW(w "MSGX_RELOCATION_UNINSTALL_COMMAND", p 0)'
+      ${If} $2 == "0"
+        Return
+      ${EndIf}
+
+      StrCpy $1 ""
+      ClearErrors
+      FileOpen $0 "$PLUGINSDIR\relocation-error.txt" r
+      ${IfNot} ${Errors}
+        FileReadUTF16LE $0 $1
+        FileClose $0
+      ${EndIf}
+      ${If} $1 == ""
+        StrCpy $1 "无法完成迁移预检。请保留原程序目录，或重试后再更改目录。"
+      ${EndIf}
+      MessageBox MB_OK|MB_ICONSTOP "$1" /SD IDOK
+      Abort
+    FunctionEnd
+  !macroend
+
+  !macro customUnInstallCheck
+    ${If} $MsgxRelocating == "1"
+      ; 迁移时必须确认旧程序已卸载，防止模板在卸载器启动失败后继续解包。
+      IfErrors msgxRelocationUninstallFailed
+      ${If} $R0 != 0
+      ${OrIf} ${FileExists} "$MsgxRegisteredInstallDir\${APP_EXECUTABLE_FILENAME}"
+        Goto msgxRelocationUninstallFailed
+      ${EndIf}
+      Return
+      msgxRelocationUninstallFailed:
+      MessageBox MB_OK|MB_ICONSTOP "原程序未能完成卸载，迁移已停止。新目录没有安装程序。" /SD IDOK
+      SetErrorLevel 2
+      Quit
+    ${EndIf}
+
+    ; 原位覆盖保留 electron-builder 原来的卸载结果处理。
+    IfErrors 0 +3
+    DetailPrint `Uninstall was not successful. Not able to launch uninstaller!`
+    Return
+    ${If} $R0 != 0
+      MessageBox MB_OK|MB_ICONEXCLAMATION "$(uninstallFailed): $R0"
+      DetailPrint `Uninstall was not successful. Uninstaller error code: $R0.`
+      SetErrorLevel 2
+      Quit
+    ${EndIf}
+  !macroend
 
   !macro customInstall
     ${IfNot} ${Silent}
