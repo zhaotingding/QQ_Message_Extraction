@@ -47,9 +47,10 @@ const pending = new Map()
 const picked = new Map()
 
 function titleBar(theme) {
-  return theme === 'light'
-    ? { color: '#ececec', symbolColor: '#242424', height: 36 }
-    : { color: '#242424', symbolColor: '#dedede', height: 36 }
+  const palette = theme === 'light'
+    ? { color: '#ececec', symbolColor: '#242424' }
+    : { color: '#242424', symbolColor: '#dedede' }
+  return { ...palette, height: 44 }
 }
 
 function backend(action, payload = {}) {

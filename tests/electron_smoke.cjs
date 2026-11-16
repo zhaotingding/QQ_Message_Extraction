@@ -105,6 +105,32 @@ async function run() {
     }
     await wait(() => evaluate("document.querySelectorAll('#navigation button').length === 5"), '主导航未构建')
     assert.equal(await evaluate("window.msgx.call('desktop.update.status').then(s => s.phase)"), 'unavailable')
+    const shellSizes = () => evaluate(`(() => {
+      const size = (selector, axis) => document.querySelector(selector).getBoundingClientRect()[axis]
+      const menu = document.querySelector('.menu-trigger')
+      const light = document.querySelector('.service-light').getBoundingClientRect()
+      const statusIcon = document.querySelector('[data-page=status] svg').getBoundingClientRect()
+      return {
+        titleHeight: size('.title-bar', 'height'),
+        menuWidth: menu.getBoundingClientRect().width, menuHeight: menu.getBoundingClientRect().height,
+        menuText: getComputedStyle(menu).fontSize, menuGap: getComputedStyle(menu.closest('.title-controls')).columnGap,
+        railWidth: size('.activity-bar', 'width'), iconWidth: statusIcon.width,
+        lightClear: light.left > statusIcon.right,
+      }
+    })()`)
+    const shell = { titleHeight: 44, menuWidth: 54, menuHeight: 34, menuText: '14px', menuGap: '6px',
+      railWidth: 60, iconWidth: 24, lightClear: true }
+    assert.deepEqual(await shellSizes(), shell)
+    assert.ok(await evaluate(`(() => {
+      const overlay = navigator.windowControlsOverlay.getTitlebarAreaRect()
+      const title = document.querySelector('.title-bar').getBoundingClientRect()
+      const tools = document.querySelector('.window-tools').getBoundingClientRect()
+      return overlay.height > 0 && title.height >= overlay.height && tools.right < overlay.right
+    })()`), '顶栏按钮应避开系统窗口控制区')
+    await send('Emulation.setDeviceMetricsOverride', { width: 820, height: 590, deviceScaleFactor: 1.25, mobile: false })
+    assert.deepEqual(await shellSizes(), { ...shell, railWidth: 54 })
+    await capture('shell-820-125.png')
+    await send('Emulation.clearDeviceMetricsOverride')
     await wait(() => evaluate("document.querySelector('#inspector-title').textContent === '自动摘要'"), '运行状态未挂载摘要侧栏')
     await light('idle')
     const activeLog = 'document.querySelector(".status-console .log:not([hidden])")'
@@ -115,7 +141,6 @@ async function run() {
     await wait(() => evaluate(atEnd), '首次打开未定位到最后一屏日志')
     await capture('light-idle.png')
     assert.equal(await evaluate("navigator.windowControlsOverlay.visible"), true)
-    assert.equal(await evaluate("document.querySelector('#navigation').offsetWidth"), 49)
     await evaluate("[...document.querySelectorAll('.menu-trigger')].find(b => b.textContent === '视图').click()")
     assert.equal(await evaluate("document.querySelector('.menu-trigger[aria-expanded=true]').textContent"), '视图')
     await evaluate("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
