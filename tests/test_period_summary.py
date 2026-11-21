@@ -44,6 +44,15 @@ class FakeLLM:
 
 
 class PeriodPartsTests(unittest.TestCase):
+    def test_official_sol_limits_cap_overstated_local_profile(self):
+        cfg = {"api": {"model": "gpt-6.2-sol", "base_url": "https://api.openai.com/v1",
+                       "context_tokens": 1_050_000, "max_output_tokens": 1_020_000, "reasoning": "max"}}
+        self.assertEqual(S.model_limits(cfg), (1_050_000, 128_000))
+        budget, input_limit = S.period_token_limits(cfg, 3500, 586831)
+        self.assertEqual(budget, 36_776)
+        self.assertGreater(input_limit, 586831)
+        self.assertLessEqual(input_limit, 922_000)
+
     def test_prompt_template_token_estimate_and_output_budget(self):
         self.assertEqual(S.digest_system(4500, "约{{目标字数}}字 {custom}"), "约4500字 {custom}")
         self.assertLess(output_token_budget(1000), output_token_budget(3000))

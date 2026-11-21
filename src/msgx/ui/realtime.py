@@ -222,6 +222,8 @@ class RealtimePage:
             return "下载失败"
         if v == "failed":
             return "图片未识别"
+        if v == "not_sent":
+            return "识别请求未提交"
         if v == "rejected":
             return "请求被拒绝"
         if v == "skipped":

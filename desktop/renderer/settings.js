@@ -237,7 +237,7 @@ export function mount(container, app) {
         void updateKey();
         notify('已删除此地址的密钥。');
       })), profileLocation,
-    explain('OpenAI 费率填写 Standard 基准价。Flex 仅在明确返回容量不足时回退到 Standard。'));
+    explain('OpenAI 费率填写 Standard 基准价。GPT-6.2 Sol / Astra 请选 default（Standard）。支持 Flex 的模型仅在明确返回容量不足时回退到 Standard。'));
 
   const summaryPrompt = make('textarea', { rows: 10, spellcheck: false });
   const targetChars = make('input', { type: 'number', min: '1', max: '100000' });

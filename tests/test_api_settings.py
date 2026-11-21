@@ -378,6 +378,31 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(KEY, str(raised.exception))
         self.assertNotIn("base64", str(raised.exception))
 
+    async def test_all_connect_failures_do_not_block_image_budget_but_mixed_errors_do(self):
+        from types import SimpleNamespace
+        from msgx.llm import RequestNotSent, RetryableRequestError
+        self.llm.llm["post_retries"] = 2
+        error = aiohttp.ClientConnectorError(SimpleNamespace(host="fixture", port=443, ssl=True),
+                                              OSError(10060, "private connection detail"))
+        for errors, expected in (([error, error], RequestNotSent),
+                                 ([Response({"error": {"code": "unavailable"}}, 503), error], RetryableRequestError)):
+            session = Mock()
+            session.post.side_effect = errors
+            with patch.object(self.llm, "session", AsyncMock(return_value=session)), patch("msgx.llm.asyncio.sleep", new=AsyncMock()):
+                with self.assertRaises(expected) as failure:
+                    await self.llm.chat("合成材料", "合成问题", purpose="自动图片理解")
+            self.assertEqual(type(failure.exception), expected)
+            self.assertEqual(session.post.call_count, 2)
+            row = self.store.api_usage_details()["items"][0]
+            self.assertNotIn("private connection detail", str(failure.exception))
+            if expected is RequestNotSent:
+                self.assertIn("10060", row["status"])
+                self.assertEqual(row["cost_cny"], 0)
+                self.assertEqual(self.store.automatic_image_usage()["unknown"], 0)
+            else:
+                self.assertIsNone(row["cost_cny"])
+                self.assertEqual(self.store.automatic_image_usage()["unknown"], 1)
+
     async def test_rejected_manual_image_preserves_ocr_without_auto_retry(self):
         import hashlib
         from PIL import Image

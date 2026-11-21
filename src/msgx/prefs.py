@@ -85,7 +85,7 @@ def save(prefs: dict, path: Path | str) -> None:
     tmp = p.with_suffix(p.suffix + ".tmp")
     if "api" in prefs:
         from .api_settings import validate
-        prefs = {**prefs, "api": validate(prefs["api"])}
+        prefs = {**prefs, "api": validate(prefs["api"], stored=True)}  # 保存主题等无关偏好时允许保留旧档案。
     if "api_profiles" in prefs:
         from .api_settings import catalog
         profiles, active = catalog({}, prefs)

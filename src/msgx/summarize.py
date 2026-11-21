@@ -13,6 +13,7 @@ from datetime import date, datetime, time as day_time, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .api_settings import check_service_tier, official_gpt62
 from .config import abs_path
 from .llm import IncompleteResponse, LLM
 from .summary_review import get_review
@@ -135,9 +136,11 @@ def model_limits(cfg: dict) -> tuple[int, int]:
     api = cfg.get("api", {})
     llm = cfg.get("llm", {})
     model = api.get("model", llm.get("model", "deepseek-flash"))
-    host = urlsplit(api.get("base_url", llm.get("base_url", "https://api.deepseek.com"))).hostname
+    base_url = api.get("base_url", llm.get("base_url", "https://api.deepseek.com"))
+    host = urlsplit(base_url).hostname
     official = None
-    if host == "api.openai.com" and model in ("gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra"):
+    if host == "api.openai.com" and (model in ("gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra")
+                                     or official_gpt62(base_url, model)):
         official = (1_050_000, 128_000)
     elif (host == "api.deepseek.com" or not api) and model in (
         "deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"
@@ -163,7 +166,12 @@ def period_token_limits(cfg: dict, target_chars: int, input_tokens: int) -> tupl
     if cfg.get("api", {}).get("reasoning", "none") != "none":
         # 优先容纳原材料，再用剩余空间预留推理额度，避免额外余量触发分块。
         reserve = max(0, min(25_000, output_cap - output, input_limit - input_tokens))
-        return output + reserve, input_limit - reserve
+        output += reserve
+        input_limit -= reserve
+    profile = cfg.get("api") or cfg.get("llm", {})
+    if official_gpt62(profile.get("base_url", ""), profile.get("model", "")):
+        # 6.2 另有限制单次输入的门槛，即使配置的总上下文仍有剩余也要分块。
+        input_limit = min(input_limit, 922_000 - margin)
     return output, input_limit
 
 
@@ -396,6 +404,10 @@ class Summarizer:
         if kind == "daily":
             if self.store.count_messages_window(start_ts, end_ts) == 0:
                 return None
+            if request_key and not saved:
+                # 空周期及已有成稿无需请求；新日报可在读取数万条材料前拒绝不兼容档位。
+                api = self.cfg.get("api", {})
+                check_service_tier(self.llm.llm["base_url"], self.llm.llm["model"], api.get("service_tier", "default"))
             return await self._run_day(start, limit)  # 复用周期入口的锁、快照与成稿检查。
         blocks, reports = [], []
         for child_kind, child_start, child_end in period_parts(kind, start, end):

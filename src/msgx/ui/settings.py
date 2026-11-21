@@ -98,7 +98,7 @@ class SettingsPage:
         ttk.Label(api, text="选择配置仅切换摘要用途；参数草稿暂存在当前窗口，点击「保存 API 参数」后生效。新增复制当前参数，不覆盖原配置。\n"
                   "密钥只由「保存 / 替换密钥」保存；删除配置不删除系统凭据，避免破坏在途任务恢复。\n"
                   "配置导出不含密钥；不同配置或地址不复用密钥。更换模型请核对容量和费率，汇率为手动估值。\n"
-                  "官方 OpenAI：flex 为半价慢速，default 为 Standard；单价填写 Standard 基准价，自动按档位折算。\n"
+                  "官方 OpenAI：GPT-6.2 Sol / Astra 请选 default（Standard）；支持 Flex 的模型按档位折算 Standard 基准单价。\n"
                   "Flex 资源不足时改用 Standard；仅对明确资源拒绝回退，结果未知不自动重发；其他平台不发送此参数。",
                   style="Hint.TLabel", wraplength=730).grid(row=row+5, column=0, columnspan=2, sticky="w")
 

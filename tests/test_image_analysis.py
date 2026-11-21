@@ -17,7 +17,7 @@ from PIL import Image
 from msgx import api_settings, prefs
 from msgx.config import DEFAULTS
 from msgx.image_policy import ANALYSIS_DELAY_SECONDS, KEYWORD_RULES, SCREEN_VERSION, is_sticker, screen_image, validate_analysis
-from msgx.llm import LLM
+from msgx.llm import LLM, RequestNotSent
 from msgx.media import MediaWorker
 from msgx.models import Msg
 from msgx.store import Store
@@ -116,6 +116,19 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fake.calls, [])
         self.assertGreaterEqual(self.store.get_image(row["id"])["screen_score"], 70)
         self.assertEqual(self.store.get_image(row["id"])["include_vision"], 0)
+
+    async def test_unsent_image_preserves_ocr_and_next_image_can_run(self):
+        self.enable()
+        first = self.image("offline")
+        self.fake.describe_image = AsyncMock(side_effect=[RequestNotSent("连接未建立"), ("合成结果", True)])
+        await self.process_ready()
+        saved = self.store.get_image(first["id"])
+        self.assertEqual((saved["vision_state"], saved["auto_state"]), ("not_sent", "not_sent"))
+        self.assertEqual(saved["ocr_text"], first["ocr_text"])
+        self.assertEqual(self.store.automatic_image_usage()["unknown"], 0)
+        second = self.image("online", digest="different")
+        await self.process_ready()
+        self.assertEqual(self.store.get_image(second["id"])["auto_state"], "ok")
 
     async def test_success_context_and_summary_reuse(self):
         self.enable()

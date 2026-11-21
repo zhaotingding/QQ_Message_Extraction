@@ -70,6 +70,36 @@ class BackgroundSummaryTests(unittest.IsolatedAsyncioTestCase):
         return await Summarizer(self.llm.cfg, self.store, self.llm).run_period(
             "daily", date(2026, 10, 8), date(2026, 10, 9))
 
+    async def test_sol_flex_rejected_locally_then_standard_uses_one_new_post(self):
+        legacy = {**api_settings.DEFAULTS, "model": "gpt-6.2-sol", "reasoning": "max", "service_tier": "flex"}
+        # 已保存的不兼容档案仍可打开编辑，不能阻断应用启动，也不能提交付费任务。
+        profiles, active = api_settings.catalog({}, {"api_profiles": {"openai": legacy}})
+        self.llm.cfg = api_settings.apply(self.cfg, profiles[active])
+        self.llm.llm = self.llm.cfg["llm"]
+        result = await self.llm._read_response(response("completed"))
+        result["service_tier"] = "default"
+        self.llm._retrieve_response = AsyncMock(return_value=result)
+        with patch("msgx.llm.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaisesRegex(ValueError, "gpt-6.2-sol.*Flex"):
+                await self.run_daily()
+            self.assertEqual(self.posts, [])
+            self.assertIsNone(self.store.summary_request(self.key))
+            self.assertEqual(self.store.api_usage_details()["items"], [])
+            self.llm.cfg["api"]["service_tier"] = "default"
+            report = await self.run_daily()
+        self.assertEqual(report["content"], "完整摘要")
+        self.assertEqual([body["service_tier"] for _, body in self.posts], ["default"])
+        self.assertEqual(self.posts[0][1]["reasoning"], {"effort": "max"})
+        self.assertEqual(self.store.api_usage_details()["items"][0]["service_tier"], "default")
+
+    def test_model_tier_validation_only_applies_to_known_official_models(self):
+        for model in ("gpt-6.2-sol", "gpt-6.2-astra"):
+            values = {**api_settings.DEFAULTS, "model": model, "reasoning": "high"}
+            with self.subTest(model=model), self.assertRaisesRegex(ValueError, "Flex"):
+                api_settings.validate(values)
+            self.assertEqual(api_settings.validate({**values, "base_url": "https://gateway.invalid"})["model"], model)
+        self.assertEqual(api_settings.validate(api_settings.DEFAULTS)["service_tier"], "flex")
+
     async def test_confirmed_retry_keeps_terra_reasoning_and_reserves_output(self):
         self.cfg["api"].update(model="gpt-6.1-terra", reasoning="max", max_output_tokens=11776)
         self.llm.llm["model"] = "gpt-6.1-terra"

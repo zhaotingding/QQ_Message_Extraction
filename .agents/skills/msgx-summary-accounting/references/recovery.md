@@ -20,6 +20,8 @@
 
 ## 网络与费用
 
+2026-11-21（1.0.6）：排查日报时按日期核对 `summary_jobs.error` 的安全字段、当次账本与响应 ID。HTTP 400 的 `param=service_tier` 表示档位被拒，需区分模型支持范围与项目权限。官方 GPT-6.2 Sol / Astra 不支持 Flex，旧档案仍须可编辑，确认改用 Standard 后只影响后续提交。单纯建连失败还没有响应或正文可解析。仅当一次调用的全部尝试都明确止于建连阶段，才能记零费用；请求已经发送而结果未知时保留原保护。隔离测试见 `tests/test_background_summary.py`、`test_api_settings.py`、`test_image_analysis.py`。实际服务商扣款和旧日报都无需为这项验证重发。 [OpenAI Flex 适用模型](https://developers.openai.com/api/docs/guides/flex-processing)
+
 1.0.1（2026-10-31，30项API及8项后台恢复隔离测试通过）：只有官方OpenAI已请求Flex且明确返回`429 resource_unavailable`时立即按Standard重新提交；普通429、超时及未知提交不走该分支。回退后的实际提交档位须持久化到请求metadata，重开GET取回时继续按该档位推算，服务端返回档位仍优先；不能保留原Flex半价。
 
 策略依据：[OpenAI Flex资源不足处理](https://developers.openai.com/api/docs/guides/flex-processing)。新任务统一Responses；[DeepSeek官方Responses](https://api-docs.deepseek.com/guides/responses_api/)已提供该格式（2026-10-31查阅），不把官方支持推广到任意代理。旧任务恢复仍用原协议快照，不因编辑配置切换接口或重新POST。
