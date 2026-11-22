@@ -56,15 +56,19 @@ class LauncherTests(IsolatedToolTest):
 
     def test_desktop_launch_uses_local_runtime_and_current_conda_python(self):
         desktop = self.folder / "desktop"
-        runtime = desktop / "node_modules/electron/dist/electron.exe"
+        runtime = desktop / "node_modules/electron/dist/msgx-desktop.exe"
         runtime.parent.mkdir(parents=True)
-        runtime.touch()
+        runtime.with_name("electron.exe").touch()
         with patch.object(electron_launcher, "DESKTOP", desktop), \
                 patch.object(electron_launcher, "require_environment") as guard, \
                 patch.object(electron_launcher.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "setup-runtime"):
+                electron_launcher.launch()
+            run.assert_not_called()
+            runtime.touch()
             run.return_value.returncode = 0
             self.assertEqual(electron_launcher.launch(), 0)
-        guard.assert_called_once()
+        self.assertEqual(guard.call_count, 2)
         self.assertEqual(run.call_args.args[0], [str(runtime), str(desktop)])
         self.assertEqual(run.call_args.kwargs["env"]["MSGX_DESKTOP_PYTHON"], sys.executable)
 

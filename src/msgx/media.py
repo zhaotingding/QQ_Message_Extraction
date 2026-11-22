@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from .llm import APIRequestRejected, LLM
+from .api_settings import UnsupportedServiceTier
+from .llm import APIRequestRejected, LLM, RequestNotSent
 
 import asyncio
 import hashlib
@@ -287,6 +288,9 @@ class MediaWorker:
             text, ok = await llm.describe_image(path, prompt, **options)
         except APIRequestRejected:
             return "", "rejected"
+        except (RequestNotSent, UnsupportedServiceTier) as exc:
+            log.warning("图片识别未提交：%s", exc)
+            return "", "not_sent"
         return text, ("ok" if ok else "failed")
 
     async def manual_vision(self, row_id: int) -> dict:

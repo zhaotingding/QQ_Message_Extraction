@@ -92,15 +92,17 @@ async function show(key, record = true) {
   }
 }
 
-window.msgx.onClose(async () => {
+window.msgx.onClose(async ({ forUpdate } = {}) => {
   try {
     if (switching) throw new Error('页面正在切换，请稍后关闭。')
-    const status = await app.call('status.read')
-    if (status.serviceRunning && !(await app.confirm('接收服务仍在运行', '停止接收服务并关闭界面？'))) {
-      await app.call('desktop.cancelClose')
-      return
+    if (!forUpdate) {
+      const status = await app.call('status.read')
+      if (status.serviceRunning && !(await app.confirm('接收服务仍在运行', '停止接收服务并关闭界面？'))) {
+        await app.call('desktop.cancelClose')
+        return
+      }
     }
-    if (active === 'reader') await mounted.get(active)?.cleanup?.()
+    if (active === 'reader') await mounted.get(active)?.cleanup?.({ keepMounted: true })
     await app.call('desktop.finishClose')
   } catch (error) {
     app.notify(error.message)
@@ -112,6 +114,10 @@ async function main() {
   app.state = await app.call('desktop.bootstrap')
   app.setTheme(app.state.theme)
   document.querySelector('#version').textContent = 'v' + app.state.version + ' · Electron'
+  if (app.state.setupPending) {
+    const { showFirstRun } = await import('./first-run.js')
+    showFirstRun(app)
+  }
   await show('status')
   setInterval(refreshServiceLight, 2000)
 }

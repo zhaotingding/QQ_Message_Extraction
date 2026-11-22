@@ -1,6 +1,40 @@
 # Windows克隆、版本与图标
 
-适用：Windows源码克隆与本地轻量启动器；约定更新：2026-10-20。证据路径相对仓库根目录，本地 `data/` 记录不随Git分发。历史验收与性能只描述其日期和测量条件，不代表本轮已验证。
+适用：Windows 安装版、源码版与本地轻量启动器。证据路径相对仓库根目录，本地 `data/` 记录不随 Git 分发。历史验收与性能仅描述各日期和对应测量条件。
+
+## 安装版与公开更新
+
+安装实现统一在 `installer/`：`build_backend.py` 和 `backend_entry.py` 构建随包后台，`build-installer.mjs` 和 `installer.nsh` 构建 NSIS，`update.cjs` 与 `installed-profile.cjs` 由源码桌面与安装包共用。依赖仍从 `desktop/package.json` 解析。`uninstall.ps1` 只调用当前用户注册的目标卸载器，先用 `-WhatIf` 验证目标；测试实例必须加 `-TestBuild`。旧构建成品不因目录整理删除或搬走。
+
+用户于 2026-11-15 批准独立安装版。Windows x64 NSIS 为当前用户部署 Electron 和业务运行时。开发者继续沿用 Conda 源码链路。程序默认资料根为 `%LOCALAPPDATA%\msgx\profile`。如需沿用源码版资料，先退出原应用，再用安装版的 `--msgx-data-root` 指向原资料根。程序记住选择并原地使用资料。该参数不负责复制、迁移或改写 SQLite 内的文件路径。安装、更新和卸载保留资料。密钥沿用当前 Windows 用户的凭据管理器，QQ 与 NapCat 由各自的安装维护。
+
+安装版查询 [公开的稳定 Release](https://github.com/zhaotingding/QQ_Message_Extraction/releases)。发现新版在「帮助」显示蓝点。用户确认「更新并重启」后才下载和验证，完成摘要编辑保存和应用持有的接收服务退出后再安装。源码版用 Git 更新。正式签名和上传 Release 需分别确认，不能从实现或本地安装测试推定已有公开更新。
+
+手动安装显示程序目录页，接受新建或空目录。覆盖安装默认显示已注册的原路径。换目录时先验证目标写权限、原卸载记录及新旧程序目录与实际资料目录的关系，再确认迁移。源码仓库兼作资料根时，允许它直属的专用 `installed/`，不入 Git。卸载只管理程序目录，数据库、图片和报告不可设在其中。NSIS 复用旧卸载器保留资料，卸载失败不得在新目录解包。静默更新仍沿用原路径。资料先复用已记住的根或默认目录中的已有资料，再考虑从仓库 `installer/` 下启动安装包时可识别的源码资料。手动安装的完成页可以直接打开基础设置，自动更新重启进入工作台。基础设置复用现有主题和凭据接口，留空保持原密钥。使用 `npm.cmd run build:installer --prefix desktop -- --local-preview` 生成同安装身份的未签名本地验收包，输出到 `installer/dist/release/<版本>-project-local/`，该包关闭在线更新。
+
+实际验证使用隔离资料根，核对安装程序及后台解释器归属、设置和数据库保留、系统卸载入口、更新重启后的版本及收尾。记录本地源验证和公开 Release 验证的各自结果。用户步骤见 [README 安装版](../../../../README.md#安装版) 和 [安装版资料使用指南](../../../../docs/使用与排障.md#安装版资料位置与复用)。
+
+本地双版本测试在仓库根目录的普通 PowerShell 中运行。先按 [README 构建安装包](../../../../README.md#构建-windows-安装包) 构建后端并安装 npm 依赖，正式签名构建那一步换成：
+
+```powershell
+npm.cmd run build:installer --prefix desktop -- --test-feed http://127.0.0.1:17391/ --test-version 1.0.5
+npm.cmd run build:installer --prefix desktop -- --test-feed http://127.0.0.1:17391/ --test-version 1.0.6
+conda run -n msgx --no-capture-output python -s -m http.server 17391 --bind 127.0.0.1 --directory installer/dist/test/1.0.6
+```
+
+第一条和第二条应分别产生 `installer/dist/test/1.0.5/` 和 `1.0.6/` 下的验收安装包。安装低版本，保留起始偏好、批注和历史数据后，在该应用的「帮助」菜单检查更新并安装，确认实际重开的是高版本且资料仍在。只使用独立的「消息萃取（更新验收）」实例和合成资料。测试包不签名，更新源限制为本机回环，不能作为正式发行产物上传。正式包的签名、GitHub 下载和 Release 策略仍需要单独验收。
+
+2026-11-15 实际验收（Windows x64，回环更新源）：1.0.8 在检测到 1.0.9 时显示蓝点，点击前未下载安装包。点击更新后接收服务以退出码 0 关停，原位置的 1.0.9 自动重开并读回显式选择的资料根、QQ 设置、历史摘要和筛选偏好。卸载后安装文件和注册项移除，隔离数据库与偏好文件 SHA-256 不变。测试安装包在本机 `.ui/installer-build/test/`，无正式签名及公开发布验证。
+
+2026-11-15 目录整理后，以 `installer/dist/test/` 的 1.0.10 和 1.0.11 复验回环升级。隔离后台就绪后，应用显示蓝点，确认才下载，正常退出并在原位置重开 1.0.11。新版注册项经 `uninstall.ps1 -TestBuild -WhatIf` 核对，实际卸载移除主程序与注册项，隔离数据库和两份配置的 SHA-256 保持一致。本机日志在 `.ui/installer-layout-20261115-194755/`。实测 NSIS 卸载项的 `DisplayName` 带版本号，主程序路径取 `DisplayIcon`。脚本执行前拒绝同名进程仍在运行的情况，避免 NSIS 回退按名称终止进程，这一保护已通过卸载入口的替身测试。正式签名及 GitHub 更新未验收。
+
+安装向导本地验收见 `installer/dist/wizard-verification/in-place.json`。隔离的 1.0.12 装在 A，1.0.13 带 `/D=B` 覆盖后只有 A 的 EXE 和唯一注册项。NSIS 会先创建显式 `/D` 的空目录，实际文件仍写入注册位置。资料选择测试及隔离窗口验证覆盖已有主题、档案回显、局部保存和首次设置状态。正式身份的交互安装留给使用者确认。
+
+目录页与首次设置的后续验收见 `installer/dist/wizard-feedback/nsis-pages.log` 和 `open-setup.log`。对隔离安装器 1.0.14 操作了实际控件，确认新装可选尚不存在的非默认目录，覆盖安装显示原地址且浏览禁用，完成页可见且默认勾选基础设置。完成页启动参数在隔离应用中验证能打开基础设置，即使已有完成标记。比较目录时使用 Win32 `GetFullPathNameW`，NSIS 的同名指令会因新目录尚不存在而返回空值。
+
+2026-11-16 交互迁移验收见 `installer/dist/relocation-verification/interactive.log`。对隔离 1.0.15 包验证了覆盖时原路径预填、浏览可用、迁移确认、A 到 B 迁移。旧主程序已移除，Windows 只保留 B 的安装记录，开始菜单快捷方式指向 B，合成偏好、数据库和资料路径指针的哈希不变。`tests/test_installer_relocation.ps1` 单独验证目录、旧卸载登记和资料保护。验收使用隔离身份，正式身份的安装留给使用者。
+
+2026-11-16 项目内安装验收见 `installer/dist/project-verification/interactive.log`。隔离 1.0.16 从外部 A 原位资料迁入合成源码项目的 `installed/`，注册与快捷方式只留新地址。实际随包后台从项目根读回原主题。卸载只移除 `installed/` 内程序，合成源码仍在，偏好、数据库和资料路径指针哈希不变。正式身份留给用户验收。
 
 ## 权限与安装说明维护时读取
 

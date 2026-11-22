@@ -12,7 +12,7 @@ from typing import Callable
 
 import aiohttp
 
-from . import security, pricing
+from . import api_settings, security, pricing
 
 log = logging.getLogger("msgx.llm")
 
@@ -27,6 +27,10 @@ class APIRequestRejected(RuntimeError):
 
 class RetryableRequestError(RuntimeError):
     """连接未建立或服务端临时拒绝；单次请求重试耗尽，可由调度有限重试。"""
+
+
+class RequestNotSent(RetryableRequestError):
+    """全部尝试均在建立连接时失败，没有向模型提交请求体。"""
 
 
 class AmbiguousResponseError(RuntimeError):
@@ -88,6 +92,10 @@ class _Transient(Exception):
 
 class _FlexUnavailable(_Transient):
     """官方明确拒绝 Flex 容量；允许切换 Standard，不含未知提交。"""
+
+
+class _ConnectFailed(_Transient):
+    """单次尝试在建立连接时失败。"""
 
 
 def _flex_unavailable(status: int, body: str) -> bool:
@@ -304,6 +312,9 @@ class LLM:
                 raise RuntimeError("后台摘要材料不一致，请检查任务记录")
             self.store.clear_summary_request(request_key)
             saved = None
+        if saved is None:
+            api_settings.check_service_tier(self.llm["base_url"], payload["model"],
+                                            self.cfg.get("api", {}).get("service_tier", "default"))
         if request_key and saved is None:
             self.store.start_summary_request(request_key, metadata, started)
             saved = self.store.summary_request(request_key)
@@ -323,6 +334,12 @@ class LLM:
                 raise  # 已接受的后台任务保留 ID，不能因查询失败重新提交。
             if request_key and isinstance(exc, (RetryableRequestError, APIRequestRejected)):
                 self.store.clear_summary_request(request_key)
+            if isinstance(exc, RequestNotSent):
+                # 保留尝试记录和每日次数，但不以这次未发出的请求触发“金额未知”保护。
+                self.store.record_api_call(ts=started, purpose=purpose, source_ids=source_ids or [], model=payload["model"],
+                                           usage=None, cost_cny=0.0, status=str(exc), provider=provider,
+                                           cost_usd=0.0 if self.cfg.get("api", {}).get("currency") == "USD" else None)
+                raise
             status = f"请求被拒绝：{exc}；用量未知" if isinstance(exc, APIRequestRejected) else "请求失败，用量未知"
             self.store.record_api_call(ts=started, purpose=purpose, source_ids=source_ids or [],
                                        model=payload["model"], usage=None, cost_cny=None, status=status, provider=provider,
@@ -502,6 +519,7 @@ class LLM:
         """
         n = int(self.llm.get("post_retries", 4)) if retries is None else int(retries)
         last: Exception | str = ""
+        only_connect_failures = True
         submitted = dict(payload)  # 每次调用独占档位，不能修改共享 LLM 或其他在途任务。
         for attempt in range(1, max(1, n) + 1):
             t0 = time.time()
@@ -509,6 +527,7 @@ class LLM:
                 try:
                     data = await self._post_once(submitted)
                 except _FlexUnavailable:
+                    only_connect_failures = False
                     submitted["_service_tier"] = "default"  # 服务端已明确拒绝，立即转 Standard，不先等待 Flex 重试。
                     log.warning("Flex资源不足，当前请求切换Standard；后续费用按实际档位记录")
                     data = await self._post_once(submitted)
@@ -516,6 +535,7 @@ class LLM:
                     data["_requested_service_tier"] = submitted.get("_service_tier", self.cfg.get("api", {}).get("service_tier", "default"))
                 return data
             except _Transient as e:
+                only_connect_failures = only_connect_failures and isinstance(e, _ConnectFailed)
                 last = e
                 dt = time.time() - t0
                 if attempt >= n:
@@ -533,6 +553,8 @@ class LLM:
                 flex = (urlsplit(self.llm["base_url"]).hostname == "api.openai.com"
                         and submitted.get("_service_tier", self.cfg.get("api", {}).get("service_tier")) == "flex")
                 await asyncio.sleep(min(2 ** attempt, 30) if flex else min(0.6 * attempt, 3.0))
+        if only_connect_failures:
+            raise RequestNotSent(f"API 连接未建立，未提交请求体（尝试 {attempt} 次）：{last}")
         raise RetryableRequestError(f"请求失败（已重试 {n} 次）: {last}")
 
     async def _post_once(self, payload: dict) -> dict:
@@ -582,6 +604,7 @@ class LLM:
         async def upload():
             nonlocal queued, phase
             phase = "上传请求体"
+            log.info("API 开始上传：%.1f KiB，单次请求，每段 8 KiB", len(encoded) / 1024)
             # 同一个 HTTP 请求分段写入，不拆消息、不增加模型调用。
             # 本机约 452 KiB 大包直接写出会在 15～20 秒断连；相同内容按此节奏
             # 上传已实测成功。保留 Content-Length，避免改成 chunked 传输编码。
@@ -600,8 +623,6 @@ class LLM:
             for url in urls:
                 queued, started = 0, time.monotonic()
                 phase, request_id = "连接或发送请求", ""
-                if paced:
-                    log.info("API 开始上传：%.1f KiB，单次请求，每段 8 KiB", len(encoded) / 1024)
                 # 每次尝试都创建新的迭代器，404 路径回退和重试不能复用耗尽的正文。
                 async with s.post(url, headers=headers, data=upload() if paced else encoded, allow_redirects=False, **options) as r:
                     phase = "接收响应正文"
@@ -634,8 +655,12 @@ class LLM:
                         break
         except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError,
                 AmbiguousResponseError, json.JSONDecodeError, UnicodeDecodeError) as e:
-            if isinstance(e, aiohttp.ClientConnectorError):
-                raise _Transient(f"{type(e).__name__}（阶段：连接未建立）") from None
+            if isinstance(e, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError)) and phase == "连接或发送请求":
+                os_error = getattr(e, "os_error", None)
+                number = getattr(os_error, "winerror", None) or getattr(os_error, "errno", None)
+                code = f"，系统错误码 {number}" if isinstance(number, int) else ""
+                error_type = _Transient if last else _ConnectFailed  # 本轮若已有 HTTP 回复，保守保留未知。
+                raise error_type(f"{type(e).__name__}（阶段：连接未建立{code}）") from None
             detail = (f"API 请求中断：{type(e).__name__}；阶段={phase}；"
                       f"耗时={time.monotonic() - started:.1f}s；request_id={request_id or '未收到'}；"
                       "处理结果及用量未知；未自动重发")
@@ -643,6 +668,7 @@ class LLM:
             error = AmbiguousResponseError(detail)
             error.request_id = request_id
             raise error from None
+        log.warning("API 请求被拒绝：%s", last)  # 仅记录 _http_error 筛过的字段，不回显模型输入。
         raise APIRequestRejected(last or "请求失败")
 
     async def _read_chat_stream(self, response) -> dict:
@@ -855,6 +881,9 @@ class LLM:
         if not p.exists():
             return "", False
 
+        api_settings.check_service_tier(self.llm["base_url"], self.llm.get("vision_model", self.llm["model"]),
+                                        self.cfg.get("api", {}).get("service_tier", "default"))
+
         data, mime = await asyncio.to_thread(self._prepare_image, p)
         b64 = base64.b64encode(data).decode()
         payload = {
@@ -888,6 +917,6 @@ class LLM:
             log.warning(
                 "图片语义提取失败（上传 %.0fKB）：%s", len(data) / 1024, e
             )
-            if isinstance(e, APIRequestRejected):
+            if isinstance(e, (APIRequestRejected, RequestNotSent)):
                 raise
             return "", False

@@ -4,8 +4,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from . import prefs, yaml_config
+from .runtime_paths import PROGRAM_ROOT
 
-DEFAULT_ICON = Path(__file__).resolve().parents[2] / "assets" / "app-icon.ico"  # 公共资源属于源码，不随个人资料根迁移。
+DEFAULT_ICON = PROGRAM_ROOT / "assets" / "app-icon.ico"  # 公共资源不随个人资料根迁移。
 
 
 def selected_icon(root: Path, saved: dict | None = None, preferences_file: Path | None = None) -> Path | None:

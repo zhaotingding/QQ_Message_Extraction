@@ -53,8 +53,15 @@ class ImageAnalysis:
             self.status = {"state": "disabled", "message": "本地初筛运行，自动图片 API 已关闭"}
             return count
         usage = self.store.automatic_image_usage()
-        if usage["attempts"] >= options["daily_limit"] or usage["cost_cny"] >= options["daily_budget_cny"] or usage["unknown"]:
-            self.status = {"state": "limited", "message": "今日次数/预算已达上限，或存在用量未知请求；已暂停自动上传", **usage}
+        reason = ""
+        if usage["unknown"]:
+            reason = f"今天有 {usage['unknown']} 笔自动图片请求的用量未知"
+        elif usage["attempts"] >= options["daily_limit"]:
+            reason = f"自动图片分析今日已达 {options['daily_limit']} 次上限"
+        elif usage["cost_cny"] >= options["daily_budget_cny"]:
+            reason = "自动图片分析今日预算已用完"
+        if reason:
+            self.status = {"state": "limited", "message": reason + "，已暂停自动上传", **usage}
             return count
         account = str(self.media.cfg.get("napcat", {}).get("account", ""))
         watch = {str(value) for value in self.media.cfg.get("watch", {}).get("groups", [])}
@@ -99,10 +106,11 @@ class ImageAnalysis:
                                                after_seconds=ANALYSIS_DELAY_SECONDS)
             text, state = await self.media._run_vision(Path(row["media_path"]), row, purpose="自动图片理解", llm=llm, context=context)
             self.store.set_image_result(row["id"], vision_text=text if state == "ok" else "", vision_state=state)
-            self.store.finish_auto_image(row["id"], state if state == "ok" else "unknown")
+            self.store.finish_auto_image(row["id"], state if state in ("ok", "not_sent") else "unknown")
             if state == "ok":
                 self.store.set_image_include(row["id"], True)  # 摘要只读取已成功保存的语义。
-            self.status = {"state": state, "message": "分析已入库并纳入摘要" if state == "ok" else "分析未完成，不自动重发；可手动检查"}
+            message = {"ok": "分析已入库并纳入摘要", "not_sent": "图片请求未提交，请查看 API 配置和连接日志"}
+            self.status = {"state": state, "message": message.get(state, "分析未完成，不自动重发；可手动检查")}
         except asyncio.CancelledError:
             raise  # running 已落盘，关闭重开也不会盲目重发。
         except Exception as exc:

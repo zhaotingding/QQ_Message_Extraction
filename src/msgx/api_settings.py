@@ -35,7 +35,22 @@ def endpoint(value: str) -> str:
         raise ValueError("API 地址必须是 HTTPS 基础地址，不能包含账号、密钥、查询参数或片段") from None
 
 
-def validate(values: dict) -> dict:
+def official_gpt62(base_url: str, model: str) -> bool:
+    return (urlsplit(base_url).hostname == "api.openai.com"
+            and re.fullmatch(r"gpt-6\.2-(?:sol|astra)(?:-\d{4}-\d{2}-\d{2})?", model) is not None)
+
+
+class UnsupportedServiceTier(ValueError):
+    """在本地识别出不兼容档位，尚未发送请求。"""
+
+
+def check_service_tier(base_url: str, model: str, tier: str) -> None:
+    if tier == "flex" and official_gpt62(base_url, model):
+        raise UnsupportedServiceTier(f"OpenAI 官方 {model} 不支持 Flex。请在设置中选择 default（Standard）"
+                                     "并保存，或选用支持 Flex 的模型。")
+
+
+def validate(values: dict, *, stored: bool = False) -> dict:
     if not isinstance(values, dict):
         raise ValueError("API 配置必须是对象")
     if set(values) - set(DEFAULTS):
@@ -51,6 +66,9 @@ def validate(values: dict) -> dict:
         if not text or len(text) > 100 or any(c in text for c in "\r\n") or "sk-" in text:
             raise ValueError("服务名称或模型名称无效，请勿填写密钥")
         out[key] = text
+    # 旧档案必须能打开编辑；新保存的参数和每次新提交都校验组合，不静默改变费用。
+    if not stored:
+        check_service_tier(out["base_url"], out["model"], out["service_tier"])
     if out["protocol"] not in ("responses", "chat_completions"):
         raise ValueError("接口格式必须是 responses；旧 chat_completions 设置会迁移")
     out["protocol"] = "responses"  # 公开配置统一Responses；历史在途请求由LLM恢复原协议快照。
@@ -79,7 +97,7 @@ def validate(values: dict) -> dict:
 
 
 def apply(cfg: dict, values: dict) -> dict:
-    profile = validate(values)
+    profile = validate(values, stored=True)
     out = dict(cfg)
     out["api"] = profile
     out["llm"] = {**cfg["llm"], "base_url": profile["base_url"], "model": profile["model"],
@@ -118,7 +136,7 @@ def catalog(cfg: dict, prefs: dict) -> tuple[dict, str]:
     elif "api" in prefs:
         # 兼容初版 0.7.0 的单配置；自定义地址也原样保留。
         profiles["openai"] = prefs["api"]
-    profiles = {name: validate(value) for name, value in profiles.items()}
+    profiles = {name: validate(value, stored=True) for name, value in profiles.items()}
     if not profiles:
         raise ValueError("至少需要保留一个 API 配置")
     if any(not isinstance(name, str) or not name.isidentifier() or len(name) > 64 for name in profiles):

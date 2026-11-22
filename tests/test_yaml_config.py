@@ -117,6 +117,18 @@ class YamlTests(unittest.TestCase):
         self.assertEqual(loaded["summary"]["target_chars"], 5678)
         self.assertEqual(loaded["onebot"]["http_port"], 7654)
 
+    def test_installed_app_keeps_history_outside_its_program_subdirectory(self):
+        base = self.write("config.yaml", {})
+        with patch.object(config, "ROOT", self.root), patch.object(config, "FROZEN", True), \
+                patch.object(config, "PROGRAM_ROOT", self.root / "installed/resources"):
+            cfg = config.load(base, include_preferences=False)
+            self.assertEqual(config.abs_path(cfg, "db_path"), self.root / "data/msgx.db")
+            for key in ("db_path", "media_dir", "report_dir"):
+                with self.subTest(key=key):
+                    changed = self.write("override.yaml", {"app": {key: "data/../installed/inside"}})
+                    with self.assertRaisesRegex(ValueError, rf"app\.{key}"):
+                        config.load(changed, include_preferences=False)
+
     def test_empty_document_and_invalid_mapping(self):
         self.assertEqual(yaml_config.loads("# 空配置\n"), {})
         for text in ("- item", "plain string", "summary: [", "value: !!python/object/apply:os.system []"):

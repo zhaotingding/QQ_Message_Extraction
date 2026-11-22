@@ -7,13 +7,14 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from . import conda_runtime, security
+from .runtime_paths import FROZEN, SOURCE_DIR
 
 CREATE_NO_WINDOW = 0x08000000
-SOURCE_DIR = Path(__file__).resolve().parents[1]  # 源码目录不随用户指定的数据根改变。
 
 
 class ServiceProcess:
@@ -31,17 +32,19 @@ class ServiceProcess:
         stop_file.unlink(missing_ok=True)
         env = os.environ.copy()
         env.update(MSGX_PREFS=str(prefs_file), PYTHONUTF8="1", PYTHONNOUSERSITE="1",
-                   MSGX_CONDA_ENV=conda_runtime.environment_name(),  # 后台与界面使用同名项目环境。
-                   PYTHONPATH=str(SOURCE_DIR),  # 后台只导入本项目源码，不借用外层项目路径。
                    NO_PROXY="127.0.0.1,localhost")
         for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
             env.pop(name, None)
         env["MSGX_DESKTOP_INSTANCE"] = desktop_instance
-        args = ["-u", "-m", "msgx.main"]
+        args = []
         if config_path:
             args += ["--config", str(config_path)]
-        args += ["run", "--stop-file", str(stop_file)]
-        cmd = conda_runtime.command(*args)  # Conda 选择环境；源码入口再校验真实解释器归属。
+        if FROZEN:
+            env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+            cmd = [sys.executable, "run", *args, "--stop-file", str(stop_file)]
+        else:
+            env.update(MSGX_CONDA_ENV=conda_runtime.environment_name(), PYTHONPATH=str(SOURCE_DIR))
+            cmd = conda_runtime.command("-u", "-m", "msgx.main", *args, "run", "--stop-file", str(stop_file))
         self.proc = subprocess.Popen(cmd, cwd=str(root), env=env, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                      encoding="utf-8", errors="replace",

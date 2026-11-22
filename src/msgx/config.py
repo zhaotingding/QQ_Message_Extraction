@@ -6,13 +6,10 @@ from pathlib import Path
 from .prefs import DEFAULT_BLOCKED_SENDERS
 from . import yaml_config
 from .image_policy import DEFAULT_IMAGE_ANALYSIS
+from .runtime_paths import FROZEN, PROGRAM_ROOT
 
-PACKAGE_DIR = Path(__file__).resolve().parent      # <项目根>/src/msgx
-SRC_DIR = PACKAGE_DIR.parent                       # <项目根>/src
-# 项目根 = src 的上一层。用 src 布局后这里是三级上溯，不是两级 —— 少写一层
-# 会让 config.yaml、data/ 全部解析到 src/ 下面，表现为「配置读不到、数据库凭空重建」。
-# 允许用环境变量覆盖，便于把包安装到别处时仍能定位数据目录。
-ROOT = Path(os.environ["MSGX_ROOT"]) if os.environ.get("MSGX_ROOT") else SRC_DIR.parent
+# 源码启动默认沿用仓库资料；安装版由桌面入口传入独立资料根。
+ROOT = Path(os.environ["MSGX_ROOT"]) if os.environ.get("MSGX_ROOT") else PROGRAM_ROOT
 
 DEFAULTS: dict = {
     "app": {
@@ -133,12 +130,22 @@ def _merge(base: dict, override: dict) -> dict:
     return out
 
 
-def load(path: str | Path | None = None, *, include_preferences: bool = True) -> dict:
-    local_path = ROOT / ".ui/config.local.yaml"  # 本机主配置独立于 Git 共享默认配置。
+def config_path(path: str | Path | None = None, *, root: Path | None = None) -> Path:
     if path:
-        cfg_path = Path(path)  # 显式路径优先，保留缺文件时使用内置默认值的既有行为。
-    else:
-        cfg_path = local_path if local_path.exists() else ROOT / "config.yaml"  # 本机文件完整替代共享文件，不按字段叠加。
+        return Path(path)
+    root = ROOT if root is None else root
+    local_path = root / ".ui/config.local.yaml"
+    if local_path.exists():
+        return local_path
+    shared_path = root / "config.yaml"
+    if not FROZEN or (shared_path.is_file() and (root / "src/msgx/__init__.py").is_file()):
+        # 主动复用旧源码目录时保留原 config.yaml，包括用户在仓库中的本机改动。
+        return shared_path
+    return PROGRAM_ROOT / "config.yaml"
+
+
+def load(path: str | Path | None = None, *, include_preferences: bool = True) -> dict:
+    cfg_path = config_path(path)
     user: dict = {}
     if cfg_path.exists():
         user = yaml_config.read(cfg_path)
@@ -160,6 +167,11 @@ def load(path: str | Path | None = None, *, include_preferences: bool = True) ->
     prefs = load_from_env() if include_preferences else None
     if prefs:
         cfg = apply_to_config(cfg, prefs)
+    if FROZEN:
+        # 安装目录会被覆盖或卸载，数据库与输出不能借配置写到程序目录内。
+        for key in ("db_path", "media_dir", "report_dir"):
+            if abs_path(cfg, key).resolve().is_relative_to(PROGRAM_ROOT.parent):
+                raise ValueError(f"app.{key} 不能位于程序安装目录内，请使用独立的资料位置。")
     return cfg
 
 

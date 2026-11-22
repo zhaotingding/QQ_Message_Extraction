@@ -106,7 +106,7 @@ export function setupWorkbench(app, pages, show) {
       menu = { trigger, list }
       trigger.setAttribute('aria-expanded', 'true')
       list.hidden = false
-      list.querySelector('button')?.focus()
+      list.querySelector('button:not([hidden])')?.focus()
     }, { className: 'menu-trigger', 'aria-expanded': 'false' })
     for (const [label, action] of entries) {
       list.append(button(label, async () => {
@@ -117,6 +117,7 @@ export function setupWorkbench(app, pages, show) {
       }))
     }
     controls.append(el('div', { className: 'title-menu' }, trigger, list))
+    return { trigger, list }
   }
 
   addMenu('文件', [
@@ -133,9 +134,66 @@ export function setupWorkbench(app, pages, show) {
     ...pages.map(([key, label]) => [label, () => show(key)]),
     ['切换右侧面板', () => { if (content.childElementCount) setCollapsed(!inspector.hidden) }],
   ])
-  addMenu('帮助', [
+  const help = addMenu('帮助', [
+    ['检查更新', () => openUpdateDialog(true)],
     ['关于消息萃取', () => app.call('desktop.about', { version: app.state.version })],
   ])
+  const updateDialog = el('dialog', { className: 'update-dialog', 'aria-labelledby': 'update-dialog-title' })
+  const updateVersion = el('p', { className: 'update-version', hidden: true })
+  const updateMessage = el('p', { className: 'update-message', role: 'status' })
+  const updateProgress = el('progress', { max: 100, hidden: true, 'aria-label': '安装包下载进度' })
+  const installUpdate = button('更新并重启', async () => {
+    installUpdate.disabled = true
+    try { showUpdate(await app.call('desktop.update.install')) }
+    catch (error) { updateMessage.textContent = error.message; installUpdate.disabled = false }
+  }, { className: 'primary', hidden: true })
+  const checkUpdate = button('重新检查', () => openUpdateDialog(true))
+  const closeUpdate = button('关闭', () => updateDialog.close())
+  const updateShortcut = button('查看可用更新', () => {
+    closeMenu()
+    void openUpdateDialog(false)
+  }, { hidden: true })
+  help.list.insertBefore(updateShortcut, help.list.firstChild)
+  updateDialog.append(
+    el('h2', { id: 'update-dialog-title' }, '检查更新'),
+    updateVersion, updateMessage, updateProgress,
+    el('div', { className: 'update-actions' },
+      checkUpdate, closeUpdate, installUpdate),
+  )
+  document.body.append(updateDialog)
+  updateDialog.addEventListener('cancel', event => { if (closeUpdate.disabled) event.preventDefault() })
+
+  function showUpdate(state) {
+    const hasUpdate = Boolean(state.version)
+    help.trigger.dataset.update = hasUpdate ? 'available' : ''
+    help.trigger.setAttribute('aria-label', hasUpdate ? '帮助，有可用更新' : '帮助')
+    updateShortcut.hidden = !hasUpdate
+    updateVersion.hidden = !hasUpdate
+    updateVersion.textContent = hasUpdate ? `可用版本 ${state.version}` : ''
+    const downloading = state.phase === 'downloading'
+    updateProgress.hidden = !downloading
+    if (state.percent === null) updateProgress.removeAttribute('value')
+    else updateProgress.value = state.percent
+    updateMessage.textContent = downloading && state.percent !== null && state.percent < 100
+      ? `${state.message} ${Math.floor(state.percent)}%`
+      : state.message
+    if (state.canInstall) updateMessage.textContent += ' 安装时会安全停止接收服务并重启界面。'
+    installUpdate.hidden = !hasUpdate
+    installUpdate.disabled = !state.canInstall
+    checkUpdate.hidden = state.phase === 'unavailable' || hasUpdate
+    checkUpdate.disabled = state.phase === 'checking'
+    closeUpdate.disabled = state.phase === 'restarting'
+    if (closeUpdate.disabled && !updateDialog.open) updateDialog.showModal()
+  }
+
+  async function openUpdateDialog(check) {
+    if (!updateDialog.open) updateDialog.showModal()
+    try { showUpdate(await app.call(check ? 'desktop.update.check' : 'desktop.update.status')) }
+    catch (error) { updateMessage.textContent = error.message }
+  }
+
+  window.msgx.onUpdate(showUpdate)
+  void app.call('desktop.update.status').then(showUpdate).catch(() => {})
   document.addEventListener('pointerdown', event => {
     if (!event.target.closest('.title-menu')) closeMenu()
   })
@@ -146,7 +204,7 @@ export function setupWorkbench(app, pages, show) {
       closeMenu(true)
       event.preventDefault()
     } else if (['ArrowDown', 'ArrowUp'].includes(event.key)) {
-      const entries = [...menu.list.querySelectorAll('button')]
+      const entries = [...menu.list.querySelectorAll('button:not([hidden])')]
       const step = event.key === 'ArrowDown' ? 1 : -1
       entries[(entries.indexOf(document.activeElement) + step + entries.length) % entries.length]?.focus()
       event.preventDefault()

@@ -65,6 +65,7 @@ function mediaLabel(row) {
   if (row.vision_state === 'download_failed' || row.media_state === 'failed') return '下载失败';
   if (row.media_state === 'pending') return '待处理';
   if (row.vision_state === 'failed') return '图片未识别';
+  if (row.vision_state === 'not_sent') return '识别请求未提交';
   if (row.vision_state === 'rejected') return '请求被拒绝';
   if (row.vision_text) return '已识别';
   if (row.ocr_text) return '仅 OCR';
@@ -449,7 +450,7 @@ export function mount(container, app) {
       }
       if (image.auto_state === 'waiting') details.append(node('p', `等待上下文，最早分析时间 ${formatTime(image.auto_ready_at)}`, 'msgx-muted'));
       if (image.auto_state === 'unknown') details.append(node('p', '自动分析结果未知，请核对记录', 'msgx-muted'));
-      if (image.vision_requested_at) details.append(node('p', `最近提交图片 API：${formatTime(image.vision_requested_at)}`, 'msgx-muted'));
+      if (image.vision_requested_at) details.append(node('p', `最近尝试图片识别：${formatTime(image.vision_requested_at)}`, 'msgx-muted'));
     });
   }
 

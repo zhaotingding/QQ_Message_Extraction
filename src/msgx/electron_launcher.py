@@ -13,10 +13,10 @@ DESKTOP = Path(__file__).resolve().parents[2] / "desktop"
 
 def launch(config_path: str | None = None) -> int:
     require_environment()
-    runtime = DESKTOP / "node_modules" / "electron" / "dist" / "electron.exe"
+    runtime = DESKTOP / "node_modules" / "electron" / "dist" / "msgx-desktop.exe"
     if not runtime.is_file():
-        raise RuntimeError("缺少项目 Electron 运行时。请在仓库根目录执行 npm.cmd ci --prefix desktop，"
-                           "再执行 npm.cmd exec --prefix desktop -- install-electron。")
+        raise RuntimeError("缺少消息萃取的 Electron 界面程序。请在仓库根目录执行 npm.cmd ci --prefix desktop，"
+                           "再执行 npm.cmd run setup-runtime --prefix desktop。")
     env = {**os.environ, "MSGX_DESKTOP_PYTHON": sys.executable, "PYTHONUTF8": "1",
            "PYTHONIOENCODING": "utf-8", "PYTHONNOUSERSITE": "1"}
     env.pop("ELECTRON_RUN_AS_NODE", None)

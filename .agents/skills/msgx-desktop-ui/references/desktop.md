@@ -1,6 +1,19 @@
-# 桌面流程的隐藏约束
+# 桌面入口与已验证交互
 
-适用：0.9.9；证据路径相对仓库根目录。以下日期描述当时验证，不代表本轮重新运行生产实例。
+证据路径相对仓库根目录。2026-11-16 静态核对当前 Electron 入口；各历史日期描述当时验证，本次未启动应用。旧 Tk 经验不能替代 Electron 验收。
+
+## 现行 Electron 入口
+
+- `src/msgx/main.py` 的 `gui` 默认启动 Electron，`--legacy-tk` 才进入旧界面。`desktop/main.cjs` 管窗口、受控 IPC、Python 子进程与退出；`preload.cjs` 暴露现有 `msgx:call`，renderer 不直接使用 Node、凭据或数据库。
+- `desktop/bridge.py` 使用 `ServiceProcess`，分发业务操作；`settings_api.py` 复用 `prefs.update` 局部保存，`messages_api.py` 与 `reader_api.py` 复用 Store 和阅读/朗读实现。修正归属处，不复制整套业务到页面。
+- 默认源码运行使用项目 Conda；安装版由 `installer/` 提供运行时与独立资料根。`MSGX_ROOT`、`MSGX_PREFS` 的有效值由当前入口决定，不能把程序安装目录当可写数据目录。安装模式按 [发布参考](../../msgx-windows-release/references/windows.md)处理。
+- `reader_api._blocks/_display_text` 生成与旧阅读内容相容的显示文本，`renderer/reader.js` 用 `Array.from` 对齐字符偏移；批注写入校验 `content_hash`。修改文本渲染时核对换行、去 Markdown 标记及 emoji；不能直接用 JavaScript UTF-16 字符串下标代替已有字符坐标。
+- 朗读仍由 `src/msgx/tts.py` 的 `Narrator` 处理，`reader_api.py` 仅传普通参数并读状态。下节 SAPI 线程与暂停经验可复用，Tk 的点击坐标、`Text` 索引及定时器则仅适用旧界面。
+- 当前桌面验收入口为 `tests/electron_smoke.cjs`，从项目 Conda 环境运行，使用合成数据、模拟服务和实际 Electron 窗口。Python/Tk 测试通过不代表此入口通过；既有证据与本次实际结果分别报告。
+
+## 旧 Tk 与共用业务的历史经验
+
+以下保留 0.9.9—1.0.5 的已验证流程；涉及具体 Tk 控件和当时启动器的步骤，仅在修改旧界面或追查对应历史问题时使用。
 
 ## 进程与扫码
 
