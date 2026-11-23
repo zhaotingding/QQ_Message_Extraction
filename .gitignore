@@ -6,6 +6,7 @@ runtime/
 .venv.bak*/
 venv/
 .env
+update-private.pem
 .ui/
 .workbuddy/
 _install/

@@ -5,7 +5,7 @@
 
 **适用：Windows 10 / 11 x64。** 日常用户使用安装版。开发者可从源码运行，沿用项目专用 Conda 环境。
 
-当前版本 **1.0.6**，默认打开 Electron 界面。支持加权群活跃度、确认退群并清理消息（保留摘要）、关键词上下文定位、逐群勾选的二次确认群发和摘要语音朗读。完整变更见 [更新日志](CHANGELOG.md)。
+当前源码版本 **1.0.7**，默认打开 Electron 界面。支持加权群活跃度、确认退群并清理消息（保留摘要）、关键词上下文定位、逐群勾选的二次确认群发和摘要语音朗读。完整变更见 [更新日志](CHANGELOG.md)。
 
 | 你现在要做什么 | 从这里开始 |
 |---|---|
@@ -20,7 +20,7 @@
 
 ## 安装版
 
-公开安装包和稳定更新通过 [GitHub Releases](https://github.com/zhaotingding/QQ_Message_Extraction/releases) 提供。目前尚无公开 Release，拿到本机构建的安装包后可先本地试用。
+公开安装包和稳定更新通过 [GitHub Releases](https://github.com/zhaotingding/QQ_Message_Extraction/releases) 分发。首次安装从项目的稳定 Release 下载 Windows x64 安装 EXE。1.0.6 本地预览包关闭了在线更新，需要手动覆盖安装一次带发布公钥的版本，个人资料沿用。
 
 1. 双击 Windows x64 安装包，为当前用户安装。安装向导默认显示原程序目录或新装默认位置，也可以点「浏览」选择新的或空的程序目录。手动换目录时，确认后由原卸载器移除旧程序，再安装到新位置，个人资料留在原地。程序和业务运行时随包提供，无需先安装 Conda、Node.js 或 Git。
 2. 完成页默认勾选「打开消息萃取并进行基础设置」。点击「完成」后可选择深色或浅色主题，为已有 API 档案填写密钥，也可直接跳过。留空保留已保存的密钥，密钥由当前 Windows 用户的凭据管理器保存。收取群消息时另行准备 QQ 和 NapCat。见 [接入 QQ 与 NapCat](#接入-qq-与-napcat)。
@@ -28,7 +28,7 @@
 
 如果想把安装后的程序和源码放在同一个项目里，在目录页选择项目根下的 `installed/`。例如项目在 `D:\Dev\MCP\消息萃取-MCP`，程序便装到 `D:\Dev\MCP\消息萃取-MCP\installed`。该子目录不入库，既有资料继续在原处读写。
 
-安装版的「帮助 → 检查更新」查询公开稳定 Release。发现可用新版后，「帮助」旁显示蓝点，选择「更新并重启」才开始下载安装。程序保存摘要编辑、停止所持有的接收服务后再安装。公开更新尚需上传首个稳定 Release 及其更新文件。
+安装版启动约 10 秒后、运行期间每 6 小时，以及点击「帮助 → 检查更新」时，查询 GitHub 最新稳定 Release。客户端先用内置公钥验证更新清单，发现更高版本时显示蓝点。选择「更新并重启」后才下载、核对安装包 SHA-512，再保存编辑、停止接收服务并原位升级。签名用于更新清单；未使用 Windows 代码签名证书时，首次安装仍可能显示“未知发布者”。
 
 安装、卸载和更新实现统一在 [installer/](installer/)；新安装包输出到 `installer/dist/release/<版本>/`，隔离验收包在 `installer/dist/test/<版本>/`。已有 `.ui/installer-build/` 成品保留原位。测试包只用于本机更新验收，不作为正式发行包。
 
@@ -338,15 +338,40 @@ conda run -n msgx --no-capture-output python -s tools\build_launcher.py
 
 ### 构建 Windows 安装包
 
-在仓库根目录的普通 PowerShell 中操作，先确认项目 Conda 环境已安装 `.[build]`（见上节），并准备发布者的 Windows 代码签名。运行以下命令前请确认构建目录可写。
+**协作分工。** 开发者按功能提交、测试并提 PR。负责人审查后 Squash 合入 `main`，决定何时发布，合并 PR 不会自动发版。发版前在 PR 中同步源码版本和 CHANGELOG。协作者用公钥构建，用独立测试密钥验收，正式私钥只由发布者保管。
+
+**首次发布只做一次。** 发布者在仓库根目录的普通 PowerShell 中操作，项目 Conda 环境需含 OpenSSL 3。以下命令在仓库外生成口令加密的 Ed25519 私钥，只将公钥导出到 `installer/update-public.pem`。将公钥通过 PR 合入 `main`，私钥和口令另做离线备份。已有配对密钥可直接导出原公钥。失败时提供 OpenSSL 版本和错误文字。
+
+```powershell
+$keyDir = Join-Path $env:LOCALAPPDATA 'msgx-release-signing'
+$key = Join-Path $keyDir 'update-private.pem'
+if ((Test-Path $key) -or (Test-Path installer/update-public.pem)) { throw '已有密钥或公钥，请使用原密钥。' }
+New-Item -ItemType Directory -Path $keyDir -Force | Out-Null
+conda run -n msgx --no-capture-output openssl genpkey -algorithm ED25519 -aes-256-cbc -out $key
+if ($LASTEXITCODE) { throw '生成私钥失败' }
+conda run -n msgx --no-capture-output openssl pkey -in $key -pubout -out installer/update-public.pem
+if ($LASTEXITCODE) { throw '导出公钥失败；保留已生成的私钥，单独重试导出命令。' }
+```
+
+**每次发布。** 在已审核的 `main` 对应提交、仓库根目录的普通 PowerShell 中操作。先确认项目 Conda 环境已安装 `.[build]`、Node 满足桌面要求，使用已入库的发布公钥。构建成功会产生 EXE、同名 `.blockmap` 和 `latest.yml`。失败时提供失败命令及日志末尾。
 
 ```powershell
 conda run -n msgx --no-capture-output python -s installer/build_backend.py
+if ($LASTEXITCODE) { throw '后台构建失败' }
 npm.cmd ci --prefix desktop
+if ($LASTEXITCODE) { throw '桌面依赖安装失败' }
 npm.cmd run build:installer --prefix desktop
+if ($LASTEXITCODE) { throw '安装包构建失败' }
 ```
 
-正式构建从源码读取版本号，输出到 `installer/dist/release/<版本>/`。核对 `msgx-setup-<版本>-x64.exe`、`latest.yml` 和更新所需的配套文件。后台和中间构建文件也在 `installer/dist/`；此目录不入库，安装实现本身需要入库。命令仅在本机构建，上传稳定 Release 需要单独执行。
+**核对并签名。** 仍在仓库根目录普通 PowerShell 中执行。示例版本为 1.0.7。签名工具核对清单、实际 EXE 和包内公钥，成功会生成 `latest.yml.sig`。密钥口令由 OpenSSL 在本机提示输入。签名失败时提供报错，保留口令及私钥在本机。
+
+```powershell
+$key = Join-Path $env:LOCALAPPDATA 'msgx-release-signing/update-private.pem'
+conda run -n msgx --no-capture-output node installer/sign-release.mjs installer/dist/release/1.0.7 $key
+```
+
+**在 GitHub 发布。** 负责人在 Releases 新建草稿，选择打包的同一个提交，标签为 `v1.0.7`（后续用对应版本）。把同一次构建的 `msgx-setup-1.0.7-x64.exe`、对应 `.exe.blockmap`、`latest.yml`、`latest.yml.sig` 四个文件作为附件，发布为最新稳定版。下个版本重复构建、签名、发布即可。使用者只需首次手动下载安装 EXE，之后从应用内更新。密钥遗失或泄露时，从可信渠道重新分发带新公钥的安装包，让用户手动安装并恢复更新。
 
 本地安装向导验收可在最后一条命令添加 `-- --local-preview`，输出到 `installer/dist/release/<版本>-project-local/`，包名带 `unsigned`，沿用同一安装标识，在线更新关闭。隔离的双版本更新验证见 [安装版与公开更新](.agents/skills/msgx-windows-release/references/windows.md#安装版与公开更新)。
 

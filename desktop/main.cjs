@@ -3,7 +3,7 @@ const { spawn } = require('node:child_process')
 const { createInterface } = require('node:readline')
 const { pathToFileURL } = require('node:url')
 const path = require('node:path')
-const { msgxInstalled, msgxLocalUpdateTest = false, msgxLocalPreview = false } = require('./package.json')
+const { msgxInstalled, msgxLocalUpdateTest = false, msgxLocalPreview = false, msgxTestFeed } = require('./package.json')
 
 const entry = 'msgx://app/index.html'
 const resources = path.join(__dirname, 'renderer')
@@ -280,6 +280,13 @@ if (!app.requestSingleInstanceLock()) {
     window.webContents.on('will-navigate', event => event.preventDefault())
     const updater = installed && !msgxLocalPreview && process.platform === 'win32'
       ? require('electron-updater').autoUpdater : null
+    if (updater) {
+      const { configureSignedFeed } = require(path.join(installerRoot, 'signed-feed.cjs'))
+      const fs = require('node:fs')
+      const keyPath = path.join(programRoot, 'update-public.pem')
+      configureSignedFeed(updater, require('electron-updater/out/providers/Provider'),
+        () => fs.readFileSync(keyPath, 'utf8'), msgxLocalUpdateTest && msgxTestFeed)
+    }
     updates = createUpdates(updater, {
       notify: state => {
         if (!window.isDestroyed()) window.webContents.send('msgx:update', state)
