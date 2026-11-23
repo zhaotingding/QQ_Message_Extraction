@@ -73,6 +73,25 @@ function mediaLabel(row) {
   return row.has_media ? '已跳过' : '—';
 }
 
+// 匹配及截取在 Python 完成，浏览器仅将命中片段作为纯文本标绿。
+function keywordExcerpt(row, action) {
+  const item = control('', action);
+  item.className = 'keyword-excerpt';
+  for (const [text, hit] of row.keyword_excerpt) {
+    item.append(hit ? node('mark', text) : document.createTextNode(text));
+  }
+  return item;
+}
+
+function keywordLabels(row) {
+  const group = node('div');
+  for (const { rule, examples } of row.keyword_labels) {
+    const label = examples.join('、') || (rule.startsWith('re:') ? '正则匹配' : rule);
+    group.append(Object.assign(node('span', label, 'keyword-label'), { title: rule }));
+  }
+  return group;
+}
+
 function imageCell(row) {
   const state = mediaLabel(row);
   if (!row.image_id) return state;
@@ -206,7 +225,7 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
   let activity = {};
   let account = '';
   const imageBusy = saved.imageBusy || new Set();
-  let activeView = listOnly || saved.activeView === 'details' ? 'list' : saved.activeView || 'list';
+  let activeView = listOnly ? 'list' : ['related', 'keywords', 'broadcast'].includes(saved.activeView) ? saved.activeView : 'activity';
   let selectedId = null;
   let selectedDetails;
   let contextId = null;
@@ -252,7 +271,7 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
   const countLabel = node('label', '条数');
   countLabel.append(limit);
   const refreshButton = decorateAction(control('立即刷新', () => refresh(true)), 'refresh');
-  const backLive = control('返回实时', () => changeFilter());
+  const backLive = control('返回关键词消息', () => switchView('keywords'));
   backLive.hidden = true;
   const status = node('p', '正在读取消息…', 'msgx-muted');
   status.setAttribute('aria-live', 'polite');
@@ -272,6 +291,7 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
     const view = node('section', null, `msgx-message-view msgx-view-${id}`);
     panel.append(view);
     views.set(id, view);
+    if (id === 'list') continue; // 主页显示实时列表；此处仅在定位同群上下文时进入列表。
     const icons = { list: 'messages', activity: 'usage', related: 'person', keywords: 'tag', broadcast: 'send' };
     const button = decorateAction(control(name, () => switchView(id)), icons[id]);
     tabButtons.set(id, button);
@@ -325,7 +345,7 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
   });
   const keywordBar = node('div', null, 'toolbar msgx-toolbar');
   keywordBar.append(ruleEdit, previousKeyword, nextKeyword);
-  const keywordGrid = grid(['时间', '群', '发送者', '命中关键词', '内容']);
+  const keywordGrid = grid(['时间', '内容', '命中关键词', '群', '发送者']);
   keywordView.append(keywordBar, keywordNote, keywordGrid.wrap);
 
   const compose = node('textarea');
@@ -334,6 +354,9 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
   compose.placeholder = '输入群发消息正文';
   compose.setAttribute('aria-label', '群发消息正文');
   compose.value = saved.draft || '';
+  const interval = Object.assign(node('input'), { type: 'number', min: '1', max: '3600', step: '1', required: true, value: saved.interval || '30' });
+  const intervalLabel = node('label', '群间隔（秒）');
+  intervalLabel.append(interval);
   const send = control('预览群发范围…', () => showOperation('broadcast'));
   const history = control('读取最近操作记录', () => loadJob(''));
   const stop = control('停止后续发送', async () => {
@@ -350,7 +373,7 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
     if (!disposed) loadJob(id);
   });
   const operationBar = node('div', null, 'toolbar msgx-toolbar');
-  operationBar.append(send, stop, history);
+  operationBar.append(intervalLabel, send, stop, history);
   const operationStatus = node('p', '尚未执行群操作', 'msgx-muted');
   operationStatus.setAttribute('role', 'status');
   const results = grid(['群名', '群号', '结果', '说明 / 消息 ID']);
@@ -364,10 +387,18 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
   }
 
   function switchView(id, fetch = true) {
+    if (id !== 'list' && contextId) {
+      contextVersion++;
+      contextId = null;
+      backLive.hidden = true;
+    }
     activeView = id;
+    for (const element of [countLabel, filter.label]) element.hidden = id !== 'list' || !!contextId;
+    toolbar.hidden = id === 'broadcast';
+    group.label.hidden = !!contextId;
     for (const [key, view] of views) {
       view.hidden = key !== id;
-      tabButtons.get(key).setAttribute('aria-pressed', String(key === id));
+      tabButtons.get(key)?.setAttribute('aria-pressed', String(key === id));
     }
     if (!jobInitialized && (id === 'activity' || id === 'broadcast')) {
       jobInitialized = true;
@@ -416,7 +447,7 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
     fill(messageGrid, rows.map(row => ({
       id: row.id,
       className: [
-        row.vision_requested_at || row.vision_text ? 'msgx-vision-row' : row.keyword_matches?.length ? 'msgx-hit-row' : '',
+        row.vision_requested_at || row.vision_text ? 'msgx-vision-row' : '',
         row.relation === 'self' || row.relation === 'reply' ? 'msgx-related-row' : '',
         selectedId === row.id ? 'msgx-selected-row' : '',
       ].join(' '),
@@ -579,8 +610,8 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
       nextKeyword.disabled = !result.more;
       fill(keywordGrid, keywordRows.map(row => ({
         id: row.id, className: 'msgx-hit-row',
-        cells: [formatTime(row.ts), identityCell('group', row.group_id, groupName(row)), identityCell('sender', row.sender_id, row.sender_name), row.keyword_matches.join('、'),
-          control(snippet(row), () => locate(row.id))],
+        cells: [formatTime(row.ts), keywordExcerpt(row, () => locate(row.id)), keywordLabels(row),
+          identityCell('group', row.group_id, groupName(row)), identityCell('sender', row.sender_id, row.sender_name)],
       })), '没有关键词命中，可配置普通词或正则表达式');
     } catch (error) {
       if (disposed || version !== keywordVersion) return;
@@ -622,7 +653,8 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
           save.disabled = false;
         }
       });
-      actions.append(control('取消', () => dialog.close()), save);
+      save.classList.add('confirm-yes');
+      actions.append(save, Object.assign(control('取消', () => dialog.close()), { className: 'confirm-no' }));
       dialog.append(feedback, input, actions);
       dialog.showModal();
     } catch (error) {
@@ -770,6 +802,7 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
   async function showOperation(kind) {
     if (operationBusy || job?.state === 'running') return;
     const broadcast = kind === 'broadcast';
+    if (broadcast && !interval.reportValidity()) return;
     if (broadcast && !compose.value.trim()) {
       app.notify('请输入要群发的正文');
       compose.focus();
@@ -782,7 +815,7 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
     operationStatus.textContent = '正在核对账号与群范围…';
     try {
       const response = await app.call('messages.group-preview', broadcast
-        ? { kind, text: compose.value }
+        ? { kind, text: compose.value, interval_seconds: Number(interval.value) }
         : { kind, group_id: groupForTrend });
       if (disposed) return;
       const preview = response.result;
@@ -800,7 +833,7 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
           checkboxes.push(item.input);
           candidates.append(item.label);
         }
-        dialog.append(candidates, node('h3', '完整正文'), node('pre', preview.text, 'msgx-preview-text'));
+        dialog.append(candidates, node('p', `每个群之间间隔 ${preview.interval_seconds} 秒`), node('h3', '完整正文'), node('pre', preview.text, 'msgx-preview-text'));
       } else {
         const target = preview.groups[0];
         dialog.append(node('h3', `${target.group_name}（${target.group_id}）`),
@@ -846,7 +879,8 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
         ack.input.checked = false;
         updateSelection();
       };
-      actions.append(control('取消', () => dialog.close()), submit);
+      submit.classList.add('confirm-yes');
+      actions.append(submit, Object.assign(control('取消', () => dialog.close()), { className: 'confirm-no' }));
       dialog.append(node('p', '预览 5 分钟内有效。账号或群范围变化后请重新预览。', 'msgx-muted'), ack.label, actions);
       dialog.addEventListener('close', () => {
         if (!submitting) {
@@ -884,7 +918,7 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
     app.state[stateKey] = {
       activeView, contextId, selectedId, trend: groupForTrend, ascending, keywordOffset,
       filter: filter.input.value, group: group.input.value, sender, auto: auto.input.checked,
-      limit: limit.value, period: period.input.value, draft: compose.value, imageBusy,
+      limit: limit.value, period: period.input.value, draft: compose.value, interval: interval.value, imageBusy,
     };
     disposed = true;
     clearInterval(timer);

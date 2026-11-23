@@ -133,13 +133,6 @@ async function desktopCall(event, action, payload) {
     openSetup = false
     return {}
   }
-  if (action === 'desktop.confirm') {
-    const value = await dialog.showMessageBox(window, {
-      type: 'question', title: String(payload.title), message: String(payload.text),
-      buttons: ['取消', '确认'], defaultId: 0, cancelId: 0, noLink: true
-    })
-    return value.response === 1
-  }
   if (action === 'desktop.copy') {
     clipboard.writeText(String(payload.text))
     return true

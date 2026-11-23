@@ -223,14 +223,10 @@ async function run() {
           message:[{type:'text',data:{text:'同名与跨群筛选验收 '+id}}]})})
       assert.equal((await insert.json()).results[0].ok,true)
     }
-    await evaluate("document.querySelector('[data-page=messages]').click()")
-    try {
-      await wait(() => evaluate("document.querySelector('#page-messages')?.textContent.includes('Electron 实时验收入库')"), '实时消息未显示')
-    } catch (error) {
-      throw new Error(error.message + '\n' + await evaluate("document.body.innerText.slice(0, 1500)") + '\n' + startup)
-    }
+    await evaluate("document.querySelector('[data-page=status]').click()")
+    await wait(() => evaluate("document.querySelector('.home-feed')?.textContent.includes('Electron 实时验收入库')"), '主页实时消息未显示')
     console.log('实际接收进程、隔离入库和消息页面通过')
-    // 在消息页模拟协议连接与断开，检查顶层提示灯能跨页面更新。
+    // 模拟协议连接与断开，检查顶层提示灯能跨页面更新。
     protocol = new WebSocket('ws://127.0.0.1:' + ws + '/onebot/ws', {
       headers: { 'X-Self-ID': '100001' },
     })
@@ -247,7 +243,7 @@ async function run() {
     await wait(() => evaluate("document.querySelector('#inspector-content').textContent.includes('Electron 实时验收入库')"), '消息详情未显示')
     await evaluate("document.querySelector('#inspector-toggle').click()")
     assert.equal(await evaluate("document.querySelector('#inspector').hidden"), true)
-    await evaluate("[...document.querySelectorAll('.msgx-tab-bar button')].find(b => b.textContent === '消息详情').click()")
+    await evaluate("document.querySelector('#inspector-toggle').click()")
     assert.equal(await evaluate("document.querySelector('#inspector').hidden"), false)
     await capture('messages.png')
     await send('Emulation.setDeviceMetricsOverride', { width: 900, height: 640, deviceScaleFactor: 1, mobile: false })
@@ -257,7 +253,7 @@ async function run() {
     await evaluate("document.querySelector('[aria-label=后退]').click()")
     await wait(() => evaluate("!!document.querySelector('#page-logs .status-console')"), '后退未切回上一页日志')
     await evaluate("document.querySelector('[aria-label=前进]').click()")
-    await wait(() => evaluate("document.querySelector('#inspector-title').textContent === '消息详情'"), '前进未切回消息页')
+    await wait(() => evaluate("document.querySelector('#inspector-title').textContent === '接收概览'"), '前进未切回消息页')
     console.log('标题栏、菜单、前进后退、详情切换与窄窗侧栏通过')
     console.log(await require('./electron_reader_smoke.cjs')(evaluate, capture))
     assert.match(await fs.readFile(path.join(isolated, '.ui', 'preferences.yaml'), 'utf8'),
@@ -270,6 +266,14 @@ async function run() {
     await capture('status.png')
     await wait(() => evaluate("document.querySelector('.service-switch:not(:disabled)')?.title === '停止服务'"), '红色停止开关未就绪')
     assert.equal(await evaluate("getComputedStyle(document.querySelector('.service-switch')).backgroundColor"), 'rgb(170, 52, 68)')
+    await evaluate("window.msgx.call('desktop.requestClose')")
+    await wait(() => evaluate("!!document.querySelector('.action-confirm[open]')"), '关闭服务未弹出确认')
+    assert.deepEqual(await evaluate("[...document.querySelectorAll('.action-confirm button')].map(b=>[b.textContent,getComputedStyle(b).backgroundColor])"),
+      [['确认','rgb(25, 104, 62)'],['取消','rgb(148, 54, 68)']])
+    assert.equal(await evaluate("document.activeElement.textContent"), '取消')
+    await send('Input.dispatchKeyEvent', {type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27})
+    await send('Input.dispatchKeyEvent', {type:'keyUp',key:'Escape',code:'Escape',windowsVirtualKeyCode:27})
+    await wait(() => evaluate("!document.querySelector('.action-confirm[open]')"), 'Esc 未取消')
     await evaluate("document.querySelector('.service-switch').click()")
     await wait(() => evaluate("window.msgx.call('status.read').then(s => !s.serviceRunning)"), '接收服务未停止')
     await light('idle')

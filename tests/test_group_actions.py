@@ -90,6 +90,23 @@ class GroupActionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(params["message"], [{"type": "text", "data": {"text": preview["text"]}}])
         self.assertTrue(all(item["state"] == "sent" for item in job["groups"]))
 
+    async def test_interval_is_bound_to_preview_and_stop_interrupts_wait(self):
+        self.actions = GroupActions(self.pipe)
+        self.assertEqual((await self.preview())["interval_seconds"], 30)
+        for invalid in (False, 0, -2, 1.5, 3601):
+            with self.assertRaisesRegex(ValueError, "间隔"):
+                await self.preview(interval_seconds=invalid)
+        first = asyncio.Event()
+        self.after_send = first.set
+        preview = await self.preview(interval_seconds=600)
+        job = await self.actions.confirm(preview["token"], True, ["11", "22"])
+        await asyncio.wait_for(first.wait(), 1)
+        await asyncio.sleep(0.02)
+        self.assertEqual(len(self.external_calls()), 1)
+        self.actions.cancel(job["id"])
+        await asyncio.wait_for(self.actions.task, 1)
+        self.assertEqual([g["state"] for g in self.store.group_job(job["id"])["groups"]], ["sent", "not_sent"])
+
     async def test_empty_watch_never_means_broadcast_all(self):
         self.pipe.watch.clear()
         with self.assertRaisesRegex(ValueError, "禁止群发"):

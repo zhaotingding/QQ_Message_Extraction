@@ -12,14 +12,14 @@ from .protocol_session import ActionRejected
 
 
 class GroupActions:
-    def __init__(self, pipe, *, prefs_path=None, delay=1.0):
+    def __init__(self, pipe, *, prefs_path=None, delay=30):
         self.pipe = pipe
         self.prefs_path = Path(prefs_path) if prefs_path else None
         self.delay = delay
         self.previews = {}
         self.task = None
         self.busy = False
-        self.cancelled = False
+        self.stop_wait = asyncio.Event()
         self.active_id = ""
         self.pipe.store.recover_group_jobs()
 
@@ -90,6 +90,11 @@ class GroupActions:
                    "groups": [{"group_id": gid, "group_name": members[gid]} for gid in ids],
                    "excluded": sorted(set(watch)-members.keys()), "expires_at": time.time()+300,
                    "connection": connection}
+        if kind == "broadcast":
+            interval = body.get("interval_seconds", self.delay)
+            if "interval_seconds" in body and (type(interval) is not int or not 1 <= interval <= 3600):
+                raise ValueError("群发间隔须为 1～3600 的整数秒")
+            preview["interval_seconds"] = interval
         if kind == "leave":
             preview["message_count"] = self.pipe.store.group_message_count(ids[0])
         self.previews = {token: preview}  # 新预览使旧确认失效，不累计可重放的发送草稿。
@@ -142,7 +147,8 @@ class GroupActions:
                    "created_at": time.time(), "state": "running", "note": "开始执行，逐群返回结果",
                    "groups": [{**group, "state": "pending"} for group in preview["groups"]]}
             self.pipe.store.save_group_job(job)
-            self.active_id, self.cancelled = token, False
+            self.active_id = token
+            self.stop_wait.clear()
             self.task = asyncio.create_task(self._run(preview, job))
             return job
         except BaseException:
@@ -152,7 +158,7 @@ class GroupActions:
     def cancel(self, job_id):
         if job_id != self.active_id or not self.busy:
             raise ValueError("该操作已结束或不属于当前任务")
-        self.cancelled = True  # 只停止未发群，已提交或已成功的消息不能视为撤回。
+        self.stop_wait.set()  # 只停止未发群，已提交或已成功的消息不能视为撤回。
 
     @staticmethod
     def _summarize(kind: str, groups) -> tuple[str, str]:
@@ -178,11 +184,11 @@ class GroupActions:
         fatal = False  # 连接断开、配置变化、结果未知：必须停止整批，不能继续猜
         try:
             for index, group in enumerate(job["groups"]):
-                if self.cancelled:
+                if self.stop_wait.is_set():
                     reason = "已停止后续群；已提交的消息不会撤回"
                     break
                 await self._validate(preview)  # 每群发送前重新验证配置、身份和冻结名单。
-                if self.cancelled:
+                if self.stop_wait.is_set():
                     reason = "已停止后续群；本次核对结束后未提交新消息"
                     break  # 用户可能在等待群列表响应期间取消，发送前必须再次检查。
                 gid = group["group_id"]
@@ -216,7 +222,9 @@ class GroupActions:
                     group.update(state="cleaned", **result, note="已退群并清理消息，摘要保留")
                 self.pipe.store.save_group_job(job)
                 if index+1 < len(job["groups"]):
-                    await asyncio.sleep(self.delay)
+                    # 仅在两次发送之间等待，停止操作可立即唤醒等待中的任务。
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(self.stop_wait.wait(), preview["interval_seconds"])
         except asyncio.CancelledError:
             reason, fatal = "服务关闭，未恢复或重发操作", True
         except Exception as exc:

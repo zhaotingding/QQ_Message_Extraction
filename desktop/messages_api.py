@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from msgx import prefs
-from msgx.message_keywords import compile_rules, matching_message
+from msgx.message_keywords import compile_rules, keyword_preview, matching_message
 from msgx.ui.common import open_path
 
 
@@ -120,7 +120,11 @@ def handle(ctx, action, payload):
                                                   keyword_rules=rules, offset=max(0, int(payload.get("offset", 0))))
         except FileNotFoundError:
             items = []
-        return {"items": _decorate(items[:200], rules), "more": len(items) > 200}
+        rows = _decorate(items[:200], rules)
+        if action == "messages.keywords":
+            for row in rows:
+                row.update(keyword_preview(rules, row))
+        return {"items": rows, "more": len(items) > 200}
     if action == "messages.image-open":
         return _open_image(ctx, payload)
     if action in ("messages.vision", "messages.summary-include"):
@@ -137,6 +141,8 @@ def handle(ctx, action, payload):
                 "watch_groups": sorted(str(gid) for gid in ctx.cfg["watch"]["groups"])}
         if kind == "broadcast":
             body["text"] = payload["text"]
+            if "interval_seconds" in payload:
+                body["interval_seconds"] = payload["interval_seconds"]
         elif kind == "leave":
             body["group_id"] = str(payload["group_id"])
         data = ctx.request("/groups/operations/preview", method="POST", payload=body, timeout=35)

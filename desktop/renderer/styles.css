@@ -1,4 +1,13 @@
+.action-confirm { width: min(420px, 88vw); padding: 22px; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 12px; }
+.action-confirm h2 { margin: 0; }
+.action-confirm p { margin-block: 12px 20px; }
+.action-confirm::backdrop { background: rgb(0 0 0 / .55); }
+.confirm-actions { display: flex; gap: 10px; justify-content: flex-end; }
+dialog button.confirm-yes { background: #19683e; border-color: #388659; color: white; }
+dialog button.confirm-no { background: #943644; border-color: #b35664; color: white; }
+dialog button:is(.confirm-yes,.confirm-no):hover:enabled { filter: brightness(1.13); }
 :root {
+  --keyword-ink: #71dc94;
   color-scheme: dark;
   --bg: #1b1b1b;
   --panel: #222;
@@ -24,6 +33,7 @@
   font: 16px/1.55 "Segoe UI", "Microsoft YaHei UI", sans-serif;
 }
 [data-theme="light"] {
+  --keyword-ink: #12733d;
   color-scheme: light;
   --bg: #fafafa;
   --panel: #f4f4f4;

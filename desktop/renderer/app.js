@@ -1,4 +1,4 @@
-import { button, el } from './controls.js'
+import { button, el, confirmAction } from './controls.js'
 import { setupWorkbench } from './workbench.js'
 
 const pages = [
@@ -25,7 +25,7 @@ const app = {
     }
   },
   navigate: key => show(key),
-  confirm: (title, text) => window.msgx.call('desktop.confirm', { title, text }),
+  confirm: confirmAction,
   setTheme(name) {
     app.state.theme = name === 'light' ? 'light' : 'dark'
     document.documentElement.dataset.theme = app.state.theme
