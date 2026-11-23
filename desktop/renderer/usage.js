@@ -1,7 +1,8 @@
 import {el} from "./controls.js";
 
-const money = value => value == null ? "未知" : Number(value).toFixed(6);
-const amount = (value, unknown) => money(value) + (unknown ? ` + ${unknown} 次未知` : "");
+const sumLabel = (value, unit) => (unit === "usd" ? "$" : "¥") + Number(value).toFixed(6);
+const native = (row, unit) => row[unit] == null ? "—" : sumLabel(row[unit], unit);
+const number = value => value == null ? "—" : new Intl.NumberFormat("zh-CN").format(value);
 const beijing = new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
     timeZone: "Asia/Shanghai", hourCycle: "h23",
@@ -9,21 +10,16 @@ const beijing = new Intl.DateTimeFormat("zh-CN", {
 const colors = ["#6ea8ff", "#d48c26", "#43ba88", "#a97cf0"];
 const priceProvider = row => `${row.provider || "历史未记录"} / ${row.model || "未知"}`;
 const groupColumns = [
-    ["用途", row => row.purpose], ["消息类型", row => row.source_type], ["请求数", row => row.calls, "calls"],
-    ["输入 Token", row => row.in_tokens, "in_tokens"], ["输出 Token", row => row.out_tokens, "out_tokens"],
-    ["总金额（元）", row => amount(row.cost_cny, row.unknown_calls), "cost_cny"],
-    ["今日消费（元）", row => amount(row.today_cost_cny, row.today_unknown_calls), "today_cost_cny"],
-    ["平台 / 模型", priceProvider], ["美元", row => amount(row.cost_usd, row.unknown_usd_calls), "cost_usd"],
+    ["API / 模型", priceProvider], ["用途", row => row.purpose], ["成功请求", row => number(row.calls), "calls"],
+    ["输入 Token", row => number(row.in_tokens), "in_tokens"], ["输出 Token", row => number(row.out_tokens), "out_tokens"],
+    ["美元 USD", row => native(row, "usd"), "usd"], ["人民币 CNY", row => native(row, "cny"), "cny"],
 ];
 const detailColumns = [
-    ["时间（北京）", row => beijing.format(new Date(row.ts * 1000))],
-    ["用途", row => row.purpose], ["关联消息", row => row.source_label],
-    ["输入", row => row.in_tokens, "in_tokens"], ["输出", row => row.out_tokens, "out_tokens"],
-    ["缓存读命中", row => row.cache_hit_tokens, "cache_hit_tokens"],
-    ["总金额（元）", row => money(row.cost_cny), "cost_cny"],
-    ["结果", row => row.status], ["今日消费（元）", row => money(row.today_cost_cny), "today_cost_cny"],
-    ["平台 / 模型", priceProvider], ["美元", row => money(row.cost_usd), "cost_usd"],
-    ["服务层级", row => row.tier_label], ["缓存写入", row => row.cache_write_tokens, "cache_write_tokens"],
+    ["时间（北京）", row => beijing.format(new Date(row.ts * 1000))], ["API / 模型", priceProvider],
+    ["关联消息", row => row.source_label], ["用途", row => row.purpose], ["结果", row => row.status],
+    ["输入 Token", row => number(row.in_tokens), "in_tokens"], ["输出 Token", row => number(row.out_tokens), "out_tokens"],
+    ["美元 USD", row => native(row, "usd"), "usd"], ["人民币 CNY", row => native(row, "cny"), "cny"],
+    ["服务层级", row => row.tier_label], ["缓存读取", row => number(row.cache_hit_tokens), "cache_hit_tokens"],
 ];
 
 function usageTable(columns, onSelect) {
@@ -64,72 +60,68 @@ function usageTable(columns, onSelect) {
 }
 
 function trendChart(data) {
-    const series = Object.entries(data.trend);
+    const currency = el("select", {ariaLabel: "图表币种"},
+        el("option", {value: "usd"}, "美元 USD"), el("option", {value: "cny"}, "人民币 CNY"));
+    if (!data.daily.some(row => row.usd > 0) && data.daily.some(row => row.cny > 0)) currency.value = "cny";
+    const day = el("select", {ariaLabel: "查询每日金额"}, data.days.map(d => el("option", {value: d}, d)));
+    day.value = data.days.at(-1);
+    const canvas = el("div");
+    const legend = el("div", {className: "usage-legend"});
     const note = el("p", {className: "reader-meta", ariaLive: "polite"});
-    if (!series.length) return el("p", {textContent: "暂无消费趋势"});
-    const ns = "http://www.w3.org/2000/svg";
-    function svg(tag, attrs, content = "") {
-        const node = document.createElementNS(ns, tag);
-        for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
-        if (content) node.textContent = content;
-        return node;
+    function svg(tag, attrs, text) {
+        const n = document.createElementNS("http://www.w3.org/2000/svg", tag);
+        for (const [name, value] of Object.entries(attrs)) n.setAttribute(name, value);
+        if (text) n.textContent = text;
+        return n;
     }
-    const chart = svg("svg", {viewBox: "0 0 860 225", role: "img", "aria-label": "最近三十天的消费趋势"});
-    const width = 780, left = 58, top = 18, height = 177;
-    const days = series[0][1];
-    const max = Math.max(0.000001, ...series.flatMap(([, rows]) => rows.map(row => row.cost_cny ?? 0)));
-    const x = index => left + width * index / (days.length - 1);
-    const y = value => top + height * (1 - value / max);
-    for (let row = 0; row <= 4; row++) {
-        const pos = top + row * height / 4;
-        chart.append(svg("line", {x1: left, x2: left + width, y1: pos, y2: pos, class: "usage-grid"}));
-        chart.append(svg("text", {x: left - 6, y: pos + 4, "text-anchor": "end"}, (max * (1 - row / 4)).toFixed(4)));
+    function renderDay(date) {
+        const unit = currency.value;
+        const amounts = data.daily.filter(row => row.day === date && row[unit] > 0);
+        const parts = amounts.map(row => priceProvider(row) + " " + sumLabel(row[unit], unit));
+        note.textContent = date + " · " + (parts.join("　") || sumLabel(0, unit));
     }
-    for (const [index, [, rows]] of series.entries()) {
-        let path = "", previousKnown = false;
-        for (const [i, row] of rows.entries()) {
-            if (row.cost_cny === null) {
-                const px = x(i), py = y(0) - 3 - index * 7;
-                chart.append(svg("path", {d: `M ${px-3} ${py-3} l 6 6 m -6 0 l 6 -6`, stroke: "#d48c26"}));
-                previousKnown = false;
-            } else {
-                const px = x(i), py = y(row.cost_cny);
-                path += `${previousKnown ? "L" : "M"} ${px} ${py} `;
-                chart.append(svg("circle", {cx: px, cy: py, r: 2, fill: colors[index]}));
-                previousKnown = true;
-            }
+    function draw() {
+        const unit = currency.value;
+        const chart = svg("svg", {viewBox: "0 0 900 210", role: "img", "aria-label": "按 API 和请求日期统计的每日消费柱状图"});
+        const names = [...new Set(data.daily.filter(row => row[unit] > 0).map(priceProvider))];
+        const rows = data.days.map(d => data.daily.filter(row => row.day === d && row[unit] > 0));
+        const max = Math.max(0, ...rows.map(items => items.reduce((sum, r) => sum + r[unit], 0)));
+        for (let i = 0; i <= 3; i++) {
+            const y = 172 - 150 * i / 3;
+            chart.append(svg("line", {x1: 65, x2: 891, y1: y, y2: y, class: "usage-grid"}),
+                svg("text", {x: 62, y: y + 4, "text-anchor": "end"}, Number((max*i/3).toPrecision(3)).toString()));
         }
-        chart.append(svg("path", {d: path, fill: "none", stroke: colors[index], "stroke-width": 2}));
+        rows.forEach((items, i) => {
+            const x = 70 + i*27;
+            let y = 172;
+            for (const row of items) {
+                const height = 150 * row[unit] / max;
+                y -= height;
+                const bar = svg("rect", {x, y, width: 18, height, fill: colors[names.indexOf(priceProvider(row)) % colors.length]});
+                bar.append(svg("title", {}, row.day + " · " + priceProvider(row) + " " + sumLabel(row[unit], unit)));
+                chart.append(bar);
+            }
+            const target = svg("rect", {x: x-3, y: 8, width: 26, height: 167, fill: "transparent"});
+            target.onpointerenter = () => renderDay(data.days[i]);
+            target.onclick = () => { day.value = data.days[i]; renderDay(day.value); };
+            chart.append(target);
+            if ([0,7,14,21,29].includes(i)) chart.append(svg("text", {x: x+8, y: 198, "text-anchor": "middle"}, data.days[i].slice(5)));
+        });
+        chart.onpointerleave = () => renderDay(day.value);
+        canvas.replaceChildren(chart);
+        legend.replaceChildren(...names.map((name,i) => el("span",{style: "--series-color:" + colors[i%colors.length]},name)));
+        renderDay(day.value);
     }
-    for (const index of [0, 7, 14, 21, 29]) {
-        chart.append(svg("text", {x: x(index), y: 215, "text-anchor": "middle"}, days[index].day.slice(5)));
-    }
-    const unknown = series.reduce((sum, [, rows]) => sum + rows.reduce((a, row) => a + row.unknown_calls, 0), 0);
-    const explanation = "最近 30 天 · 北京时间" + (unknown ? ` · ${unknown} 次费用未知，橙色叉号表示当日费用全部未知` : "");
-    const date = el("select", {ariaLabel: "查询每日金额"}, ...days.map((day, i) =>
-        el("option", {value: String(i), textContent: day.day})));
-    date.value = String(days.length - 1);
-    const describe = index => { note.textContent = data.trend_notes[index]; };
-    date.addEventListener("change", () => describe(Number(date.value)));
-    chart.addEventListener("pointermove", event => {
-        const point = new DOMPoint(event.clientX, event.clientY).matrixTransform(chart.getScreenCTM().inverse());
-        const relative = (point.x - left) / width;
-        describe(Math.round(Math.max(0, Math.min(1, relative)) * (days.length - 1)));
-    });
-    chart.addEventListener("pointerleave", () => describe(Number(date.value)));
-    describe(days.length - 1);
-    return el("div", {className: "usage-chart"},
-        el("div", {className: "toolbar"}, el("span", {textContent: explanation}), date),
-        chart,
-        el("div", {className: "usage-legend"}, ...series.map(([name], i) =>
-            el("span", {style: `--series-color: ${colors[i]}`, textContent: name}))),
-        note);
+    currency.onchange = draw;
+    day.onchange = () => renderDay(day.value);
+    draw();
+    return el("div", {className:"usage-chart"}, el("div",{className:"toolbar"}, currency, day), canvas, legend, note);
 }
 
 export function mount(container, app) {
     let closed = false, selection = 0;
     const status = el("p", {className: "reader-meta", ariaLive: "polite"});
-    const utc = el("p", {className: "reader-meta"});
+    const cards = el("div", {className: "spend-cards"});
     const sources = el("div", {className: "usage-sources"});
     const trend = el("div");
     const totals = usageTable(groupColumns);
@@ -139,8 +131,9 @@ export function mount(container, app) {
         el("h3", {textContent: "关联消息"}), sources);
     container.append(el("div", {className: "usage-page"},
         el("section", {className: "panel usage-section"},
-            el("div", {className: "toolbar"}, el("h3", {textContent: "消费汇总"}), refresh), status, utc, totals.node),
-        el("section", {className: "panel usage-section"}, el("h3", {textContent: "消费趋势"}), trend),
+            el("div", {className: "toolbar"}, el("h3", {textContent: "消费汇总"}), refresh), status, cards),
+        el("section", {className: "panel usage-section"}, el("h3", {textContent: "每日支出 · 近 30 天"}), trend),
+        el("section", {className: "panel usage-section"}, el("h3", {textContent: "按 API 和用途"}), totals.node),
         el("section", {className: "panel usage-section"}, el("h3", {textContent: "最近请求"}),
             el("p", {className: "reader-meta", textContent: "显示最近 500 次请求。点击关联消息查看原文，点击数字表头排序。"}), details.node),
         sourcePanel));
@@ -174,10 +167,10 @@ export function mount(container, app) {
         try {
             const data = await app.call("usage.details");
             if (closed) return;
-            status.textContent = `累计 ¥${money(data.visible_cost_cny ?? 0)} · 今日 ¥${money(data.today_cost_cny ?? 0)}（北京）· 金额为本地估算，未知费用单列`;
-            const labels = data.openai_utc_days.slice(0, 3).map(day =>
-                `${day.day} $${amount(day.cost_usd, Math.max(day.unknown_calls, day.unknown_usd_calls))}`);
-            utc.textContent = `OpenAI UTC 日用量 · ${labels.join(" · ") || "暂无记录"}。UTC 00:00 对应北京 08:00，平台账单可包含其他程序的调用。`;
+            status.textContent = "按请求发起日（北京）统计成功且有原币金额的支出。补生成计入实际调用当天。";
+            cards.replaceChildren(...[["usd","美元 USD"],["cny","人民币 CNY"]].map(([unit,label]) =>
+                el("div", {}, el("span", {}, label), el("strong", {}, sumLabel(data.totals[unit],unit)),
+                    el("small", {}, "今日 " + sumLabel(data.totals["today_"+unit],unit)))));
             totals.set(data.groups);
             details.set(data.items);
             trend.replaceChildren(trendChart(data));

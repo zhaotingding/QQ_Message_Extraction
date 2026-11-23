@@ -12,6 +12,8 @@
 .status-page > .status-commandbar { padding: 10px 16px; border-bottom: 1px solid var(--border); }
 .home-feed { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
 .home-feed .msgx-current { max-height: none; }
+.metrics .spend-line { display: flex; align-items: baseline; gap: 5px; font-size: 16px; }
+.metrics .spend-line small { font-size: 11px; color: var(--muted); }
 .home-inspector .status-overview .metrics { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
 .home-inspector .metrics > div { border: 0; padding: 0; }
 .home-inspector .metrics strong { font-size: 22px; }

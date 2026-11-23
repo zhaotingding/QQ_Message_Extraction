@@ -134,6 +134,33 @@ async def main():
               and abs(active["historical_unattributed_cny"] - .25) < 1e-8)
         reopened.close()
 
+def check_native_spending():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(Path(tmp) / "spend.db")
+        try:
+            # 同一美元请求有人民币折算额；另一个人民币请求在北京零点前。
+            start = datetime(2026, 2, 5, tzinfo=timezone(timedelta(hours=8))).timestamp()
+            for offset, usd, cny, currency, status in [
+                (1, .2, 1.45, "USD", "完成，服务等级未返回"),
+                (2, None, 7, "USD", "完成"), (3, None, 98, "CNY", "输出未完成（length）"),
+                (-1, None, .3, "CNY", "完成"), (4, 1, 7.2, "", "ok"),
+                (5, None, .9, "", "完成"), (6, None, None, "", "未知"),
+            ]:
+                store.record_api_call(ts=start+offset, purpose="摘要总结", source_ids=[], model="示例",
+                    usage={"prompt_tokens": 20, "completion_tokens": 2}, provider="示例平台",
+                    cost_usd=usd, cost_cny=cny, status=status, pricing={"currency":currency})
+            data = store.spending_dashboard("2026-02-05")
+            check("原币支出分开，失败和缺失原币金额不进入汇总",
+                  data["totals"] == {"usd": 1.2,"cny":.3,"today_usd":1.2,"today_cny":0})
+            check("北京零点分日；首页与账单一致且仅成功请求进入汇总",
+                  [d["day"] for d in data["daily"]] == ["2026-02-04","2026-02-05"]
+                  and data["totals"] == store.native_totals("2026-02-05") and data["groups"][0]["calls"] == 5)
+            check("最近请求仍保留七行原始状态", len(data["items"]) == 7)
+        finally:
+            store.close()
+
+
+check_native_spending()
 check_daily_costs()
 asyncio.run(main())
 if fails:

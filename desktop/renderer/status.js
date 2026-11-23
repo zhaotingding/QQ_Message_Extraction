@@ -5,7 +5,13 @@ import { mount as mountMessages } from './messages.js'
 const dateFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', dateStyle: 'short', timeStyle: 'short' })
 const date = value => value ? dateFormat.format(new Date(value * 1000)) : '—'
 const yuan = value => value == null ? '—' : '¥' + Number(value).toFixed(2)
-const sources = { platform: '平台', balance_diff: '余额差值', estimate: '估算' }
+function displaySpend(totals, prefix) {
+  if (!totals) return '—'
+  return ['usd', 'cny'].map(unit => {
+    const amount = totals[prefix + unit].toLocaleString('zh-CN', {minimumFractionDigits: 2, maximumFractionDigits: 4})
+    return el('span', {className: 'spend-line'}, el('small', {}, unit.toUpperCase()), amount)
+  })
+}
 const summaries = { daily: '日报', weekly: '周报', monthly: '月报' }
 
 export function mount(container, app) {
@@ -17,6 +23,7 @@ export function mount(container, app) {
   let qrMtime
   let status
   let billing
+  let spending, nextSpending = 0
   let shownReports
   const note = el('p', { className: 'muted', role: 'status' })
   const qr = el('dialog', { className: 'qr-dialog' })
@@ -83,7 +90,7 @@ export function mount(container, app) {
         statusEpoch++
         status = null
       }
-      if (action === 'status.billing') billing = result
+      if (action === 'status.billing') { billing = result; nextSpending = 0 }
       if (result.note || result.message) app.notify(result.note || result.message)
       await refresh()
     } catch (error) {
@@ -143,7 +150,10 @@ export function mount(container, app) {
     loading = true
     const epoch = statusEpoch
     try {
-      const state = await app.call('status.read', { qrMtime })
+      const readSpending = Date.now() >= nextSpending;
+      const [state, latestSpend] = await Promise.all([app.call('status.read', { qrMtime }),
+        readSpending ? app.call('usage.totals') : spending])
+      if (readSpending) { spending = latestSpend; nextSpending = Date.now() + 30000 }
       if (!live || epoch !== statusEpoch) return
       status = state
       const h = state.health
@@ -157,8 +167,8 @@ export function mount(container, app) {
       const entries = [
         ['入库消息', h.stats?.messages ?? '—'],
         ['当前连接', h.ws_conns ?? '—'],
-        ['今日消费', yuan(b.today_cny ?? h.spent_today_cny), sources[b.today_source || b.source] || (h.ok ? '估算' : '')],
-        ['累计消费', yuan(b.total_cny), sources[b.total_source || b.source]],
+        ['今日消费', displaySpend(spending, 'today_')],
+        ['累计消费', displaySpend(spending, '')],
         ['账户余额', b.balance?.ok ? yuan(b.balance.total) : '—'],
       ]
       metrics.replaceChildren(...entries.map(([label, value, detail]) => el('div', {},

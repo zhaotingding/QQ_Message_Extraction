@@ -43,18 +43,18 @@ module.exports = async function checkReaderAndUsage(evaluate, capture) {
     return true;
   })()`)
   await go('usage')
-  await wait(`document.querySelector('.usage-page')?.textContent.includes('0.001200')`, '用量明细未呈现')
+  await wait(`document.querySelector('.usage-page')?.textContent.includes('$0.000100')`, '用量明细未呈现')
   assert.equal(await evaluate(`document.querySelectorAll('.usage-chart svg').length`), 1)
-  assert.ok(await evaluate(`document.querySelector('.usage-page').textContent.includes('未知')`))
+  assert.ok(await evaluate(`!document.querySelector('.usage-page').textContent.includes('次未知') && document.querySelector('.spend-cards').textContent.includes('¥0.000000')`))
   // 未知条目可能排在前面，按关联消息选中已知账目。
   await evaluate(`[...document.querySelectorAll('.usage-source')].find(b => b.textContent.includes('消息 #')).click(); true`)
   await wait(`document.querySelector('.usage-sources')?.textContent.includes('关联消息验收文本')`, '账目关联消息未呈现')
   assert.ok(await evaluate(`(() => {
     const detail = [...document.querySelectorAll('.usage-table')].at(-1);
-    const b = [...detail.querySelectorAll('th button')].find(b => b.textContent === '总金额（元）');
+    const b = [...detail.querySelectorAll('th button')].find(b => b.textContent === '美元 USD');
     b.click();
-    return detail.tBodies[0].rows[0].cells[6].textContent === '0.001200' &&
-           detail.tBodies[0].rows[1].cells[6].textContent === '未知';
+    return detail.tBodies[0].rows[0].cells[7].textContent === '$0.000100' &&
+           detail.tBodies[0].rows[1].cells[7].textContent === '—';
   })()`), '金额排序未区分未知费用')
   await go('reader')
   await wait(`document.querySelector('textarea[aria-label="我的心得"]')?.value === 'Electron 验收心得 🧪'`, '切换后心得未恢复')
@@ -70,5 +70,5 @@ module.exports = async function checkReaderAndUsage(evaluate, capture) {
   await wait(`!document.querySelector('.reader-filters input').disabled
     && document.querySelectorAll('.reader-entry').length === 2`, '重新打开阅读页未恢复已保存筛选')
   assert.deepEqual(await evaluate(`[...document.querySelectorAll('.reader-filters input:checked')].map(b => b.value)`), ['weekly', 'monthly'])
-  return '摘要多选及偏好读回、粗读精读卡片、Unicode 批注、切换保存、费用图表与来源消息通过'
+  return '双币账单、摘要多选及偏好读回、粗读精读卡片、Unicode 批注、切换保存、费用图表与来源消息通过'
 }

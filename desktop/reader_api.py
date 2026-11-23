@@ -12,7 +12,6 @@ from msgx import prefs, summary_review, tts
 from msgx.config import abs_path
 from msgx.summarize import BEIJING, summary_chars
 from msgx.ui.common import open_path
-from msgx.usage_chart import daily_series, day_description
 
 
 KINDS = {"daily": "日报", "weekly": "周报", "monthly": "月报"}
@@ -188,12 +187,20 @@ def _narration(ctx, payload: dict) -> dict:
     return voice.status
 
 
-def _usage_details(ctx) -> dict:
+def _usage_details(ctx, totals_only=False) -> dict:
     day = datetime.now(BEIJING).date()
-    if not abs_path(ctx.cfg, "db_path").is_file():
-        return {"items": [], "groups": [], "openai_utc_days": [], "trend": {}, "trend_notes": []}
-    with ctx.read_store() as store:
-        result = store.api_usage_details(active_only=True)
+    try:
+        with ctx.read_store() as store:
+            store.conn.execute("BEGIN")
+            if totals_only:
+                return store.native_totals(day.isoformat())
+            result = store.spending_dashboard(day.isoformat())
+    except FileNotFoundError:
+        totals = dict.fromkeys(("usd", "cny", "today_usd", "today_cny"), 0.0)
+        if totals_only:
+            return totals
+        result = {"totals": totals, "daily": [], "groups": [], "items": []}
+    result["days"] = [(day - timedelta(days=i)).isoformat() for i in reversed(range(30))]
     for row in result["items"]:
         pricing = json.loads(row.get("pricing") or "{}")
         tier = row.get("service_tier") or pricing.get("requested_service_tier")
@@ -204,10 +211,6 @@ def _usage_details(ctx) -> dict:
         # 只交给渲染进程展示用得上的价格信息，不透传快照中的其它配置。
         row["pricing"] = {key: pricing[key] for key in ("input_price", "cached_price", "output_price", "currency")
                           if key in pricing}
-        row.pop("source_ids", None)
-    trend = daily_series(result.pop("daily_costs"), day)
-    result["trend"] = trend
-    result["trend_notes"] = [day_description(trend, i) for i in range(30)]
     return result
 
 
@@ -234,8 +237,8 @@ def handle(ctx, action: str, payload: dict):
     if action == "reader.narration":
         with _VOICE_LOCK:
             return _narration(ctx, payload)
-    if action == "usage.details":
-        return _usage_details(ctx)
+    if action in ("usage.details", "usage.totals"):
+        return _usage_details(ctx, totals_only=action == "usage.totals")
     if action == "usage.sources":
         with ctx.read_store() as store:
             return store.api_call_sources(int(payload["id"]))

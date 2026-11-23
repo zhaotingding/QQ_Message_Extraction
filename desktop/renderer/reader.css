@@ -87,6 +87,10 @@
 .reader-speaking { box-shadow: inset 0 -3px #ebaf40; background: #ebaf4042; }
 .usage-page { display: grid; gap: 14px; align-content: start; }
 .usage-section { min-width: 0; }
+.spend-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.spend-cards > div { display: grid; gap: 4px; border-left: 3px solid var(--accent); padding: 4px 14px; }
+.spend-cards strong { font-size: 24px; font-variant-numeric: tabular-nums; }
+.spend-cards small { color: var(--muted); }
 .usage-section h3 { margin: 0 0 6px; }
 .usage-table-wrap { max-width: 100%; max-height: 360px; overflow: auto; }
 .usage-table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
