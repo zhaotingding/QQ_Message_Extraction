@@ -107,7 +107,7 @@ export function mount(container, app) {
   async function save(section = category) {
     let values;
     if (section === 'reports') {
-      values = {summaryPrompt: summaryPrompt.value, targetChars: targetChars.value,
+      values = {summaryPrompt: summaryPrompt.value, topicPrompt: topicPrompt.value, targetChars: targetChars.value,
         promptEvolution: {enabled: promptEnabled.checked, days: promptDays.value, interval_days: promptInterval.value}};
     } else if (section === 'reception') {
       values = {groups: [...selectedGroups], filters: {...Object.fromEntries(Object.entries(filterInputs).map(([key, input]) => [key, input.checked])),
@@ -242,6 +242,7 @@ export function mount(container, app) {
       })), profileLocation,
     explain('OpenAI 费率填写 Standard 基准价。GPT-6.2 Sol / Astra 请选 default（Standard）。支持 Flex 的模型仅在明确返回容量不足时回退到 Standard。'));
 
+  const topicPrompt = make('textarea', { rows: 5, spellcheck: false });
   const summaryPrompt = make('textarea', { rows: 10, spellcheck: false });
   const targetChars = make('input', { type: 'number', min: '1', max: '100000' });
   const [promptEnabled, promptToggle] = check('启用提示词自更新');
@@ -273,7 +274,9 @@ export function mount(container, app) {
       summaryPrompt.value = view.defaultPrompt;
       notify('已恢复默认提示词，保存后生效。');
     })),
-    explain('周报使用日报字数的两倍，月报使用三倍。'), field('基础提示词', summaryPrompt), promptToggle,
+    explain('周报使用日报字数的两倍，月报使用三倍。'), field('基础提示词', summaryPrompt),
+    make('details', {}, make('summary', {}, '主题报提示词'), field('主题报写作要求', topicPrompt),
+      button('恢复主题报默认提示词', () => { topicPrompt.value = view.defaultTopicPrompt; })), promptToggle,
     row(field('取最近日报天数', promptDays), field('更新间隔（天）', promptInterval)), promptStatus,
     row(button('刷新记录', async () => showPrompt(await app.call('settings.prompt.status'))),
       button('立即更新（调用 API）', async () => {
@@ -421,6 +424,7 @@ export function mount(container, app) {
   function populateForms() {
     showProfile();
     summaryPrompt.value = view.summaryPrompt;
+    topicPrompt.value = view.topicPrompt;
     targetChars.value = view.targetChars;
     promptEnabled.checked = view.promptEvolution.enabled;
     promptDays.value = view.promptEvolution.days;

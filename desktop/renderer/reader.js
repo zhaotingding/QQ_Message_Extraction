@@ -1,4 +1,5 @@
 import {el} from "./controls.js";
+import {topicReader} from "./topics.js";
 
 const readStates = {unread: "未读", skimmed: "粗读", deep: "精读"};
 const reportKinds = {daily: "日报", weekly: "周报", monthly: "月报"};
@@ -79,11 +80,29 @@ export function mount(container, app) {
             el("div", {className: "toolbar"}, speak, pause, stop, el("label", {}, "语速 ", rate), voiceStatus)),
         article,
         el("div", {className: "panel reader-notes"}, el("label", {textContent: "我的心得"}), notes, save));
-    container.append(el("div", {className: "reader-layout"},
+    const periods = el("div", {className: "reader-layout"},
         el("aside", {className: "panel reader-side"},
             el("div", {className: "toolbar"}, el("strong", {textContent: "最近摘要"}), refresh),
             filterGroup, historyStatus, reportList, el("strong", {textContent: "主题目录"}), outline),
-        reading));
+        reading);
+    const topicPage = el("div", {className: "reader-topics", hidden: true});
+    const topics = topicReader(topicPage, app);
+    const periodTab = btn("日报 · 周报 · 月报", () => switchTab(false));
+    const topicTab = btn("主题报", () => switchTab(true));
+    periodTab.setAttribute("aria-pressed", "true");
+    topicTab.setAttribute("aria-pressed", "false");
+    container.append(el("nav", {className:"reader-tabs", ariaLabel:"报告视图"}, periodTab, topicTab), periods, topicPage);
+    async function switchTab(topic) {
+        if (topic === periods.hidden || busy) return;
+        await guarded(async () => {
+            if (topic) { await saveNotes(); await stopVoice(); }
+            periods.hidden = topic;
+            topicPage.hidden = !topic;
+            periodTab.setAttribute("aria-pressed", String(!topic));
+            topicTab.setAttribute("aria-pressed", String(topic));
+            if (topic) topics.show(); else topics.hide();
+        });
+    }
 
     function updateButtons() {
         refresh.disabled = busy;
@@ -341,6 +360,7 @@ export function mount(container, app) {
             await stopVoice();
             app.state.readerView = {id: report?.id, hash: report?.review.content_hash, scroll: article.scrollTop};
             closed = !keepMounted;
+            if (closed) topics.hide();
         });
     };
 }

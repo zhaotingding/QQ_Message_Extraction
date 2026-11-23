@@ -36,6 +36,8 @@ class Pipeline(ProtocolSession, BillingCoordinator, SummaryScheduler):
         self.llm.configure(api_key(self.cfg))
         self.media = MediaWorker(self.cfg, self.store, self.llm)
         self.summarizer = Summarizer(self.cfg, self.store, self.llm)
+        from .topic_reports import TopicReports
+        self.topics = TopicReports(self.store, self.llm)
 
         # 老库的历史金额回填（幂等、一次性）。放在这里而不是 start()：`msgx stats`
         # 这类只读命令不会调 start()，但同样要显示「累计花费」，所以两条路都得走到。
@@ -96,6 +98,7 @@ class Pipeline(ProtocolSession, BillingCoordinator, SummaryScheduler):
         if n:
             log.info("已把 %d 张上次下载失败的图片重新排入处理队列", n)
     async def stop(self) -> None:
+        await self.topics.close()
         await self.group_actions.close()  # 先固定外部操作结果，再关闭协议与数据库。
         self._stop.set()
         # 连接后群同步和延迟断线检查也归本进程，停止时取消并等待后再关闭 Store。

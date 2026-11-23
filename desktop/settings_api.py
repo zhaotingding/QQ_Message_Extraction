@@ -9,6 +9,7 @@ from msgx.runtime_paths import FROZEN, PROGRAM_ROOT
 from msgx.app_icon import selected_icon
 from msgx.config import abs_path, config_path
 from msgx.image_policy import default_keyword_rules, screen_image, validate_analysis
+from msgx.topic_reports import DEFAULT_TOPIC_PROMPT
 from msgx.summarize import DEFAULT_DIGEST_PROMPT, DIGEST_DEFAULT_CHARS
 
 
@@ -53,6 +54,8 @@ def _settings(ctx, saved):
         "managedProtocol": bool(ctx.cfg.get("napcat", {}).get("managed_dir")),
         "protocolSkipped": FROZEN and bool(ctx.cfg.get("napcat", {}).get("managed_dir")) and (PROGRAM_ROOT / "protocol-skipped").is_file(),
         "configPath": str(config_path(ctx.config_path, root=ctx.root)), "defaultPrompt": DEFAULT_DIGEST_PROMPT,
+        "defaultTopicPrompt": DEFAULT_TOPIC_PROMPT,
+        "topicPrompt": saved.get("topic_prompt") or summary.get("topic_prompt") or DEFAULT_TOPIC_PROMPT,
         "summaryPrompt": saved.get("summary_prompt") or summary.get("prompt") or DEFAULT_DIGEST_PROMPT,
         "targetChars": target_chars if 1 <= target_chars <= 100000 else DIGEST_DEFAULT_CHARS,
         "promptEvolution": {"enabled": False, "days": 7, "interval_days": 7,
@@ -151,6 +154,7 @@ def _report_changes(values, saved):
     except (TypeError, ValueError):
         raise ValueError("提示词材料须为 2～30 天，更新间隔须为 1～30 天") from None
     return {
+        **({"topic_prompt": values["topicPrompt"].strip()} if "topicPrompt" in values else {}),
         "summary_prompt": values["summaryPrompt"].strip(), "summary_target_chars": chars,
         "prompt_evolution": {**saved.get("prompt_evolution", {}), "enabled": bool(prompt["enabled"]),
                              "days": days, "interval_days": interval},

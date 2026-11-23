@@ -10,6 +10,7 @@ from pathlib import Path
 from .models import message_links
 from .message_store import MessageStore, VISION_MAX_TRIES
 from .summary_store import SummaryStore
+from .topic_store import TOPIC_SCHEMA, TopicStore
 from .usage_store import UsageStore
 from .image_analysis_store import ImageAnalysisStore, IMAGE_COLUMNS
 from .prompt_evolution import PROMPT_SCHEMA
@@ -205,7 +206,7 @@ GROUP_MIGRATIONS = (
 SCHEMA += PROMPT_SCHEMA  # 新表仅保存动态观察与任务状态，不回填或覆盖旧提示词。
 
 
-class Store(MessageStore, SummaryStore, UsageStore, ImageAnalysisStore, GroupActionStore):
+class Store(MessageStore, SummaryStore, TopicStore, UsageStore, ImageAnalysisStore, GroupActionStore):
     def __init__(self, db_path: str | Path, *, filters: dict | None = None, readonly: bool = False):
         self.filters = filters if filters is not None else {}
         p = Path(db_path)
@@ -232,6 +233,7 @@ class Store(MessageStore, SummaryStore, UsageStore, ImageAnalysisStore, GroupAct
                     self.conn.backup(dest)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self.conn.executescript(TOPIC_SCHEMA)
         self.conn.executescript(GROUP_ACTION_SCHEMA)  # 群操作流水独立于消息和已生成摘要。
         self._migrate()
         self.conn.commit()

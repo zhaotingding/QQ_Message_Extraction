@@ -60,7 +60,7 @@ class UsageStore:
         if summary_key and self.summary_request(summary_key)["accounted"]:
             return
         ids = list(dict.fromkeys(source_ids))
-        source_type = ("汇总报告" if purpose in ("日报合并", "摘要合并", "摘要成稿", "提示词更新") else "系统检查") if not ids else "多条消息汇总"
+        source_type = ("汇总报告" if purpose in ("日报合并", "摘要合并", "摘要成稿", "提示词更新", "主题报") else "系统检查") if not ids else "多条消息汇总"
         if len(ids) == 1:
             row = self.get_message(ids[0])
             source_type = {"text": "文字消息", "image": "纯图片", "mixed": "图文/附件"}.get(

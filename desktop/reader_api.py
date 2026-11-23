@@ -215,6 +215,19 @@ def _usage_details(ctx, totals_only=False) -> dict:
 
 
 def handle(ctx, action: str, payload: dict):
+    if action == "reader.topicUpdate":
+        if not ctx.service_running:
+            raise ValueError("请在主页启动接收服务，再生成主题报")
+        return ctx.request("/topics/update", method="POST", payload=payload, timeout=30)
+    if action == "reader.topics":
+        from msgx.topic_reports import candidates
+        try:
+            with ctx.read_store() as store:
+                store.conn.execute("BEGIN")
+                return {"reports": store.topic_reports(),
+                        "candidates": candidates(store) if payload.get("candidates") else []}
+        except FileNotFoundError:
+            return {"reports": [], "candidates": []}
     if action == "reader.history":
         if "kinds" in payload:
             kinds = _reader_kinds(payload["kinds"])

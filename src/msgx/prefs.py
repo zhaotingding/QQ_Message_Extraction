@@ -161,6 +161,8 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
         media["analysis"] = validate_analysis({**media.get("analysis", {}), **prefs["image_analysis"]})
     if "image_api_profile" in prefs:
         out.setdefault("media", {})["image_api_profile"] = str(prefs["image_api_profile"] or "")
+    if "topic_prompt" in prefs:
+        out.setdefault("summary", {})["topic_prompt"] = prefs["topic_prompt"]
     if "prompt_evolution" in prefs:
         out.setdefault("summary", {})["prompt_evolution"] = dict(prefs["prompt_evolution"])
 

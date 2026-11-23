@@ -312,6 +312,19 @@ async def _groups_refresh(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "groups": r["count"], **r})
 
 
+async def _topic_update(request: web.Request) -> web.Response:
+    if request.remote not in ("127.0.0.1", "::1") or not _local_edit_allowed(request) or not _auth_ok(request):
+        return web.json_response({"ok": False, "error": "仅允许本机授权 JSON 操作"}, status=403)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("name"), str):
+            raise ValueError("请填写主题名称")
+        result = request.app["pipe"].topics.request(body["name"], confirmed=body.get("confirmed"), repeat=body.get("repeat"))
+        return web.json_response({"ok": True, **result})
+    except (ValueError, RuntimeError) as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=409)
+
+
 async def _prompt_status(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, **request.app["pipe"].prompt_evolution.status()})
 
@@ -397,6 +410,7 @@ def build_app(cfg: dict, pipeline) -> web.Application:
     app.router.add_get("/summary/days", _summary_days)
     app.router.add_post("/summary/retry", _summary_retry)
     app.router.add_get("/prompt-evolution", _prompt_status)
+    app.router.add_post("/topics/update", _topic_update)
     app.router.add_post(r"/prompt-evolution/{action:update|restore}", _prompt_action)
     app.router.add_post("/groups/refresh", _groups_refresh)
     app.router.add_post(r"/groups/operations/{operation:preview|confirm|cancel}", _group_operation)
