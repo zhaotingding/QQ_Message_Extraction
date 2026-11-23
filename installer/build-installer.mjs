@@ -2,8 +2,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { parseArgs } from 'node:util'
 import { createRequire } from 'node:module'
+import { execFileSync } from 'node:child_process'
 import signing from './signed-feed.cjs'
-import { withPortableProtocol } from './portable-protocol.mjs'
+import { withPortableProtocol, componentName, componentHash, sha256 } from './portable-protocol.mjs'
 
 const installer = import.meta.dirname
 const root = path.dirname(installer)
@@ -92,9 +93,31 @@ const config = {
   },
 }
 
-await withPortableProtocol(installer, backend, stage =>
-  build({ projectDir: desktop, targets: Platform.WINDOWS.createTarget(['nsis'], Arch.x64),
-    publish: 'never', config: { ...config, extraFiles: [{ from: stage, to: 'NapCat' }] } }))
+const releaseBase = test ? publish.url.replace(/\/?$/, '/') :
+  `https://github.com/${publish.owner}/${publish.repo}/releases/download/v${appVersion}/`
+const nsis = require('app-builder-lib/out/toolsets/windows')
+const plugins = path.join(await nsis.getNsisPluginsPath(), 'x86-unicode')
+await withPortableProtocol(installer, backend, output, async support => {
+  const include = path.join(support, 'component-config.nsh')
+  fs.writeFileSync(include, [
+    `!addplugindir /x86-unicode "${plugins}"`,
+    `!define PROTOCOL_NAME "${componentName}"`, `!define PROTOCOL_HASH "${componentHash}"`,
+    `!define PROTOCOL_URL "${releaseBase}${componentName}"`, `!define PROTOCOL_SUPPORT "${support}"`,
+    `!include "${config.nsis.include}"`,
+  ].join('\n'))
+  await build({ projectDir: desktop, targets: Platform.WINDOWS.createTarget(['nsis'], Arch.x64),
+    publish: 'never', config: { ...config, nsis: { ...config.nsis, include } } })
+})
+
+// 更新器继续下载签名清单指定的主安装包；首次安装的轻量入口只信任本次构建的哈希。
+const core = config.nsis.artifactName.replace('${version}', appVersion).replace('${arch}', 'x64')
+const compiler = await nsis.getMakeNsisPath()
+execFileSync(compiler.path, ['/V2', '/INPUTCHARSET', 'UTF8',
+  `/DBOOT_PLUGINS=${plugins}`,
+  `/DBOOT_OUTPUT=${path.join(output, 'Setup.exe')}`, `/DBOOT_ICON=${icon}`,
+  `/DCORE_NAME=${core}`, `/DCORE_URL=${releaseBase}${core}`,
+  `/DCORE_HASH=${await sha256(path.join(output, core))}`, path.join(installer, 'bootstrap.nsi')],
+  { env: { ...process.env, ...compiler.env }, stdio: 'inherit', windowsHide: true })
 
 if (!preview && !fs.existsSync(path.join(output, 'latest.yml'))) {
   throw new Error('安装包未生成更新清单 latest.yml。')

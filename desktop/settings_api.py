@@ -5,6 +5,7 @@ from io import BytesIO
 from pathlib import Path
 
 from msgx import api_settings, credentials, prefs, security, yaml_config
+from msgx.runtime_paths import FROZEN, PROGRAM_ROOT
 from msgx.app_icon import selected_icon
 from msgx.config import abs_path, config_path
 from msgx.image_policy import default_keyword_rules, screen_image, validate_analysis
@@ -50,6 +51,7 @@ def _settings(ctx, saved):
     return {
         **_api_state(ctx, saved), "theme": _theme(saved), "prefsPath": str(ctx.prefs_file),
         "managedProtocol": bool(ctx.cfg.get("napcat", {}).get("managed_dir")),
+        "protocolSkipped": FROZEN and (PROGRAM_ROOT / "protocol-skipped").is_file(),
         "configPath": str(config_path(ctx.config_path, root=ctx.root)), "defaultPrompt": DEFAULT_DIGEST_PROMPT,
         "summaryPrompt": saved.get("summary_prompt") or summary.get("prompt") or DEFAULT_DIGEST_PROMPT,
         "targetChars": target_chars if 1 <= target_chars <= 100000 else DIGEST_DEFAULT_CHARS,

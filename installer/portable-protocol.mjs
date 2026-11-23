@@ -8,8 +8,9 @@ const commit = '9335843246e3b7a17944861f3ac8731a259732c2'
 const archive = 'NapCat.Shell.Windows.Node.zip'
 const mirror = `https://github.com/XingYunStar/NapCatQQ/releases/download/${tag}/${archive}`
 
-// 在构建机上取固定的无头包，终端用户安装时无需访问原发布站或系统 QQ。
-// 缓存仅用于节省下载；每次打包重新校验并在新的目录展开，避免混入旧配置。
+export const componentName = `msgx-napcat-${tag}-x64.zip`
+export const componentHash = '77397ac38d66f46383e48f08f35d5f9d37ec575c22069f62d6c600e73b4521ed'
+// 固定上游资产只作为独立 Release 附件；用户可以预下载，也可在安装过程中领取。
 async function cached(dir, name, url, digest) {
   const target = path.join(dir, name)
   if (!fs.existsSync(target)) {
@@ -25,16 +26,16 @@ async function cached(dir, name, url, digest) {
   return target
 }
 
-async function sha256(file) {
+export async function sha256(file) {
   const hash = createHash('sha256')
   for await (const chunk of fs.createReadStream(file)) hash.update(chunk)
   return hash.digest('hex')
 }
 
-export async function withPortableProtocol(installer, backend, pack) {
+export async function withPortableProtocol(installer, backend, output, pack) {
   const cache = path.join(installer, 'dist', 'components', tag)
   fs.mkdirSync(cache, { recursive: true })
-  const zip = await cached(cache, archive, mirror, '77397ac38d66f46383e48f08f35d5f9d37ec575c22069f62d6c600e73b4521ed')
+  const zip = await cached(cache, archive, mirror, componentHash)
   const license = await cached(cache, 'napcat-LICENSE.txt',
     `https://raw.githubusercontent.com/NapNeko/NapCatQQ/${commit}/LICENSE`,
     '2bbc0dba0c62fcde4adfe38ebadad0b7d4e23b06b88d9551904bbe07769dc46f')
@@ -42,7 +43,8 @@ export async function withPortableProtocol(installer, backend, pack) {
     'f0cb1ad806ba5d681f378a8cc2e539fe4b54839290eda3c814ec8994af2b8422')
   const stage = fs.mkdtempSync(path.join(cache, 'pack-'))
   try {
-    execFileSync('tar.exe', ['-xf', zip, '-C', stage], { windowsHide: true })
+    fs.mkdirSync(output, { recursive: true })
+    fs.copyFileSync(zip, path.join(output, componentName))
     fs.copyFileSync(license, path.join(stage, 'NapCat-LICENSE.txt'))
     fs.copyFileSync(nodeLicense, path.join(stage, 'Node-LICENSE.txt'))
     fs.writeFileSync(path.join(stage, 'NOTICE.txt'),

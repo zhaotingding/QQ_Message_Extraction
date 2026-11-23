@@ -59,7 +59,7 @@ export function showFirstRun(app) {
         key.value = ''
         void refreshCredential()
       }
-      if (apply && view.managedProtocol && !view.account) await app.call('status.start')
+      if (apply && view.managedProtocol && !view.protocolSkipped && !view.account) await app.call('status.start')
       await app.call('desktop.setup.complete')
       app.state.setupPending = false
       statusRequest++
@@ -93,7 +93,7 @@ export function showFirstRun(app) {
   void app.call('settings.get').then(settings => {
     if (!dialog.open) return
     view = settings
-    if (view.managedProtocol && !view.account) {
+    if (view.managedProtocol && !view.protocolSkipped && !view.account) {
       save.textContent = '开始扫码登录'
       skip.textContent = '稍后登录'
     }
@@ -101,7 +101,7 @@ export function showFirstRun(app) {
     profile.replaceChildren(...Object.entries(view.profiles).map(([id, details]) =>
       el('option', { value: id }, `${details.provider} / ${details.model}${id === view.active ? '（当前摘要）' : ''}`)))
     profile.value = view.active
-    if (!saving) status.textContent = view.managedProtocol && !view.account
+    if (!saving) status.textContent = view.protocolSkipped ? '已跳过 QQ 组件。需要接收消息时，可重新运行安装向导并勾选组件。' : view.managedProtocol && !view.account
       ? 'QQ 连接组件已随程序安装。用手机 QQ 扫码即可开始接收；API 密钥可稍后填写。'
       : '主题和密钥也可以稍后在设置中修改。'
     setControls()

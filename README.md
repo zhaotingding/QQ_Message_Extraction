@@ -20,7 +20,7 @@
 
 ## 安装版
 
-公开安装包和稳定更新通过 [GitHub Releases](https://github.com/zhaotingding/QQ_Message_Extraction/releases) 分发。首次安装从项目的稳定 Release 下载 Windows x64 安装 EXE。1.0.6 本地预览包关闭了在线更新，需要手动覆盖安装一次带发布公钥的版本，个人资料沿用。
+首次安装从 [GitHub Releases](https://github.com/zhaotingding/QQ_Message_Extraction/releases) 下载在线入口 `Setup.exe`。它会取得并校验主程序，随后显示目录和组件选择。接收 QQ 消息时保留 NapCat 勾选；只查看历史时可跳过，以后重开安装向导即可补装。旧版本升级继续使用原签名清单和应用内更新入口。
 
 1. 双击 Windows x64 安装包，为当前用户安装。安装向导默认显示原程序目录或新装默认位置，也可以点「浏览」选择新的或空的程序目录。手动换目录时，确认后由原卸载器移除旧程序，再安装到新位置，个人资料留在原地。程序和业务运行时随包提供，无需先安装 Conda、Node.js 或 Git。
 2. 新装完成后选「开始扫码登录」，用手机 QQ 扫码并确认。在「实时消息」看到你的第一条新群消息，即可确认接收成功。Windows x64 安装包将 NapCat 和 NTQQ 运行组件放在所选目录的 `NapCat/`，本地连接自动配置，首次扫码后记住账号。API 密钥选填，只接收消息可留空。已保存外部 NapCat 目录的用户继续沿用原设置。
@@ -357,7 +357,7 @@ if ($LASTEXITCODE) { throw '导出公钥失败；保留已生成的私钥，单�
 
 **每次发布。** 在已审核的 `main` 对应提交、仓库根目录的普通 PowerShell 中操作。先确认项目 Conda 环境已安装 `.[build]`、Node 满足桌面要求，使用已入库的发布公钥。构建成功会产生 EXE、同名 `.blockmap` 和 `latest.yml`。失败时提供失败命令及日志末尾。
 
-首次打包会在构建机下载并核验固定的 [NapCat Windows x64 便携包](https://github.com/XingYunStar/NapCatQQ/releases/tag/v4.18.42) 和许可文件，缓存位于 `installer/dist/components/`。终端用户安装时离线展开。NapCat 上游已结束发布，安装包附归档来源、上游版权与非商用许可；公开再分发前另核对 NTQQ 组件的适用授权。
+构建机会校验固定的 [NapCat Windows x64 组件](https://github.com/XingYunStar/NapCatQQ/releases/tag/v4.18.42)，将原始 ZIP 单独输出为 Release 附件。安装器先检查同目录附件或先前校验的组件缓存，缺少时从当前版本的 Release 下载，校验和解压完成才替换旧程序。NapCat 归档附带非商用许可；公开再分发时另核对 NTQQ 组件授权。
 
 ```powershell
 conda run -n msgx --no-capture-output python -s installer/build_backend.py
@@ -375,7 +375,7 @@ $key = Join-Path $env:LOCALAPPDATA 'msgx-release-signing/update-private.pem'
 conda run -n msgx --no-capture-output node installer/sign-release.mjs installer/dist/release/1.0.8 $key
 ```
 
-**在 GitHub 发布。** 负责人在 Releases 新建草稿，选择打包的同一个提交，标签为 `v1.0.8`（后续用对应版本）。把同一次构建的 `msgx-setup-1.0.8-x64.exe`、对应 `.exe.blockmap`、`latest.yml`、`latest.yml.sig` 四个文件作为附件，发布为最新稳定版。下个版本重复构建、签名、发布即可。使用者只需首次手动下载安装 EXE，之后从应用内更新。密钥遗失或泄露时，从可信渠道重新分发带新公钥的安装包，让用户手动安装并恢复更新。
+**在 GitHub 发布。** 新建稳定 Release，标签对应打包的提交和源码版本。上传 `Setup.exe`、版本化主程序 EXE、同名 `.exe.blockmap`、`latest.yml`、`latest.yml.sig` 以及 `msgx-napcat-v4.18.42-x64.zip` 六个附件。新用户只需下载 `Setup.exe`；离线安装可将入口、主程序和组件 ZIP 放在同一目录。版本化主程序 EXE 仍供已安装客户端验签更新。开发构建不要替换同版本的已发布附件。
 
 本地安装向导验收可在最后一条命令添加 `-- --local-preview`，输出到 `installer/dist/release/<版本>-project-local/`，包名带 `unsigned`，沿用同一安装标识，在线更新关闭。隔离的双版本更新验证见 [安装版与公开更新](.agents/skills/msgx-windows-release/references/windows.md#安装版与公开更新)。
 
