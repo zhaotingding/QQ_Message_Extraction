@@ -107,6 +107,13 @@ class GroupActionTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.actions.task, 1)
         self.assertEqual([g["state"] for g in self.store.group_job(job["id"])["groups"]], ["sent", "not_sent"])
 
+    async def test_custom_interval_separates_successful_sends(self):
+        times = []
+        self.after_send = lambda: times.append(asyncio.get_running_loop().time())
+        await self.execute(await self.preview(interval_seconds=1))
+        self.assertEqual(len(times), 2)
+        self.assertGreaterEqual(times[1]-times[0], .99)
+
     async def test_empty_watch_never_means_broadcast_all(self):
         self.pipe.watch.clear()
         with self.assertRaisesRegex(ValueError, "禁止群发"):

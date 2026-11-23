@@ -29,9 +29,20 @@ module.exports = async function checkMessages(evaluate, capture) {
   if (capture) await capture('message-filters.png');
   await click('清除筛选', '#page-status');
   await wait(`document.querySelectorAll('.msgx-current tbody [data-identity=group][data-id="90002"]').length >= 1`, '清除筛选未恢复跨群记录');
+  const visibleRows = await evaluate(`(() => {
+    const wrap=document.querySelector('.home-feed .msgx-current');
+    const header=wrap.querySelector('thead').getBoundingClientRect();
+    return [...wrap.querySelectorAll('tbody tr')].map(r=>r.getBoundingClientRect())
+      .filter(r=>r.top>=header.bottom && r.bottom<=wrap.getBoundingClientRect().bottom).length;
+  })()`);
   const density = await evaluate(`[...document.querySelectorAll('.home-feed .msgx-current tbody tr')].map(r=>r.getBoundingClientRect().height)`);
   assert.ok(density.length >= 4 && Math.max(...density) <= 32, '首页消息行过高 ' + density);
-  console.log('首页消息实测行高：' + Math.max(...density) + 'px');
+  assert.ok(await evaluate(`(() => { const row=[...document.querySelectorAll('.home-feed tbody tr')].find(r=>r.textContent.includes('长文本图片验收')); return !!row && row.cells[4].textContent.includes('未纳入摘要') && getComputedStyle(row.cells[4]).whiteSpace==='nowrap' && !row.classList.contains('msgx-hit-row'); })()`));
+  await evaluate(`[...document.querySelectorAll('.home-feed tbody tr')].find(r=>r.textContent.includes('长文本图片验收')).cells[3].querySelector('button').click()`);
+  await wait(`document.querySelector('.home-inspector .msgx-detail-view')?.textContent.includes('全文末尾可见')`, '单行截断后无法查看完整消息');
+  if (capture) await capture('home-density.png');
+  console.log('首页消息实测行高：' + Math.max(...density) + 'px，完整可见 ' + visibleRows + ' 行');
+  assert.ok(visibleRows >= 12, '首页实际可见行数不足');
   await evaluate(`document.querySelector('[data-page="messages"]').click(); true`);
   await wait(`document.querySelector('.msgx-view-activity')?.hidden === false`, '消息页未默认显示群活跃度');
   assert.equal(await evaluate(`[...document.querySelectorAll('.msgx-message-tabs button')].some(b=>b.textContent==='消息列表')`), false);

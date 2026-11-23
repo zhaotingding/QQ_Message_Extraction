@@ -27,7 +27,6 @@ dialog button:is(.confirm-yes,.confirm-no):hover:enabled { filter: brightness(1.
   --light-edge: #252525;
   --danger: #ffb5ae;
   --focus: #8ad9f7;
-  --keyword: #504320;
   --own: #542d35;
   --recognized: #24493e;
   font: 16px/1.55 "Segoe UI", "Microsoft YaHei UI", sans-serif;
@@ -53,7 +52,6 @@ dialog button:is(.confirm-yes,.confirm-no):hover:enabled { filter: brightness(1.
   --light-edge: #777;
   --danger: #a52c29;
   --focus: #006f9d;
-  --keyword: #fff0bd;
   --own: #ffe0e4;
   --recognized: #d5f1e4;
 }

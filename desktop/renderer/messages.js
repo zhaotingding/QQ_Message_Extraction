@@ -743,6 +743,7 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
   }
 
   function changeFilter() {
+    if (!listOnly && activeView === 'list' && contextId) switchView('keywords', false);
     contextVersion++;
     contextId = null;
     selectedId = null;
