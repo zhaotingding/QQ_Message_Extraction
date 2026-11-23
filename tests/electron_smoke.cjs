@@ -103,7 +103,7 @@ async function run() {
       const shot = await send('Page.captureScreenshot', { format: 'png' })
       await fs.writeFile(path.join(isolated, filename), Buffer.from(shot.result.data, 'base64'))
     }
-    await wait(() => evaluate("document.querySelectorAll('#navigation button').length === 5"), '主导航未构建')
+    await wait(() => evaluate("document.querySelectorAll('#navigation button').length === 6"), '主导航未构建')
     assert.equal(await evaluate("window.msgx.call('desktop.update.status').then(s => s.phase)"), 'unavailable')
     const shellSizes = () => evaluate(`(() => {
       const size = (selector, axis) => document.querySelector(selector).getBoundingClientRect()[axis]
@@ -118,7 +118,7 @@ async function run() {
         lightClear: light.left > statusIcon.right,
       }
     })()`)
-    const shell = { titleHeight: 44, menuWidth: 54, menuHeight: 34, menuText: '14px', menuGap: '6px',
+    const shell = { titleHeight: 44, menuWidth: 54, menuHeight: 34, menuText: '16px', menuGap: '6px',
       railWidth: 60, iconWidth: 24, lightClear: true }
     assert.deepEqual(await shellSizes(), shell)
     assert.ok(await evaluate(`(() => {
@@ -131,14 +131,15 @@ async function run() {
     assert.deepEqual(await shellSizes(), { ...shell, railWidth: 54 })
     await capture('shell-820-125.png')
     await send('Emulation.clearDeviceMetricsOverride')
-    await wait(() => evaluate("document.querySelector('#inspector-title').textContent === '自动摘要'"), '运行状态未挂载摘要侧栏')
+    await wait(() => evaluate("document.querySelector('#inspector-title').textContent === '接收概览'"), '运行状态未挂载摘要侧栏')
     await light('idle')
     const activeLog = 'document.querySelector(".status-console .log:not([hidden])")'
     const atEnd = `(() => {
       const log = ${activeLog}
       return log.scrollHeight > log.clientHeight && log.scrollHeight - log.scrollTop - log.clientHeight < 2
     })()`
-    await wait(() => evaluate(atEnd), '首次打开未定位到最后一屏日志')
+    assert.ok(await evaluate("!!document.querySelector('.home-feed .msgx-current') && !document.querySelector('#page-status .status-console')"))
+    assert.ok(await evaluate("!!document.querySelector('#inspector-content .metrics')"))
     await capture('light-idle.png')
     assert.equal(await evaluate("navigator.windowControlsOverlay.visible"), true)
     await evaluate("[...document.querySelectorAll('.menu-trigger')].find(b => b.textContent === '视图').click()")
@@ -163,7 +164,9 @@ async function run() {
     assert.equal(await evaluate("document.querySelector('.summary-retry button').textContent"), '确认补生成')
     assert.match(await evaluate("document.querySelector('.summary-retry small').textContent"), /^\d{4}-\d{2}-\d{2} — \d{4}-\d{2}-\d{2}$/)
     assert.equal(await evaluate("document.querySelector('.status-summary').textContent.includes('隔离请求失败示例')"), false)
-    await wait(() => evaluate("document.querySelector('.status-console .log').textContent.includes('模拟')"), '验收日志未加载')
+    await evaluate("document.querySelector('[data-page=logs]').click()")
+    await wait(() => evaluate("document.querySelector('.status-console .log')?.textContent.includes('模拟')"), '验收日志未加载')
+    await wait(() => evaluate(atEnd), '打开日志时应定位到最后一屏')
     assert.ok(await evaluate(`(() => {
       const log = document.querySelector('.status-console .log')
       const has = (tone, text) => [...log.querySelectorAll('[data-tone=' + tone + ']')].some(s => s.textContent.includes(text))
@@ -186,7 +189,7 @@ async function run() {
 
     // 用窄窗和滚轮复现整页卷走的场景，同时验证历史位置与手动刷新。
     await send('Emulation.setDeviceMetricsOverride', { width: 900, height: 590, deviceScaleFactor: 1, mobile: false })
-    const top = 'document.querySelector(".status-overview").getBoundingClientRect().top'
+    const top = 'document.querySelector(".status-console-bar").getBoundingClientRect().top'
     const originalY = await evaluate(top)
     await evaluate(`${activeLog}.scrollTop = 0`)
     await send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: 200, y: 360, deltaX: 0, deltaY: 480 })
@@ -202,6 +205,7 @@ async function run() {
     await fs.appendFile(serviceLog, '2026-11-14 05:03:01 INFO    msgx 验收贴底跟随\n')
     await wait(() => evaluate(`${activeLog}.textContent.includes('验收贴底跟随') && ${atEnd}`), '贴底时未跟随最新')
     await send('Emulation.clearDeviceMetricsOverride')
+    await capture('logs.png')
     console.log('两种日志切换、最新定位、滚轮固定顶部与保留历史位置通过')
     const response = await fetch('http://127.0.0.1:' + http + '/inject', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -211,14 +215,18 @@ async function run() {
     })
     assert.equal(response.status, 200)
     assert.equal((await response.json()).results[0].ok, true)
-    await evaluate("document.querySelector('[data-page=messages]').click()")
-    try {
-      await wait(() => evaluate("document.querySelector('#page-messages')?.textContent.includes('Electron 实时验收入库')"), '实时消息未显示')
-    } catch (error) {
-      throw new Error(error.message + '\n' + await evaluate("document.body.innerText.slice(0, 1500)") + '\n' + startup)
+    for (const [group,user,id] of [[90002,100002,889],[90001,100003,890],[90002,100003,891]]) {
+      const insert = await fetch('http://127.0.0.1:' + http + '/inject', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({post_type:'message',message_type:'group',self_id:100001,group_id:group,user_id:user,
+          message_id:id,time:Math.trunc(Date.now()/1000)-60-id%10,sender:{nickname:'隔离发送者'},
+          message:[{type:'text',data:{text:'同名与跨群筛选验收 '+id}}]})})
+      assert.equal((await insert.json()).results[0].ok,true)
     }
+    await evaluate("document.querySelector('[data-page=status]').click()")
+    await wait(() => evaluate("document.querySelector('.home-feed')?.textContent.includes('Electron 实时验收入库')"), '主页实时消息未显示')
     console.log('实际接收进程、隔离入库和消息页面通过')
-    // 在消息页模拟协议连接与断开，检查顶层提示灯能跨页面更新。
+    // 模拟协议连接与断开，检查顶层提示灯能跨页面更新。
     protocol = new WebSocket('ws://127.0.0.1:' + ws + '/onebot/ws', {
       headers: { 'X-Self-ID': '100001' },
     })
@@ -235,7 +243,7 @@ async function run() {
     await wait(() => evaluate("document.querySelector('#inspector-content').textContent.includes('Electron 实时验收入库')"), '消息详情未显示')
     await evaluate("document.querySelector('#inspector-toggle').click()")
     assert.equal(await evaluate("document.querySelector('#inspector').hidden"), true)
-    await evaluate("[...document.querySelectorAll('.msgx-tab-bar button')].find(b => b.textContent === '消息详情').click()")
+    await evaluate("document.querySelector('#inspector-toggle').click()")
     assert.equal(await evaluate("document.querySelector('#inspector').hidden"), false)
     await capture('messages.png')
     await send('Emulation.setDeviceMetricsOverride', { width: 900, height: 640, deviceScaleFactor: 1, mobile: false })
@@ -243,21 +251,29 @@ async function run() {
     await capture('narrow.png')
     await send('Emulation.clearDeviceMetricsOverride')
     await evaluate("document.querySelector('[aria-label=后退]').click()")
-    await wait(() => evaluate("document.querySelector('#inspector-title').textContent === '自动摘要'"), '后退未切回状态页')
+    await wait(() => evaluate("!!document.querySelector('#page-logs .status-console')"), '后退未切回上一页日志')
     await evaluate("document.querySelector('[aria-label=前进]').click()")
-    await wait(() => evaluate("document.querySelector('#inspector-title').textContent === '消息详情'"), '前进未切回消息页')
+    await wait(() => evaluate("document.querySelector('#inspector-title').textContent === '接收概览'"), '前进未切回消息页')
     console.log('标题栏、菜单、前进后退、详情切换与窄窗侧栏通过')
     console.log(await require('./electron_reader_smoke.cjs')(evaluate, capture))
     assert.match(await fs.readFile(path.join(isolated, '.ui', 'preferences.yaml'), 'utf8'),
       /reader_kinds:\s*\r?\n- weekly\r?\n- monthly/)
     await capture('reader-filters.png')
-    console.log(await require('./electron_settings_smoke.cjs')(evaluate))
-    console.log(await require('./electron_messages_smoke.cjs')(evaluate))
+    console.log(await require('./electron_settings_smoke.cjs')(evaluate, capture))
+    console.log(await require('./electron_messages_smoke.cjs')(evaluate, capture))
     await evaluate("document.querySelector('[data-page=status]').click()")
-    await wait(() => evaluate("document.querySelector('#page-status .metrics strong')?.textContent !== '—' && !!document.querySelector('#page-status .metrics strong')"), '运行状态未显示')
+    await wait(() => evaluate("document.querySelector('#inspector-content .metrics strong')?.textContent !== '—' && !!document.querySelector('#inspector-content .metrics strong')"), '运行状态未显示')
     await capture('status.png')
     await wait(() => evaluate("document.querySelector('.service-switch:not(:disabled)')?.title === '停止服务'"), '红色停止开关未就绪')
     assert.equal(await evaluate("getComputedStyle(document.querySelector('.service-switch')).backgroundColor"), 'rgb(170, 52, 68)')
+    await evaluate("window.msgx.call('desktop.requestClose')")
+    await wait(() => evaluate("!!document.querySelector('.action-confirm[open]')"), '关闭服务未弹出确认')
+    assert.deepEqual(await evaluate("[...document.querySelectorAll('.action-confirm button')].map(b=>[b.textContent,getComputedStyle(b).backgroundColor])"),
+      [['确认','rgb(25, 104, 62)'],['取消','rgb(148, 54, 68)']])
+    assert.equal(await evaluate("document.activeElement.textContent"), '取消')
+    await send('Input.dispatchKeyEvent', {type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27})
+    await send('Input.dispatchKeyEvent', {type:'keyUp',key:'Escape',code:'Escape',windowsVirtualKeyCode:27})
+    await wait(() => evaluate("!document.querySelector('.action-confirm[open]')"), 'Esc 未取消')
     await evaluate("document.querySelector('.service-switch').click()")
     await wait(() => evaluate("window.msgx.call('status.read').then(s => !s.serviceRunning)"), '接收服务未停止')
     await light('idle')

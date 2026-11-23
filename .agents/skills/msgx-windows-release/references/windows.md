@@ -4,6 +4,8 @@
 
 ## 安装版与公开更新
 
+2026-11-23 开发分支的在线安装流程使用 `Setup.exe` 和独立 NapCat ZIP。版本化主程序 EXE、blockmap、latest.yml 和 latest.yml.sig 保持旧客户端的更新协议。构建、附件清单见 README。已用回环 HTTP 验证独立入口下载、坏组件拒绝、缓存复用、无 QQ 组件安装及保留选择的覆盖升级。已发布 1.0.8 的四附件流程仍是历史版本的行为。
+
 安装实现统一在 `installer/`：`build_backend.py` 和 `backend_entry.py` 构建随包后台，`build-installer.mjs` 和 `installer.nsh` 构建 NSIS，`update.cjs` 与 `installed-profile.cjs` 由源码桌面与安装包共用。依赖仍从 `desktop/package.json` 解析。`uninstall.ps1` 只调用当前用户注册的目标卸载器，先用 `-WhatIf` 验证目标；测试实例必须加 `-TestBuild`。旧构建成品不因目录整理删除或搬走。
 
 用户于 2026-11-15 批准独立安装版。Windows x64 NSIS 为当前用户部署 Electron 和业务运行时。开发者继续沿用 Conda 源码链路。程序默认资料根为 `%LOCALAPPDATA%\msgx\profile`。如需沿用源码版资料，先退出原应用，再用安装版的 `--msgx-data-root` 指向原资料根。程序记住选择并原地使用资料。该参数不负责复制、迁移或改写 SQLite 内的文件路径。安装、更新和卸载保留资料。密钥沿用当前 Windows 用户的凭据管理器，此段描述 1.0.7 及以前的外部协议端模式。

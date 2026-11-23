@@ -31,6 +31,9 @@ class GroupActionsPanel:
         self.editor.pack(fill="x", pady=4)
         bar = ttk.Frame(self.tab)
         bar.pack(fill="x")
+        self.interval = tk.StringVar(value="30")
+        ttk.Label(bar, text="群间隔（秒）").pack(side="left")
+        ttk.Spinbox(bar, from_=1, to=3600, width=6, textvariable=self.interval).pack(side="left", padx=4)
         self.send_button = ttk.Button(bar, text="预览群发范围…", command=self.prepare_broadcast)
         self.send_button.pack(side="left")
         self.cancel_button = ttk.Button(bar, text="停止后续发送", command=self.cancel, state="disabled")
@@ -66,7 +69,10 @@ class GroupActionsPanel:
     def prepare_broadcast(self):
         if self.busy:
             return
-        self.request("preview", {"kind": "broadcast", "text": self.editor.get("1.0", "end-1c"), **self._scope()})
+        if not self.interval.get().isascii() or not self.interval.get().isdigit() or not 1 <= int(self.interval.get()) <= 3600:
+            self.status.set("群发间隔须为 1～3600 的整数秒")
+            return
+        self.request("preview", {"kind": "broadcast", "interval_seconds": int(self.interval.get()), "text": self.editor.get("1.0", "end-1c"), **self._scope()})
 
     def prepare_leave(self):
         selected = self.page.rt_activity.selection()
@@ -272,6 +278,7 @@ class GroupActionsPanel:
             self._build_group_picker(window, preview)
             body_frame = ttk.Frame(window, padding=(12, 0, 12, 0))
             body_frame.pack(fill="x")
+            ttk.Label(body_frame, text=f"群间隔 {preview.get('interval_seconds', 30)} 秒").pack(anchor="w")
             ttk.Label(body_frame, text="将发送的完整正文（纯文字）：").pack(anchor="w")
             body = ScrolledText(body_frame, wrap="word", height=7)
             body.pack(fill="x", pady=(2, 0))

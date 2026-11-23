@@ -1,7 +1,7 @@
 // 真窗口到本机设置桥接的验收，调用者必须先指定隔离数据根。
 const assert = require('node:assert/strict')
 
-module.exports = async function checkSettings(evaluate) {
+module.exports = async function checkSettings(evaluate, capture) {
   const wait = async (condition, label) => {
     for (let i = 0; i < 80; i++) {
       if (await evaluate(condition)) return
@@ -26,14 +26,34 @@ module.exports = async function checkSettings(evaluate) {
   })()`)
   await evaluate(`document.querySelector('[data-page="settings"]').click(); true`)
   await wait(`!document.querySelector('#page-settings .settings-actions')?.disabled && document.querySelector('#page-settings [role="status"]')?.textContent.includes('本机偏好已加载')`, '设置未呈现')
+  const tab = id => evaluate(`document.querySelector('#page-settings [data-category="${id}"]').click(); true`)
+  await tab('reception')
+  assert.equal(await evaluate("document.querySelectorAll('#page-settings .settings-section:not([hidden])').length"), 2)
+  await tab('models')
+  assert.ok(await evaluate("!!document.querySelector('.settings-section:not([hidden]) details summary')"))
+  if (capture) await capture('settings-models.png')
+  await tab('appearance')
   assert.ok(await value('主题', 'light', true))
   await wait(`document.documentElement.dataset.theme === 'light'`, '浅色主题未设置')
+  await tab('connection')
+  const storedAccount = await evaluate("window.msgx.call('settings.get').then(s=>s.account)")
+  assert.equal(storedAccount, '100001')
+  assert.ok(await value('目标 QQ 号', '123456'))
+  await tab('reports')
+  assert.equal(await evaluate("document.querySelectorAll('#page-settings .settings-section:not([hidden])').length"), 1)
   assert.ok(await value('日报目标字数', '4567'))
   assert.ok(await click('保存设置'))
   await wait(`document.querySelector('#page-settings [role="status"]')?.textContent.startsWith('设置已保存')`, '保存设置失败')
   assert.ok(await value('日报目标字数', '9999'))
-  assert.ok(await click('重新加载'))
+  assert.ok(await click('重新加载全部'))
   await wait(`!document.querySelector('#page-settings .settings-actions')?.disabled && [...document.querySelectorAll('#page-settings .settings-field')].find(e => e.firstElementChild.textContent === '日报目标字数')?.lastElementChild.value === '4567'`, '已保存设置未读回')
+  await tab('connection')
+  assert.equal(await evaluate("window.msgx.call('settings.get').then(s=>s.account)"), storedAccount)
+  await tab('images')
+  if (capture) await capture('settings-images.png')
+  await evaluate(`const input=document.querySelector('.settings-search input'); input.value='密钥'; input.dispatchEvent(new Event('input')); true`)
+  assert.equal(await evaluate("document.querySelectorAll('.settings-nav button:not([hidden])').length"), 1)
+  await evaluate(`document.querySelector('.settings-search input').value=''; document.querySelector('.settings-search input').dispatchEvent(new Event('input')); true`)
   assert.ok(await click('编辑图片主题与评分规则'))
   await wait(`document.querySelector('dialog.settings-rules')?.open`, '图片规则弹窗未打开')
   assert.ok(await evaluate(`(() => {
@@ -44,6 +64,7 @@ module.exports = async function checkSettings(evaluate) {
   })()`))
   await wait(`document.querySelector('dialog.settings-rules [role="status"]')?.textContent.includes('本地得分')`, '图片规则试匹配失败')
   await evaluate(`[...document.querySelectorAll('dialog.settings-rules button')].find(b => b.textContent === '关闭').click(); true`)
+  await tab('appearance')
   assert.ok(await value('主题', 'dark', true))
   await wait(`document.documentElement.dataset.theme === 'dark'`, '深色主题未恢复')
   return '主题与 YAML 保存读回、图片规则本地试匹配通过'

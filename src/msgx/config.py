@@ -69,8 +69,6 @@ DEFAULTS: dict = {
     #   start_script —— 填上后界面出现「启动协议端(NapCat)」按钮（可见排障模式用）
     #   dir          —— NapCat 安装目录。隐藏启动靠它定位；登录二维码也从这里找
     #                   （<dir>\cache\qrcode.png）；NapCat 自身日志在 <dir>\logs\
-    #   hidden       —— true = 隐藏控制台窗口启动（默认）。false / 界面勾「可见模式」时
-    #                   回到 os.startfile(批处理) 的老行为，能看到完整输出
     #   log_file     —— 界面「协议端日志」展示的启动记录（相对项目根）
     #   qq_path      —— QQ.exe 路径。留空 = 从注册表 UninstallString 自动推导
     "napcat": {
@@ -79,7 +77,6 @@ DEFAULTS: dict = {
         # 全退掉，再重新拉起」—— 这是「消息冻结」唯一可靠的动作。见 pipeline/napcat.py。
         "restart_script": "",
         "dir": "",
-        "hidden": True,
         "log_file": "data/logs/napcat.log",
         "qq_path": "",
     },

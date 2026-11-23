@@ -74,7 +74,7 @@ class ManagedNapCat:
             raise ValueError("保存的目标 QQ 号无效。")
         files = ("node.exe", "index.js", "wrapper.node", "napcat/napcat.mjs")
         if not all((self.runtime / name).is_file() for name in files) or not self.guard.is_file():
-            raise RuntimeError("内置 QQ 组件不完整，请用消息萃取安装包覆盖安装。")
+            raise RuntimeError("QQ 接收组件尚未安装或不完整。请重新运行安装向导，勾选「安装 QQ 消息接收组件」。")
         if self.proc is not None and self.proc.poll() is None:
             raise RuntimeError("当前窗口的协议端正在运行。")
 

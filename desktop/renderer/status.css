@@ -1,6 +1,6 @@
-#pages:has(> .status-page) { overflow: hidden; }
+#pages:has(> :is(.status-page,.logs-page):not([hidden])) { overflow: hidden; }
 
-.page.status-page {
+.page.status-page, .page.logs-page {
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -9,6 +9,18 @@
   padding: 0;
 }
 
+.status-page > .status-commandbar { padding: 10px 16px; border-bottom: 1px solid var(--border); }
+.home-feed { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+.home-feed .msgx-current { max-height: none; }
+.metrics .spend-line { display: flex; align-items: baseline; gap: 5px; font-size: 16px; }
+.metrics .spend-line small { font-size: 11px; color: var(--muted); }
+.home-inspector .status-overview .metrics { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
+.home-inspector .metrics > div { border: 0; padding: 0; }
+.home-inspector .metrics strong { font-size: 22px; }
+.home-inspector .status-overview { gap: 12px; }
+.home-detail { padding: 12px; border-bottom: 1px solid var(--border); }
+.home-detail h3, .status-summary h3 { margin: 0; }
+.home-inspector .status-summary { padding-block: 14px; }
 .status-overview {
   display: grid;
   flex: none;
@@ -26,11 +38,11 @@
 .status-commandbar .toolbar, .status-console-bar .toolbar { gap: 5px; }
 .status-commandbar button, .status-console-bar button, .status-console-bar select {
   padding: 3px 8px;
-  font-size: 12px;
+  font-size: 15px;
   line-height: 1.55;
 }
 .status-overview p, .status-summary p { margin: 0; }
-.status-overview p, .status-summary { font-size: 12px; }
+.status-overview p, .status-summary { font-size: 15px; }
 .status-overview p:empty, .status-summary p:empty { display: none; }
 .status-overview .metrics {
   grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
@@ -41,13 +53,13 @@
 .status-overview .metrics > div {
   min-width: 0;
   padding-block: 0;
-  font-size: 12px;
+  font-size: 15px;
 }
 .status-overview .metrics strong {
   font-size: 18px;
   font-weight: 600;
 }
-.status-overview .metrics small { font-size: 11px; }
+.status-overview .metrics small { font-size: 13px; }
 
 .status-console {
   display: flex;
@@ -115,4 +127,4 @@
   border-radius: 50%; vertical-align: 1px; background: var(--light-fault);
 }
 .summary-retry { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 7px; margin-top: 4px; }
-.summary-retry button { font-size: 12px; padding: 3px 8px; }
+.summary-retry button { font-size: 15px; padding: 3px 8px; }

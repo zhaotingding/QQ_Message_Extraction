@@ -1,4 +1,5 @@
 import { el as make } from './controls.js';
+import { decorateAction, glyph } from './workbench.js';
 
 const apiFields = [
   ['provider', '服务平台'], ['base_url', 'API 基础地址'], ['model', '模型'],
@@ -58,7 +59,9 @@ export function mount(container, app) {
   let busy = false;
   let view;
   const drafts = new Map();
-  const sections = new Map();
+  let category = app.state.settingsCategory || 'connection';
+  let groupsLoaded = false;
+  let groupsRequest = 0;
   const status = make('p', { className: 'muted', role: 'status' }, '正在读取本机设置…');
   const page = make('div', { className: 'settings-page' }, status);
   container.replaceChildren(page);
@@ -89,34 +92,31 @@ export function mount(container, app) {
     }
   }
 
-  const button = (label, work, options) => make('button', { type: 'button', onclick: () => perform(work, options) }, label);
+  const button = (label, work, options) => {
+    const item = make('button', { type: 'button', onclick: () => perform(work, options) }, label);
+    const icon = /^(保存|应用)/.test(label) ? 'save' : /^(刷新|重新加载)/.test(label) ? 'refresh'
+      : /^(导入|导出|打开|选择)/.test(label) ? 'folder' : null;
+    return icon ? decorateAction(item, icon) : item;
+  };
 
   function section(title, ...children) {
     const node = make('fieldset', { className: 'panel settings-section' }, make('legend', {}, title), ...children);
-    sections.set(title, node);
     return node;
   }
 
-  function collectSettings() {
-    return {
-      id: view.active, profile: readFields(profileInputs), imageProfile: imageProfile.value,
-      image: { ...readFields(imageInputs), enabled: imageEnabled.checked },
-      summaryPrompt: summaryPrompt.value, targetChars: targetChars.value,
-      promptEvolution: { enabled: promptEnabled.checked, days: promptDays.value, interval_days: promptInterval.value },
-      groups: [...selectedGroups],
-      filters: { ...Object.fromEntries(Object.entries(filterInputs).map(([key, input]) => [key, input.checked])),
-        blocked_senders: [...senderList.options].map(option => option.value), min_text_length: minLength.value },
-      account: qqAccount.value, napcatDir: napcatDir.value, qqPath: qqPath.value, hidden: hidden.checked,
-    };
-  }
-
-  async function save() {
-    view = await app.call('settings.save', collectSettings());
-    drafts.delete(view.active);
-    refreshProfiles();
-    setFields(profileInputs, view.profiles[view.active]);
-    void updateKey();
-    notify('设置已保存。接收范围、过滤与协议端设置在服务重启后生效。');
+  async function save(section = category) {
+    let values;
+    if (section === 'reports') {
+      values = {summaryPrompt: summaryPrompt.value, topicPrompt: topicPrompt.value, targetChars: targetChars.value,
+        promptEvolution: {enabled: promptEnabled.checked, days: promptDays.value, interval_days: promptInterval.value}};
+    } else if (section === 'reception') {
+      values = {groups: [...selectedGroups], filters: {...Object.fromEntries(Object.entries(filterInputs).map(([key, input]) => [key, input.checked])),
+        blocked_senders: [...senderList.options].map(option => option.value), min_text_length: minLength.value}};
+    } else if (section === 'connection') {
+      values = {account: qqAccount.value, napcatDir: napcatDir.value, qqPath: qqPath.value};
+    } else return;
+    view = await app.call('settings.save', {section, ...values});
+    notify(section === 'reports' ? '设置已保存。' : '设置已保存，重启接收服务后生效。');
   }
 
   const profile = make('select', { ariaLabel: '摘要 API 配置' });
@@ -156,7 +156,8 @@ export function mount(container, app) {
     try {
       const result = await app.call('settings.key.status', credentialsArgs());
       if (seq === keyRequest && !disposed) {
-        keyStatus.textContent = `${result.configured ? '已配置密钥' : '此地址未配置密钥'} · Windows 凭据 ${result.target}`;
+        keyStatus.textContent = result.configured ? '密钥已保存到 Windows 凭据管理器。' : '此地址尚未配置密钥。';
+        keyStatus.title = `Windows 凭据 ${result.target}`;
       }
     } catch (error) {
       if (seq === keyRequest && !disposed) keyStatus.textContent = `读取密钥状态失败：${error.message}`;
@@ -181,7 +182,7 @@ export function mount(container, app) {
   secret.oninput = updateKey;
   profileInputs.base_url.onblur = updateKey;
 
-  const api = section('API 配置',
+  const api = section('服务与模型',
     row(profile,
       button('以当前参数新增', async () => {
         rememberProfile();
@@ -197,7 +198,9 @@ export function mount(container, app) {
         showProfile(imageProfile.value === id ? '' : imageProfile.value);
         notify(`已删除配置 ${id}。`);
       })),
-    make('div', { className: 'settings-grid' }, ...apiFields.map(([key, label]) => field(label, profileInputs[key]))),
+    make('div', { className: 'settings-grid' }, ...apiFields.slice(0, 8).map(([key, label]) => field(label, profileInputs[key]))),
+    make('details', {className: 'settings-advanced'}, make('summary', {}, '计费与价格估算'),
+      make('div', {className: 'settings-grid'}, ...apiFields.slice(8).map(([key, label]) => field(label, profileInputs[key])))),
     row(
       button('保存 API 参数', async () => {
         Object.assign(view, await app.call('settings.profile.save', { id: view.active, profile: readFields(profileInputs) }));
@@ -239,6 +242,7 @@ export function mount(container, app) {
       })), profileLocation,
     explain('OpenAI 费率填写 Standard 基准价。GPT-6.2 Sol / Astra 请选 default（Standard）。支持 Flex 的模型仅在明确返回容量不足时回退到 Standard。'));
 
+  const topicPrompt = make('textarea', { rows: 5, spellcheck: false });
   const summaryPrompt = make('textarea', { rows: 10, spellcheck: false });
   const targetChars = make('input', { type: 'number', min: '1', max: '100000' });
   const [promptEnabled, promptToggle] = check('启用提示词自更新');
@@ -265,17 +269,19 @@ export function mount(container, app) {
     promptHistory.onchange();
   }
 
-  const summary = section('摘要与动态提示词',
+  const summary = section('报告内容与生成规则',
     row(field('日报目标字数', targetChars), button('恢复默认提示词', async () => {
       summaryPrompt.value = view.defaultPrompt;
       notify('已恢复默认提示词，保存后生效。');
     })),
-    explain('周报使用日报字数的两倍，月报使用三倍。'), field('基础提示词', summaryPrompt), promptToggle,
+    explain('周报使用日报字数的两倍，月报使用三倍。'), field('基础提示词', summaryPrompt),
+    make('details', {}, make('summary', {}, '主题报提示词'), field('主题报写作要求', topicPrompt),
+      button('恢复主题报默认提示词', () => { topicPrompt.value = view.defaultTopicPrompt; })), promptToggle,
     row(field('取最近日报天数', promptDays), field('更新间隔（天）', promptInterval)), promptStatus,
     row(button('刷新记录', async () => showPrompt(await app.call('settings.prompt.status'))),
       button('立即更新（调用 API）', async () => {
         if (!await app.confirm('更新动态提示词', '先保存当前设置，再调用摘要 API。若上次提交结果未知且没有响应 ID，再次确认可能重复计费。')) return;
-        await save();
+        await save('reports');
         showPrompt(await app.call('settings.prompt.update', { confirmed: true }));
         notify(promptStatus.textContent);
       }),
@@ -292,7 +298,7 @@ export function mount(container, app) {
   const imageStatus = explain('启动接收服务后显示图片队列状态。');
   let readingHealth = false;
   async function readHealth() {
-    if (disposed || readingHealth || container.hidden) return;
+    if (disposed || readingHealth || container.hidden || !['images','reports'].includes(category)) return;
     readingHealth = true;
     try {
       const { health, serviceRunning } = await app.call('status.read');
@@ -306,7 +312,7 @@ export function mount(container, app) {
       readingHealth = false;
     }
   }
-  const image = section('图片初筛与独立 API',
+  const image = section('图片分析规则',
     field('图片分析配置', imageProfile), imageToggle,
     make('div', { className: 'settings-grid' }, ...imageFields.map(([key, label]) => field(label, imageInputs[key]))),
     explain('表情包直接过滤。筛选使用本地 OCR，自动分析调用图片 API 并受每日预算与次数限制。'), imageStatus,
@@ -322,8 +328,9 @@ export function mount(container, app) {
   const groupList = make('div', { className: 'settings-group-list' });
   const groupStatus = explain('');
   async function readGroups(action = 'settings.groups') {
+    const request = ++groupsRequest;
     const result = await app.call(action);
-    if (disposed) return;
+    if (disposed || request !== groupsRequest) return;
     const found = new Set(result.rows.map(([id]) => String(id)));
     const rows = [...result.rows, ...[...selectedGroups].filter(id => !found.has(id)).map(id => [id, '已保存，当前群列表无记录', '', null])];
     groupList.replaceChildren(...rows.map(([id, title, owner, count]) => {
@@ -334,7 +341,7 @@ export function mount(container, app) {
     }));
     groupStatus.textContent = result.warning || `${result.account ? `QQ ${result.account} · ` : ''}${result.rows.length} 个群${result.deleted ? ` · 已删除 ${result.deleted} 个空群` : ''}`;
   }
-  const groups = section('统计哪些群', explain('全不选时统计所有群。群发接收范围由群发页单独确认。'),
+  const groups = section('接收群组', explain('全不选时统计所有群。群发接收范围由群发页单独确认。'),
     row(button('刷新群列表', () => readGroups('settings.groups.refresh')),
       button('只保留当前账号的群', async () => {
         if (await app.confirm('同步当前账号群列表', '将重新同步当前登录账号的群并清理其他账号的空群。历史消息和报告会保留。')) {
@@ -359,7 +366,7 @@ export function mount(container, app) {
     sender.value = '';
   }
   sender.onkeydown = event => { if (event.key === 'Enter') { event.preventDefault(); addSender(); } };
-  const filters = section('接收与发言人过滤', row(...filterChecks), field('消息字数下限（0 不限制）', minLength),
+  const filters = section('过滤消息与发送者', row(...filterChecks), field('消息字数下限（0 不限制）', minLength),
     row(sender, button('添加发言人', async () => addSender()),
       button('移除选中项', async () => { for (const option of [...senderList.selectedOptions]) option.remove(); })), senderList,
     explain('按完整名称匹配，Q群管家同时匹配已知账号。保存后重启消息服务。'));
@@ -367,15 +374,14 @@ export function mount(container, app) {
   const qqAccount = make('input', { type: 'text', inputMode: 'numeric' });
   const napcatDir = make('input', { type: 'text' });
   const qqPath = make('input', { type: 'text' });
-  const [hidden, hiddenToggle] = check('隐藏 NapCat 控制台窗口');
-  const protocol = section('协议端（NapCat）', field('目标 QQ 号', qqAccount),
+  const protocol = section('账号与协议端', field('目标 QQ 号', qqAccount),
     row(field('本机 NapCat 目录', napcatDir), button('选择目录', async () => {
       const path = await app.call('desktop.pickDirectory', { kind: 'napcat' });
       if (path) napcatDir.value = path;
     })), row(field('QQ.exe 路径（可选）', qqPath), button('选择文件', async () => {
       const path = await app.call('desktop.pickFile', { kind: 'qq' });
       if (path) qqPath.value = path;
-    })), hiddenToggle);
+    })));
 
   const theme = make('select', {});
   options(theme, [['dark', '深色'], ['light', '浅色']], 'dark');
@@ -393,7 +399,7 @@ export function mount(container, app) {
   };
   const iconPath = explain('');
   const paths = explain('');
-  const appearance = section('外观与本机配置', row(field('主题', theme),
+  const appearance = section('主题、图标与文件', row(field('主题', theme),
     button('选择程序图标', async () => {
       const path = await app.call('desktop.pickFile', { kind: 'icon' });
       if (!path) return;
@@ -410,12 +416,15 @@ export function mount(container, app) {
     drafts.clear();
     populateForms();
     status.textContent = '本机偏好已加载。';
-    await readGroups();
+    groupsLoaded = false;
+    groupsRequest++;
+    if (category === 'reception') void loadGroupChoices();
   }
 
   function populateForms() {
     showProfile();
     summaryPrompt.value = view.summaryPrompt;
+    topicPrompt.value = view.topicPrompt;
     targetChars.value = view.targetChars;
     promptEnabled.checked = view.promptEvolution.enabled;
     promptDays.value = view.promptEvolution.days;
@@ -429,21 +438,79 @@ export function mount(container, app) {
     minLength.value = view.filters.min_text_length;
     qqAccount.value = view.account;
     napcatDir.value = view.napcatDir;
-    napcatDir.placeholder = view.managedProtocol ? '正在使用内置组件，无需选择目录' : '';
+    napcatDir.placeholder = view.protocolSkipped ? '未安装 QQ 组件，可在安装向导补装或选择外部目录' : view.managedProtocol ? '正在使用内置组件，无需选择目录' : '';
     qqPath.value = view.qqPath;
-    hidden.checked = view.hidden;
     theme.value = view.theme;
     app.setTheme(view.theme);
     iconPath.textContent = view.iconPath ? `当前图标 ${view.iconPath}` : '';
     paths.textContent = `主配置 ${view.configPath} · 个人偏好 ${view.prefsPath}`;
   }
 
-  const top = make('fieldset', { className: 'settings-actions' }, row(
-    button('保存设置', save), button('重新加载', load, { loading: true }),
-    ...[...sections].map(([title, section]) => make('button', { type: 'button', onclick: () => section.scrollIntoView({ block: 'start' }) }, title))));
-  page.append(top, api, summary, image, groups, filters, protocol, appearance);
+  async function loadGroupChoices() {
+    if (groupsLoaded || !view) return;
+    groupsLoaded = true;
+    try { await readGroups(); }
+    catch (error) { groupsLoaded = false; notify(error.message); }
+  }
+
+  const categories = [
+    ['消息接收', 'connection', 'QQ 登录与连接', 'connection', [protocol]],
+    ['消息接收', 'reception', '群组与消息过滤', 'groups', [groups, filters]],
+    ['智能分析', 'models', '模型与 API 密钥', 'key', [api]],
+    ['智能分析', 'reports', '日报与摘要', 'reader', [summary]],
+    ['智能分析', 'images', '图片识别', 'image', [image]],
+    ['应用', 'appearance', '外观与文件', 'theme', [appearance]],
+  ];
+  const search = make('input', {type: 'search', placeholder: '搜索设置', ariaLabel: '搜索设置'});
+  const nav = make('nav', {className: 'settings-nav', ariaLabel: '设置分类'});
+  const rail = make('aside', {className: 'settings-rail'}, make('label', {className: 'settings-search'}, glyph('search'), search), nav);
+  const title = make('h2', {});
+  const actions = make('fieldset', {className: 'settings-actions'}, button('保存设置', () => save()));
+  const content = make('div', {className: 'settings-content'}, title, status,
+    protocol, groups, filters, api, summary, image, appearance, actions);
+  let groupTitle;
+  let groupBox;
+  const items = new Map();
+  for (const [family, id, name, icon, panels] of categories) {
+    if (groupTitle !== family) {
+      groupBox = make('div', {className: 'settings-nav-group'}, make('h3', {}, family));
+      nav.append(groupBox);
+      groupTitle = family;
+    }
+    const tab = decorateAction(make('button', {type:'button', onclick: () => showCategory(id)}, name), icon);
+    tab.dataset.category = id;
+    groupBox.append(tab);
+    items.set(id, {tab, panels, name, family});
+  }
+  function showCategory(id) {
+    category = items.has(id) ? id : 'connection';
+    app.state.settingsCategory = category;
+    for (const [key, item] of items) {
+      const current = key === category;
+      item.tab.setAttribute('aria-current', current ? 'page' : 'false');
+      for (const panel of item.panels) panel.hidden = !current;
+    }
+    title.textContent = items.get(category).name;
+    content.scrollTop = 0;
+    actions.hidden = !['reports','connection','reception'].includes(category);
+    if (view && category === 'reception') void loadGroupChoices();
+    if (view) void readHealth();
+  }
+  const noMatches = explain('没有匹配的设置');
+  noMatches.hidden = true;
+  search.oninput = () => {
+    const term = search.value.trim().toLowerCase();
+    for (const item of items.values()) {
+      const labels = item.panels.flatMap(panel => [...panel.querySelectorAll('legend,label > span,summary')].map(n => n.textContent));
+      item.tab.hidden = ![item.name,item.family,...labels].join(' ').toLowerCase().includes(term);
+    }
+    for (const box of nav.children) box.hidden = !box.querySelector('button:not([hidden])');
+    noMatches.hidden = !!nav.querySelector('button:not([hidden])');
+  };
+  rail.append(noMatches, button('重新加载全部', load, {loading: true}));
+  page.replaceChildren(rail, content);
+  showCategory(category);
   void perform(load, { loading: true });
-  void readHealth();
   const healthTimer = setInterval(readHealth, 3000);
   return () => { disposed = true; clearInterval(healthTimer); };
 }

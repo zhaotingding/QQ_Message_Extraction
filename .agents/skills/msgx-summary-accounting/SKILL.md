@@ -1,6 +1,6 @@
 ---
 name: msgx-summary-accounting
-description: 修改或排查 msgx 日报周报月报、摘要提示词、后台模型响应恢复、补生成、用量记账和账单口径时使用。涵盖重复请求与重复计费边界，不用于API密钥编辑或普通消息查询。
+description: 修改或排查 msgx 日周月报、手动增量主题报、摘要提示词、后台模型响应恢复、补生成、用量记账和账单口径时使用。涵盖重复请求与重复计费边界，不用于API密钥编辑或普通消息查询。
 ---
 
 # 摘要恢复与费用
@@ -10,6 +10,7 @@ description: 修改或排查 msgx 日报周报月报、摘要提示词、后台�
 | 当前问题 | 先核对的项目状态 |
 |---|---|
 | 新生成或材料/字数调整 | `summarize.py` 的自然周期、来源材料、已保存档案及本次输出/推理预算 |
+| 手动主题报或原币支出 | 主题来源、旧稿和请求检查点见 `topic_reports.py`；桌面账单口径见 `usage_store.py`。行为验收见[主题报与原币支出](references/recovery.md#手动主题报与原币支出) |
 | 响应中断或补生成 | `summary_scheduler.py`、`summary_store.py` 与 `llm.py` 的原任务修订、response ID、终态与快照 |
 | 成稿/费用不一致 | 成稿保存阶段、`usage_store.py` 和 `accounted`，区分远端生成与本地恢复 |
 | 提示词自动更新 | `prompt_evolution.py` 的已完成日报、动态版本与在途请求，不直接改个人基础提示词 |

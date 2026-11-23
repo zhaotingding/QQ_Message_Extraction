@@ -10,10 +10,12 @@ from .time_rules import BEIJING
 
 
 class SummaryStore:
-    def prompt_source_reports(self, start: str, end: str) -> list[dict]:
-        bounds = [datetime.combine(date.fromisoformat(day), day_time.min, BEIJING).timestamp() for day in (start, end)]
+    def prompt_source_reports(self, start: str | None, end: str) -> list[dict]:
+        bounds = [datetime.combine(date.fromisoformat(day), day_time.min, BEIJING).timestamp()
+                  for day in (start, end) if day is not None]
+        lower = " AND window_start>=?" if start is not None else ""
         rows = self.conn.execute("SELECT id,window_start,window_end,content FROM summaries"
-                                 " WHERE kind='daily' AND window_start>=? AND window_end<=?"
+                                 f" WHERE kind='daily'{lower} AND window_end<=?"
                                  " AND window_end-window_start=86400 AND content<>''"
                                  " ORDER BY window_start DESC,id DESC", bounds)
         selected = {}  # 同一自然日只选最新成稿，不把旧版本或周月报当独立证据。

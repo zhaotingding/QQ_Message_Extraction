@@ -512,14 +512,11 @@ root.update()
 check("切回服务日志：内容还在（没有被清屏）",
       "测试日志行" in app.log.get("1.0", "end"))
 
-print("\n=== v0.5.0 新增开关的读写往返 ===")
 data2 = app._collect()
-check("保存内容含协议端隐藏开关", "napcat_hidden" in data2, str(sorted(data2)))
+check("已移除无效的协议端窗口开关", not hasattr(app, "v_napcat_hidden"))
 check("旧账单凭据控件已移除", not hasattr(app, "txt_platform_token"))
-app.v_napcat_hidden.set(False)
 _legacy_token = app.prefs.get("platform_token")
 d3 = app._collect()
-check("取消勾选后读到 False", d3["napcat_hidden"] is False, str(d3["napcat_hidden"]))
 check("移除旧设置不改写既有凭据", d3.get("platform_token") == _legacy_token)
 
 # 偏好 → 配置的叠加（只覆盖界面明确管理的字段）
@@ -528,7 +525,7 @@ from msgx import prefs as P  # noqa: E402
 base = {"napcat": {"hidden": True}, "billing": {"platform_token": "cfg-token"},
         "score": {"keywords": []}, "summary": {}, "watch": {}, "filters": {}}
 merged = P.apply_to_config(base, {"napcat_hidden": False, "platform_token": "ui-token"})
-check("界面勾选覆盖 config", merged["napcat"]["hidden"] is False, str(merged["napcat"]))
+check("旧窗口偏好不再覆盖启动配置", merged["napcat"]["hidden"] is True, str(merged["napcat"]))
 check("界面 token 覆盖 config", merged["billing"]["platform_token"] == "ui-token",
       merged["billing"]["platform_token"])
 merged2 = P.apply_to_config(base, {"platform_token": ""})

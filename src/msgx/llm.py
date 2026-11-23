@@ -176,7 +176,7 @@ class LLM:
         from .config import api_key
         saved = prefs.load_from_env() or {}
         if "api" not in self.cfg and "api_profiles" not in saved and not any(
-                key in saved for key in ("summary_prompt", "summary_target_chars", "image_analysis", "image_api_profile", "prompt_evolution")) and role != "image":
+                key in saved for key in ("summary_prompt", "topic_prompt", "summary_target_chars", "image_analysis", "image_api_profile", "prompt_evolution")) and role != "image":
             return self
         cfg = {**self.cfg, "summary": dict(self.cfg.get("summary", {}))}
         cfg["media"] = dict(self.cfg.get("media", {}))
@@ -185,6 +185,8 @@ class LLM:
             cfg["media"]["analysis"] = validate_analysis({**cfg["media"].get("analysis", {}), **saved["image_analysis"]})
         if "prompt_evolution" in saved:
             cfg["summary"]["prompt_evolution"] = dict(saved["prompt_evolution"])
+        if "topic_prompt" in saved:
+            cfg["summary"]["topic_prompt"] = saved["topic_prompt"]
         prompt = str(saved.get("summary_prompt") or "").strip()
         if prompt:
             cfg["summary"]["prompt"] = prompt

@@ -81,7 +81,8 @@ class ReadOwnershipTests(unittest.IsolatedAsyncioTestCase):
     def test_shared_config_has_no_machine_napcat_path_or_misplaced_keys(self):
         cfg = yaml_config.read(Path(__file__).resolve().parents[1] / "config.yaml")
         self.assertEqual(cfg["napcat"]["dir"], "")
-        self.assertTrue({"dir", "hidden", "log_file", "qq_path"} <= cfg["napcat"].keys())
+        self.assertTrue({"dir", "log_file", "qq_path"} <= cfg["napcat"].keys())
+        self.assertNotIn("hidden", cfg["napcat"])
         self.assertFalse({"dir", "hidden", "log_file", "qq_path"} & cfg["watchdog"].keys())
 
     def test_balance_day_and_hour_baseline_do_not_use_host_timezone(self):

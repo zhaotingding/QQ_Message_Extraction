@@ -24,3 +24,21 @@ export function table(headers, rows = []) {
     el('thead', {}, el('tr', {}, headers.map(title => el('th', { scope: 'col' }, title)))),
     el('tbody', {}, rows.map(row => el('tr', {}, row.map(value => el('td', {}, value))))))
 }
+
+export function confirmAction(title, message) {
+  if (document.querySelector('dialog.action-confirm[open]')) return Promise.resolve(false)
+  return new Promise(resolve => {
+    const dialog = el('dialog', { className: 'action-confirm' })
+    dialog.setAttribute('aria-label', title)
+    const cancel = button('取消', () => dialog.close('cancel'), { className: 'confirm-no' })
+    const accept = button('确认', () => dialog.close('confirm'), { className: 'confirm-yes' })
+    dialog.append(el('h2', {}, title), el('p', {}, message), el('div', { className: 'confirm-actions' }, accept, cancel))
+    dialog.addEventListener('close', () => {
+      dialog.remove()
+      resolve(dialog.returnValue === 'confirm')
+    }, { once: true })
+    document.body.append(dialog)
+    dialog.showModal()
+    cancel.focus()
+  })
+}

@@ -25,27 +25,38 @@
 .msgx-messages :is(.msgx-view-related, .msgx-view-keywords) > .msgx-table-scroll {
   flex: 1; max-height: none;
 }
-.msgx-table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 12px; }
-.msgx-table th, .msgx-table td { text-align: left; padding: 4px 9px; vertical-align: middle; }
+.msgx-table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 15px; }
+.msgx-table th, .msgx-table td { text-align: left; padding: 7px 10px; vertical-align: middle; }
 .msgx-table th { position: sticky; top: 0; z-index: 1; background: var(--panel); white-space: nowrap; }
 .msgx-table td { border-bottom: 1px solid var(--border); line-height: 1.35; }
 .msgx-table td:first-child { white-space: nowrap; }
 .msgx-table td button, .msgx-table th button { border: 0; padding: 3px 0; background: transparent; text-align: left; color: inherit; font: inherit; min-width: 3.5em; }
 .msgx-table td button:hover, .msgx-table th button:hover { text-decoration: underline; }
 .msgx-table .msgx-empty { text-align: center; color: var(--muted); padding: 24px; }
-.msgx-current .msgx-table { table-layout: fixed; min-width: 680px; }
-.msgx-current :is(th, td):nth-child(1) { width: 110px; }
+.msgx-current .msgx-table { table-layout: fixed; min-width: 660px; }
+.msgx-current :is(th, td):nth-child(1) { width: 135px; }
 .msgx-current :is(th, td):nth-child(2),
-.msgx-current :is(th, td):nth-child(3) { width: 82px; }
-.msgx-current :is(th, td):nth-child(5) { width: 72px; }
-.msgx-current :is(th, td):nth-child(6) { width: 110px; }
-.msgx-current :is(th, td):nth-child(7) { width: 88px; }
+.msgx-current :is(th, td):nth-child(3) { width: clamp(94px, 8vw, 140px); }
+.msgx-current :is(th, td):nth-child(5) { width: 140px; }
+.msgx-table button[data-identity] { display: block; width: 100%; max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msgx-table button[data-identity][aria-pressed="true"] { background: var(--accent); color: var(--accent-text); border-radius: 4px; padding-inline: 4px; }
+.filter-chip { color: var(--accent); }
 .msgx-current td { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.msgx-current td:last-child { white-space: normal; }
+.home-feed .msgx-current td { padding: 2px 9px; height: 28px; white-space: nowrap; }
+.home-feed .msgx-current td button { padding-block: 0; min-height: 0; line-height: 1.35; }
+.home-feed .msgx-current th { padding-block: 5px; }
 .msgx-current td:nth-child(4) > button {
   display: block; width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .msgx-vision-row, .msgx-vision-row:hover { background: var(--recognized); }
-.msgx-hit-row, .msgx-hit-row:hover { background: var(--keyword); }
+.msgx-hit-row mark, .keyword-label { background: transparent; color: var(--keyword-ink); font-weight: 650; }
+.msgx-view-keywords .msgx-table { table-layout: fixed; min-width: 650px; }
+.msgx-view-keywords th:nth-child(1) { width: 8.6em; }
+.msgx-view-keywords th:nth-child(3) { width: 16%; }
+.msgx-view-keywords th:nth-child(n+4) { width: 12%; }
+.msgx-view-keywords .keyword-excerpt { white-space: normal; overflow-wrap: anywhere; }
+.keyword-label { display: block; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .msgx-related-row td:nth-child(3) { color: var(--danger); }
 .msgx-selected-row { outline: 1px solid var(--accent); outline-offset: -1px; background: var(--surface); }
 .msgx-tab-bar {

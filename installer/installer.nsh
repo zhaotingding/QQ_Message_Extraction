@@ -2,6 +2,9 @@
   ; 自定义 include 在模板载入前编译，下面的函数需先引入条件与路径宏。
   !include LogicLib.nsh
   !include FileFunc.nsh
+  !include nsDialogs.nsh
+  !define MSGX_PREPARE_SCRIPT "${__FILEDIR__}\prepare-protocol.ps1"
+  !include "${__FILEDIR__}\protocol-component.nsh"
 
   !define MSGX_RELOCATION_SCRIPT "${__FILEDIR__}\validate-relocation.ps1"
   Var MsgxRegisteredInstallDir
@@ -44,6 +47,19 @@
     ${ElseIf} ${Silent}
       Call MsgxValidateNewDirectory
     ${EndIf}
+    StrCpy $MsgxWantProtocol 1
+    ${If} $MsgxRegisteredInstallDir != ""
+    ${AndIf} ${FileExists} "$MsgxRegisteredInstallDir\resources\protocol-skipped"
+      StrCpy $MsgxWantProtocol 0
+    ${EndIf}
+    ${If} ${Silent}
+      ClearErrors
+      ${GetOptions} $CMDLINE "/NOQQ" $0
+      ${IfNot} ${Errors}
+        StrCpy $MsgxWantProtocol 0
+      ${EndIf}
+      Call MsgxPrepareProtocol
+    ${EndIf}
   !macroend
 
   ; Assisted 模式的安装范围页直接使用当前用户，保持原来的安装身份。
@@ -52,10 +68,13 @@
   !macroend
 
   !macro customPageAfterChangeDir
+    !insertmacro MsgxProtocolFunctions
     !define MUI_PAGE_CUSTOMFUNCTION_PRE MsgxDirectoryPre
     !define MUI_PAGE_CUSTOMFUNCTION_SHOW MsgxDirectoryShow
     !define MUI_PAGE_CUSTOMFUNCTION_LEAVE MsgxDirectoryLeave
     !insertmacro MUI_PAGE_DIRECTORY
+    Page custom MsgxChooseProtocol MsgxReadProtocol
+    !define MUI_PAGE_CUSTOMFUNCTION_PRE MsgxPrepareProtocol
 
     Function MsgxDirectoryShow
       ${If} $MsgxRegisteredInstallDir != ""
@@ -302,13 +321,30 @@
   !macroend
 
   !macro customInstall
+    ${If} $MsgxWantProtocol == 1
+      ClearErrors
+      Rename "$MsgxProtocolStage" "$INSTDIR\NapCat"
+      ${If} ${Errors}
+        MessageBox MB_ICONSTOP "无法将 QQ 组件写入所选安装目录，请检查文件占用后重试。" /SD IDOK
+        SetErrorLevel 2
+        Quit
+      ${EndIf}
+      StrCpy $MsgxProtocolStage ""
+    ${Else}
+      FileOpen $0 "$INSTDIR\resources\protocol-skipped" w
+      FileClose $0
+    ${EndIf}
     ${IfNot} ${Silent}
     ${AndIfNot} ${isUpdated}
       ; 首次启动可以用安装包的来源定位同仓库旧资料，安装阶段不访问资料。
       ClearErrors
       FileOpen $0 "$INSTDIR\resources\installer-origin.txt" w
       ${IfNot} ${Errors}
-        FileWriteUTF16LE $0 "$EXEDIR"
+        ReadEnvStr $1 MSGX_SETUP_ORIGIN
+        ${If} $1 == ""
+          StrCpy $1 "$EXEDIR"
+        ${EndIf}
+        FileWriteUTF16LE $0 "$1"
         FileClose $0
       ${EndIf}
       ClearErrors
@@ -321,4 +357,7 @@
       Exec '"$INSTDIR\${APP_EXECUTABLE_FILENAME}" --updated'
     ${EndIf}
   !macroend
+  Function .onGUIEnd
+    Call MsgxCleanupStage
+  FunctionEnd
 !endif

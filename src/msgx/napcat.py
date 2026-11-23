@@ -515,9 +515,7 @@ def _shell_execute_runas(exe: str, params: str, show: int = 1) -> int:
 def launch(cfg: dict, visible: bool = False) -> dict:
     """启动协议端。成功返回 ``{"ok": True, "mode": ..., "dir": ..., "log": ...}``。
 
-    ``visible`` 由调用方（界面勾选框）决定，这里是唯一真值来源 ——
-    不要再去读 config 的 ``hidden``：那个键只是勾选框的**初始值**，
-    用户取消勾选后 config 不会变，两个来源并存就会打架。
+    由调用方选择是否显示外部启动脚本的诊断窗口。
     """
     nc = cfg.get("napcat") or {}
     d = resolve_dir(cfg)

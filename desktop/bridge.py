@@ -72,11 +72,12 @@ class Desktop:
         return proc is not None and proc.poll() is None
 
     @contextmanager
-    def read_store(self):
-        path = abs_path(self.cfg, "db_path")
+    def read_store(self, cfg=None):
+        cfg = self.cfg if cfg is None else cfg
+        path = abs_path(cfg, "db_path")
         if not path.is_file():
             raise FileNotFoundError("本地数据库尚未建立。启动服务接收消息后即可查看。")
-        store = Store(path, filters=self.cfg.get("filters"), readonly=True)
+        store = Store(path, filters=cfg.get("filters"), readonly=True)
         try:
             yield store
         finally:
@@ -132,6 +133,8 @@ class Desktop:
                 self.service_cfg = self.cfg
             cfg = self.service_cfg
             managed = bool(cfg["napcat"].get("managed_dir"))
+            if managed and (PROGRAM_ROOT / "protocol-skipped").is_file():
+                raise ValueError("当前只安装了主程序。请重新运行安装向导勾选 QQ 接收组件，或在设置中选择已有协议端。")
             if managed:
                 token = cfg["onebot"].get("access_token") or secrets.token_urlsafe(32)
                 cfg = self.service_cfg = {**cfg, "onebot": {**cfg["onebot"], "access_token": token}}
@@ -343,6 +346,7 @@ class Desktop:
                 "starting": starting, "failed": self.service_failed,
                 "stopping": self.service_running and not self.service.wanted, "health": health, "note": note,
                 "login": self.login_status(health, payload.get("qrMtime")),
+                "protocolSkipped": FROZEN and bool(self.cfg["napcat"].get("managed_dir")) and (PROGRAM_ROOT / "protocol-skipped").is_file(),
                 "managedProtocol": bool((self.service_cfg if running else self.cfg)["napcat"].get("managed_dir")),
                 "account": str(health.get("target_account") or self.cfg.get("napcat", {}).get("account") or "")}
 

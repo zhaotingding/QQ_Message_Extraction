@@ -1,9 +1,10 @@
-import { button, el } from './controls.js'
+import { button, el, confirmAction } from './controls.js'
 import { setupWorkbench } from './workbench.js'
 
 const pages = [
-  ['status', '运行状态'],
+  ['status', '主页'],
   ['messages', '实时消息'],
+  ['logs', '运行日志'],
   ['usage', '用量明细'],
   ['reader', '摘要阅读'],
   ['settings', '设置'],
@@ -23,7 +24,8 @@ const app = {
       throw new Error(error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''))
     }
   },
-  confirm: (title, text) => window.msgx.call('desktop.confirm', { title, text }),
+  navigate: key => show(key),
+  confirm: confirmAction,
   setTheme(name) {
     app.state.theme = name === 'light' ? 'light' : 'dark'
     document.documentElement.dataset.theme = app.state.theme

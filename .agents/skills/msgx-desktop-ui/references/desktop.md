@@ -4,6 +4,8 @@
 
 ## 现行 Electron 入口
 
+开发分支的主页复用实时列表，右栏显示接收概览，运行日志独立挂载。`tests/electron_smoke.cjs` 的隔离窗口覆盖启停、日志滚动与导航；`tests/electron_messages_smoke.cjs` 验证跨群同名发送者筛选和清除。2026-11-23 实测通过。
+
 1.0.8 安装版通过桥接持有单进程的便携 NapCat；首次使用由已鉴权反向连接绑定账号。绿色开关表示点击启动，红色表示点击停止。启动器按外部配置和随包模式分别处理重启；仅收到本次目标账号的新群消息后标记接收成功。
 
 - `src/msgx/main.py` 的 `gui` 默认启动 Electron，`--legacy-tk` 才进入旧界面。`desktop/main.cjs` 管窗口、受控 IPC、Python 子进程与退出；`preload.cjs` 暴露现有 `msgx:call`，renderer 不直接使用 Node、凭据或数据库。

@@ -41,9 +41,6 @@ DEFAULTS: dict = {
     },
     # 仅供参考展示，不入库
     "ui": {"last_tab": 0},
-    # 协议端启动方式：true = 隐藏控制台窗口（默认，用户明确不要任务栏里堆黑框）。
-    # 它是界面上的勾选框，所以必须走偏好；界面不改写 config.yaml。
-    "napcat_hidden": True,
     # 上次群发时勾选的接收群。空列表 = 一个都不预选（默认不选任何群，
     # 必须自己勾；勾过的下次预览自动恢复）。只是界面记忆，不参与服务配置。
     "broadcast_groups": [],
@@ -147,9 +144,8 @@ def load_from_env() -> dict | None:
         return None
     raw = data if isinstance(data, dict) else {}
     prefs = _merge(json.loads(json.dumps(DEFAULTS)), raw)
-    if "summary_target_chars" not in raw:
-        prefs.pop("summary_target_chars", None)
-    return prefs
+    # 界面可以填充空白控件，运行配置只叠加用户写过的项。保存主题不得清空账号或群范围。
+    return {key: (raw[key] if key == "filters" else prefs[key]) for key in raw}
 
 
 def apply_to_config(cfg: dict, prefs: dict) -> dict:
@@ -165,6 +161,8 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
         media["analysis"] = validate_analysis({**media.get("analysis", {}), **prefs["image_analysis"]})
     if "image_api_profile" in prefs:
         out.setdefault("media", {})["image_api_profile"] = str(prefs["image_api_profile"] or "")
+    if "topic_prompt" in prefs:
+        out.setdefault("summary", {})["topic_prompt"] = prefs["topic_prompt"]
     if "prompt_evolution" in prefs:
         out.setdefault("summary", {})["prompt_evolution"] = dict(prefs["prompt_evolution"])
 
@@ -178,24 +176,19 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
     except (TypeError, ValueError):
         pass
 
-    groups = [str(g).strip() for g in (prefs.get("groups") or []) if str(g).strip()]
-    # 群列表是「多选」语义：界面永远写出完整列表。全部取消勾选 = 关注全部群，
-    # 所以这里不区分「未设置」和「空」—— 空就是全部。
-    out["watch"]["groups"] = groups
+    if "groups" in prefs:
+        out["watch"]["groups"] = [str(g).strip() for g in prefs["groups"] if str(g).strip()]
+    if "filters" in prefs:
+        filters = {**out.get("filters", {}), **prefs["filters"]}
+        filters["blocked_senders"] = blocked_senders(filters)
+        for key in ("skip_face_only", "skip_image_only", "skip_forward", "skip_record"):
+            filters[key] = bool(filters.get(key, False))
+        try:
+            filters["min_text_length"] = max(0, int(filters.get("min_text_length") or 0))
+        except (TypeError, ValueError):
+            filters["min_text_length"] = 0
+        out["filters"] = filters
 
-    filters = prefs.get("filters") or {}
-    out.setdefault("filters", {})
-    out["filters"]["blocked_senders"] = blocked_senders(filters)
-    for key in ("skip_face_only", "skip_image_only", "skip_forward", "skip_record"):
-        out["filters"][key] = bool(filters.get(key, False))
-    try:
-        out["filters"]["min_text_length"] = max(0, int(filters.get("min_text_length") or 0))
-    except (TypeError, ValueError):
-        out["filters"]["min_text_length"] = 0
-
-    # 协议端隐藏启动：勾选框是「明确表达」，所以 true/false 都写下去。
-    if "napcat_hidden" in prefs:
-        out.setdefault("napcat", {})["hidden"] = bool(prefs.get("napcat_hidden"))
     if "qq_account" in prefs:
         out.setdefault("napcat", {})["account"] = str(prefs.get("qq_account") or "").strip()
     for local, key in (("napcat_dir", "dir"), ("qq_path", "qq_path")):

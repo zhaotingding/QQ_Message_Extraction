@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from msgx.message_keywords import compile_rules, matching_message
+from msgx.message_keywords import compile_rules, keyword_preview, matching_message
 from msgx.models import parse_onebot_event
 from msgx.store import Store
 from msgx import prefs
@@ -42,6 +42,17 @@ class MessageKeywordTests(unittest.TestCase):
         for lines, expected in ((["普通", "re:["], "第 2 行"), (["re:"], "不能为空")):
             with self.assertRaisesRegex(ValueError, expected):
                 compile_rules(lines)
+
+    def test_keyword_excerpt_marks_regex_suffix_and_individual_image_capture(self):
+        rules = compile_rules([r"re:^(?![\s\S]*广告)[\s\S]*(?:6\.2|灰度)", r"re:(?=(Codex))"])
+        row = {"text": "😀" * 350 + "灰度", "images": [{"ocr_text": "Codex 测试"}]}
+        row["keyword_matches"] = matching_message(rules, row)
+        result = keyword_preview(rules, row)
+        self.assertEqual([text for text, hit in result["keyword_excerpt"] if hit], ["灰度"])
+        self.assertEqual([r["examples"] for r in result["keyword_labels"]], [["灰度"], ["Codex"]])
+        row["text"] = "图片"
+        row["keyword_matches"] = matching_message(rules, row)
+        self.assertIn(("Codex", True), keyword_preview(rules, row)["keyword_excerpt"])
 
     def test_historical_context_is_same_group_bounded_ordered_and_multi_image_aware(self):
         before = [self.add("前文") for _ in range(50)]

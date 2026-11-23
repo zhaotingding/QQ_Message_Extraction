@@ -29,6 +29,7 @@ SUITES = [
     ("YAML 配置与持久化", "test_yaml_config.py"),
     ("本地图片初筛与独立API", "test_image_analysis.py"),
     ("摘要提示词动态观察与恢复", "test_prompt_evolution.py"),
+    ("手动主题报取材、增量修订与恢复", "test_topic_reports.py"),
     ("自动化设置与HTTP闭环", "test_automation_gui.py"),
     ("大号分支与历史数据隔离", "test_accounts.py"),
     ("API 配置与密钥安全", "test_api_settings.py"),

@@ -7,8 +7,52 @@ from datetime import datetime
 
 from .time_rules import BEIJING, beijing_day
 
+# 原始计价币种优先。旧美元记录保留了 cost_usd，旧版 DeepSeek 按人民币计价。
+# 只有折算额又无法确认原币种的历史请求仍可查看，不能据当前汇率倒算。
+NATIVE_CALLS = """
+WITH original AS (
+  SELECT *, CASE WHEN json_valid(pricing) THEN upper(json_extract(pricing,'$.currency')) END AS currency
+  FROM api_calls
+), ledger AS (
+  SELECT *, (status='完成' OR status LIKE '完成，%' OR status IN ('ok','成功','success')) AS completed,
+    CASE WHEN currency IN ('USD','CNY') THEN currency WHEN cost_usd IS NOT NULL THEN 'USD'
+         WHEN provider IN ('旧版 DeepSeek','DeepSeek') OR (provider='' AND lower(model) LIKE 'deepseek%') THEN 'CNY' END AS native
+  FROM original
+), charges AS (
+  SELECT *, CASE WHEN completed AND native='USD' THEN cost_usd END AS usd,
+            CASE WHEN completed AND native='CNY' THEN cost_cny END AS cny,
+            CASE WHEN purpose IN ('摘要分块','超上下文合并') THEN '摘要总结' ELSE purpose END AS function_name
+  FROM ledger
+)
+"""
+
 
 class UsageStore:
+    def native_totals(self, today: str) -> dict:
+        return dict(self.conn.execute(NATIVE_CALLS + """
+            SELECT total(usd) AS usd, total(cny) AS cny,
+                   total(usd) FILTER (WHERE date(ts,'unixepoch','+8 hours')=?) AS today_usd,
+                   total(cny) FILTER (WHERE date(ts,'unixepoch','+8 hours')=?) AS today_cny
+            FROM charges WHERE completed""", (today, today)).fetchone())
+
+    def spending_dashboard(self, today: str) -> dict:
+        groups = self.conn.execute(NATIVE_CALLS + """
+            SELECT provider,model,function_name AS purpose,count(*) AS calls,sum(in_tokens) AS in_tokens,
+                sum(out_tokens) AS out_tokens,sum(usd) AS usd,sum(cny) AS cny FROM charges
+            WHERE completed GROUP BY provider,model,function_name ORDER BY calls DESC,provider,model,purpose""")
+        daily = self.conn.execute(NATIVE_CALLS + """
+            SELECT date(ts,'unixepoch','+8 hours') AS day, provider, model, total(usd) AS usd,total(cny) AS cny
+            FROM charges WHERE completed AND ts>=unixepoch(?,'-29 days','-8 hours')
+              AND ts<unixepoch(?,'+1 day','-8 hours') GROUP BY day,provider,model ORDER BY day,provider,model""", (today, today))
+        items = [dict(r) for r in self.conn.execute(NATIVE_CALLS + """
+            SELECT id,ts,function_name AS purpose,source_ids,source_type,model,provider,in_tokens,out_tokens,
+                   cache_hit_tokens,status,service_tier,pricing,usd,cny FROM charges ORDER BY ts DESC,id DESC LIMIT 500""")]
+        for item in items:
+            ids = json.loads(item.pop("source_ids"))
+            item["source_label"] = f"消息 #{ids[0]}" if len(ids) == 1 else f"{len(ids)} 条消息" if ids else item["source_type"]
+        return {"totals": self.native_totals(today), "groups": [dict(r) for r in groups],
+                "daily": [dict(r) for r in daily], "items": items}
+
     def record_api_call(self, *, ts: float, purpose: str, source_ids: list[int], model: str,
                         usage: dict | None, cost_cny: float | None, status: str, provider: str = "",
                         cost_usd: float | None = None, service_tier: str = "",
@@ -16,7 +60,7 @@ class UsageStore:
         if summary_key and self.summary_request(summary_key)["accounted"]:
             return
         ids = list(dict.fromkeys(source_ids))
-        source_type = ("汇总报告" if purpose in ("日报合并", "摘要合并", "摘要成稿", "提示词更新") else "系统检查") if not ids else "多条消息汇总"
+        source_type = ("汇总报告" if purpose in ("日报合并", "摘要合并", "摘要成稿", "提示词更新", "主题报") else "系统检查") if not ids else "多条消息汇总"
         if len(ids) == 1:
             row = self.get_message(ids[0])
             source_type = {"text": "文字消息", "image": "纯图片", "mixed": "图文/附件"}.get(
