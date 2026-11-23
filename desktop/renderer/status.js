@@ -1,4 +1,5 @@
 import { el, button } from './controls.js'
+import { glyph } from './workbench.js'
 
 const dateFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', dateStyle: 'short', timeStyle: 'short' })
 const date = value => value ? dateFormat.format(new Date(value * 1000)) : '—'
@@ -26,6 +27,8 @@ export function mount(container, app) {
   let live = true
   let loading = false
   let busy = false
+  let pendingAction = ''
+  let statusEpoch = 0
   let qrMtime
   let status
   let billing
@@ -48,16 +51,22 @@ export function mount(container, app) {
     source, { node: el('pre', { className: 'log', tabIndex: 0, 'aria-label': title,
       hidden: source !== logSource.value }, '正在读取日志…'), text: undefined },
   ]))
-  const start = button('启动服务', () => operate('status.start'), { className: 'primary' })
-  const stop = button('停止服务', () => operate('status.stop'))
+  const switchLabel = el('span', { id: 'service-power-action', className: 'service-power-label' }, '启动服务')
+  const serviceSwitch = el('button', { type: 'button', className: 'service-switch', role: 'switch',
+    'aria-label': '接收服务电源', 'aria-describedby': 'service-power-action',
+    onclick: () => operate(status?.serviceRunning || status?.recovering ? 'status.stop' : 'status.start') }, glyph('power'))
+  const powerControl = el('div', { className: 'service-power-control' }, serviceSwitch, switchLabel)
   const restart = button('强制重启协议端', async () => {
-    if (!status?.account) return app.notify('请先保存目标 QQ 号。')
+    if (!status?.account && !status?.managedProtocol) return app.notify('请先保存目标 QQ 号。')
     const account = status.account
-    if (await app.confirm('强制重启协议端', '重启目标 QQ ' + account + ' 的 NapCat，会先检查接收服务，随后可能需要 UAC 授权。')) {
+    const message = status.managedProtocol ? '重启本应用的内置协议端，重新显示登录二维码。'
+      : '重启目标 QQ ' + account + ' 的 NapCat，会先检查接收服务，随后可能需要 UAC 授权。'
+    if (await app.confirm('强制重启协议端', message)) {
       await operate('status.restart', { account })
     }
   })
-  const relogin = button('重新扫码', () => operate('status.relogin', { account: status.account }))
+  restart.classList.add('service-restart')
+  restart.prepend(glyph('rocket'))
   const bill = button('刷新账单', () => operate('status.billing'))
   logSource.onchange = () => {
     for (const [source, view] of Object.entries(logs)) view.node.hidden = source !== logSource.value
@@ -71,7 +80,7 @@ export function mount(container, app) {
   container.append(
     el('section', { className: 'status-overview', 'aria-label': '消息接收' },
       el('div', { className: 'status-commandbar' },
-        el('div', { className: 'toolbar', role: 'group', 'aria-label': '接收服务' }, start, stop, relogin, restart),
+        el('div', { className: 'toolbar', role: 'group', 'aria-label': '接收服务' }, powerControl, restart),
         el('div', { className: 'toolbar', role: 'group', 'aria-label': '账单与资料' },
           bill, button('官方平台', () => operate('status.openBilling')),
           button('打开数据目录', () => operate('status.openData')))),
@@ -87,18 +96,28 @@ export function mount(container, app) {
     schedule, reports), '自动摘要')
 
   function enable() {
-    start.disabled = busy || !status || status.serviceRunning
-    stop.disabled = busy || !status || status.stopping || !(status.serviceRunning || status.recovering)
-    restart.disabled = relogin.disabled = busy || !status?.account
+    const running = Boolean(status?.serviceRunning || status?.recovering)
+    serviceSwitch.setAttribute('aria-checked', String(running))
+    serviceSwitch.disabled = busy || !status || status.starting || status.stopping
+    switchLabel.textContent = pendingAction === 'status.stop' || status?.stopping ? '正在停止…'
+      : pendingAction === 'status.start' || status?.starting ? '正在启动…' : running ? '停止服务' : '启动服务'
+    serviceSwitch.title = switchLabel.textContent
+    restart.disabled = busy || !status || status.stopping || (!status.account && !status.managedProtocol)
     bill.disabled = busy || !status?.health?.ok
   }
 
   async function operate(action, payload) {
     if (busy) return
     busy = true
+    pendingAction = action
+    statusEpoch++
     enable()
     try {
       const result = await app.call(action, payload)
+      if (action === 'status.start' || action === 'status.stop') {
+        statusEpoch++
+        status = null
+      }
       if (action === 'status.billing') billing = result
       if (result.note || result.message) app.notify(result.note || result.message)
       await refresh()
@@ -106,6 +125,7 @@ export function mount(container, app) {
       app.notify(error.message)
     } finally {
       busy = false
+      pendingAction = ''
       enable()
     }
   }
@@ -193,16 +213,19 @@ export function mount(container, app) {
   async function refresh() {
     if (!live || loading) return
     loading = true
+    const epoch = statusEpoch
     try {
       const state = await app.call('status.read', { qrMtime })
-      if (!live) return
+      if (!live || epoch !== statusEpoch) return
       status = state
       const h = state.health
       const b = h.billing?.ts >= (billing?.ts || 0) ? h.billing : billing || h.billing || {}
       const protocol = h.protocol || {}
       const connection = app.updateServiceStatus(state)
-      note.textContent = [connection, state.account ? '目标 QQ ' + state.account : '请在设置中保存目标 QQ 号',
-        protocol.message || protocol.detail, h.ok ? '' : state.note, state.login.note].filter(Boolean).join(' · ')
+      const accountHint = state.managedProtocol ? '扫码后自动识别 QQ' : '请在设置中保存目标 QQ 号'
+      const protocolHint = state.managedProtocol && !h.ws_connected_at ? '' : protocol.message || protocol.detail
+      note.textContent = [connection, state.account ? '目标 QQ ' + state.account : accountHint,
+        protocolHint, h.ok ? '' : state.note, state.login.note].filter(Boolean).join(' · ')
       const entries = [
         ['入库消息', h.stats?.messages ?? '—'],
         ['当前连接', h.ws_conns ?? '—'],

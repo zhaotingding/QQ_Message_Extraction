@@ -7,6 +7,7 @@ import os
 import logging
 import time
 from datetime import date
+from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
@@ -82,12 +83,24 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
         return web.Response(status=401, text="unauthorized")
 
     ws = web.WebSocketResponse(heartbeat=30, max_msg_size=MAX_WS_MSG)
-    target = str((request.app["cfg"].get("napcat") or {}).get("account") or "")
+    cfg = request.app["cfg"]
+    pipe = request.app["pipe"]
+    nc = cfg.get("napcat") or {}
+    target = str(nc.get("account") or "")
+    if nc.get("managed_dir") and not target:
+        # 仅让持有本次私有连接令牌的本机协议端在首次扫码后绑定账号。
+        from .managed_napcat import valid_account, pair_account
+        target = request.headers.get("X-Self-ID", "")
+        if (request.remote not in ("127.0.0.1", "::1") or not cfg["onebot"].get("access_token")
+                or not valid_account(target) or not ws.can_prepare(request).ok):
+            return web.Response(status=403, text="unpaired account")
+        pair_account(Path(nc["managed_dir"]), target)
+        nc["account"] = pipe.target_account = target
+        pipe.departed_groups = pipe.store.departure_cutoffs(target)
     if target and request.headers.get("X-Self-ID") != target:
         log.warning("拒绝非目标 QQ 的协议连接，请核对设置中的目标 QQ 号")
         return web.Response(status=403, text="account mismatch")
     await ws.prepare(request)
-    pipe = request.app["pipe"]
     peer = str(request.remote)
     pipe.register_ws(ws, peer)
     log.info("协议端已连接: %s", request.remote)

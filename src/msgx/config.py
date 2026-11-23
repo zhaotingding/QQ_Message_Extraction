@@ -167,6 +167,9 @@ def load(path: str | Path | None = None, *, include_preferences: bool = True) ->
     prefs = load_from_env() if include_preferences else None
     if prefs:
         cfg = apply_to_config(cfg, prefs)
+    if include_preferences:
+        from .managed_napcat import configure
+        configure(cfg, ROOT, FROZEN)
     if FROZEN:
         # 安装目录会被覆盖或卸载，数据库与输出不能借配置写到程序目录内。
         for key in ("db_path", "media_dir", "report_dir"):

@@ -114,6 +114,8 @@ def resolve_dir(cfg: dict) -> Path | None:
     只有完全没配时才依次尝试 ``NAPCAT_HOME`` 与几个常见位置。
     """
     nc = cfg.get("napcat") or {}
+    if nc.get("managed_dir"):
+        return Path(nc["managed_dir"])
     raw = str(nc.get("dir") or "").strip()
     if raw:
         return _resolve(raw)
@@ -711,7 +713,7 @@ QQ_DATA_ROOTS = (
 )
 
 
-def qq_msg_db_age(account: str = "") -> float | None:
+def qq_msg_db_age(account: str = "", *, data_root: Path | None = None) -> float | None:
     """指定账号消息库最后写入距今秒数；省略账号仅供兼容诊断，找不到返回 None。
 
     ``nt_msg.db-wal`` 的 mtime 就是「QQ 最后一次把消息写进本地库」的时刻。
@@ -726,7 +728,9 @@ def qq_msg_db_age(account: str = "") -> float | None:
     """
     roots: list[Path] = []
     env = os.environ.get("QQ_DATA_ROOT", "").strip()
-    if env:
+    if data_root is not None:
+        roots.append(data_root)
+    elif env:
         roots.append(Path(env))
     else:
         roots.extend(QQ_DATA_ROOTS)

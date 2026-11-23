@@ -4,6 +4,8 @@
 
 ## 现行 Electron 入口
 
+1.0.8 安装版通过桥接持有单进程的便携 NapCat；首次使用由已鉴权反向连接绑定账号。绿色开关表示点击启动，红色表示点击停止。启动器按外部配置和随包模式分别处理重启；仅收到本次目标账号的新群消息后标记接收成功。
+
 - `src/msgx/main.py` 的 `gui` 默认启动 Electron，`--legacy-tk` 才进入旧界面。`desktop/main.cjs` 管窗口、受控 IPC、Python 子进程与退出；`preload.cjs` 暴露现有 `msgx:call`，renderer 不直接使用 Node、凭据或数据库。
 - `desktop/bridge.py` 使用 `ServiceProcess`，分发业务操作；`settings_api.py` 复用 `prefs.update` 局部保存，`messages_api.py` 与 `reader_api.py` 复用 Store 和阅读/朗读实现。修正归属处，不复制整套业务到页面。
 - 默认源码运行使用项目 Conda；安装版由 `installer/` 提供运行时与独立资料根。`MSGX_ROOT`、`MSGX_PREFS` 的有效值由当前入口决定，不能把程序安装目录当可写数据目录。安装模式按 [发布参考](../../msgx-windows-release/references/windows.md)处理。

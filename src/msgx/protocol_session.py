@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import time
+from pathlib import Path
 from datetime import datetime
 from aiohttp import WSCloseCode
 from . import napcat
@@ -286,7 +287,9 @@ class ProtocolSession:
         if (evidence.get("self_id") != self.bot_uin
                 or now - max(self.started_at, self.ws_connected_at, evidence.get("received_at", 0)) < stale_s):
             return
-        age = napcat.qq_msg_db_age(self.bot_uin)
+        managed_dir = self.cfg["napcat"].get("managed_dir")
+        age = (napcat.qq_msg_db_age(self.bot_uin, data_root=Path(managed_dir) / "qq-data")
+               if managed_dir else napcat.qq_msg_db_age(self.bot_uin))
         if age is None or age < stale_s:
             return
         base = self.store.hour_baseline(datetime.now(SHANGHAI).hour, int(wg.get("baseline_days", 7)), self.bot_uin)
@@ -296,6 +299,9 @@ class ProtocolSession:
                                  "message": "疑似停收：当前 QQ 账号和服务均长时间未收到消息"}
         log.warning("疑似停收：QQ %s 消息库已 %.0f 分钟未写入，服务同期无新群消息（小时基线 %d 条）",
                     self.bot_uin, age / 60, base)
+        if managed_dir:
+            self._receive_warning["message"] += "；可点火箭重启本应用的协议端"
+            return
         if now - self._recovery_attempt_at < 3600:
             self._receive_warning["message"] += "；一小时内已尝试恢复，不再自动重启"
             return

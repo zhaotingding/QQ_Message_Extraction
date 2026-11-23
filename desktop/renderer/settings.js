@@ -429,6 +429,7 @@ export function mount(container, app) {
     minLength.value = view.filters.min_text_length;
     qqAccount.value = view.account;
     napcatDir.value = view.napcatDir;
+    napcatDir.placeholder = view.managedProtocol ? '正在使用内置组件，无需选择目录' : '';
     qqPath.value = view.qqPath;
     hidden.checked = view.hidden;
     theme.value = view.theme;
