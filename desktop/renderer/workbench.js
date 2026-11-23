@@ -3,11 +3,26 @@ import { button, el } from './controls.js'
 const paths = {
   power: 'M12 2.5v9M6.7 5.6a8.4 8.4 0 1 0 10.6 0',
   rocket: 'M14 6c3-3 7-3 7-3s0 4-3 7l-5 5-4-4 5-5ZM9 11H4l4-4h5m0 8v5l4-4v-5M7 14c-3 0-4 4-4 6 2 0 6-1 6-4M16 7h.01',
-  status: 'M3 12h4l2-6 4 12 2-6h6',
+  status: 'm3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z',
+  logs: 'M4 3h12l4 4v14H4z M15 3v5h5 M7 12h2m2 0h6M7 16h2m2 0h6',
+  folder: 'M3 6h7l2 2h9v12H3z',
+  refresh: 'M20 5v5h-5M4 19v-5h5M5 9a8 8 0 0 1 14-3l1 4M4 14l1 4a8 8 0 0 0 14-3',
+  external: 'M14 3h7v7m0-7L10 14M11 5H4v15h15v-7',
+  search: 'M16 16l5 5M18 10a8 8 0 1 1-16 0 8 8 0 1 1 16 0',
+  send: 'm2 11 19-8-6 18-4-7-9-3zm9 3L21 3',
+  person: 'M16 7a4 4 0 1 1-8 0 4 4 0 1 1 8 0M4 21v-2a8 8 0 0 1 16 0v2',
+  tag: 'M3 4h9l9 9-8 8L3 11zM7 8h.01',
+  connection: 'M8 3v6m8-6v6M5 9h14v3a7 7 0 0 1-14 0zM12 19v3',
+  groups: 'M15 7a3 3 0 1 1-6 0 3 3 0 1 1 6 0M5 20v-2a7 7 0 0 1 14 0v2M18 5a3 3 0 0 1 0 6m2 3a4 4 0 0 1 2 4',
+  image: 'M3 4h18v16H3zM4 17l5-6 4 4 3-3 5 5M17 8a1 1 0 1 1-2 0 1 1 0 0 1 2 0',
+  theme: 'M12 3a9 9 0 1 0 0 18V3zm0 0a9 9 0 0 1 0 18',
+  save: 'M4 3h13l4 4v14H3V3zM7 3v6h9V3M7 21v-8h10v8',
+  filter: 'M3 4h18l-7 8v7l-4 2v-9z',
+  key: 'M15 4a5 5 0 1 1-2 9l-7 7H3v-4l7-7a5 5 0 0 1 5-5zM16 7h.01',
   messages: 'M4 4h16a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H9l-5 4v-4H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1ZM7 8h10M7 12h7',
   usage: 'M4 3v17h17M8 16v-4m5 4V8m5 8V5',
   reader: 'M12 6C9 4 6 3 3 4v14c3-1 6 0 9 2 3-2 6-3 9-2V4c-3-1-6 0-9 2Zm0 0v14',
-  settings: 'M4 6h16M4 12h16M4 18h16M8 4v4m8 2v4m-6 2v4',
+  settings: 'm10 2 4 0 .7 2.6 2 .9 2.4-.8 2 3.5-1.8 1.9.2 2.3 1.6 1.8-2 3.5-2.5-.6-1.9 1-1 2.6h-4l-.8-2.6-2-1-2.5.7-2-3.5 1.8-1.8v-2.3L2.5 8.3l2-3.5 2.6.8 2-.9z M15.3 11.8a3.3 3.3 0 1 1-6.6 0 3.3 3.3 0 1 1 6.6 0',
   back: 'm14 6-6 6 6 6',
   forward: 'm10 6 6 6-6 6',
   sidebar: 'M4 4h16a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Zm10 0v16',
@@ -23,6 +38,12 @@ export function glyph(name) {
   shape.setAttribute('d', paths[name])
   svg.append(shape)
   return svg
+}
+
+export function decorateAction(element, icon) {
+  element.classList.add('with-glyph')
+  element.prepend(glyph(icon))
+  return element
 }
 
 export function iconButton(name, label, action) {
@@ -221,7 +242,10 @@ export function setupWorkbench(app, pages, show) {
   const statusButton = navigation.querySelector('[data-page="status"]')
   const light = el('span', { className: 'service-light', 'aria-hidden': 'true', 'data-state': 'idle' })
   statusButton.append(light)
+  let receiverRunning = false
+  app.receiverRunning = () => receiverRunning
   app.updateServiceStatus = (state, error) => {
+    receiverRunning = Boolean(state?.serviceRunning)
     const health = state?.health
     const protocol = health?.protocol
     let color = 'idle'
@@ -254,8 +278,8 @@ export function setupWorkbench(app, pages, show) {
     light.dataset.state = color
     footerStatus.dataset.state = color
     if (footerStatus.textContent !== label) footerStatus.textContent = label
-    statusButton.title = ['运行状态', label, reason && reason !== label ? reason : ''].filter(Boolean).join(' · ')
-    statusButton.setAttribute('aria-label', '运行状态 · ' + label)
+    statusButton.title = ['主页', label, reason && reason !== label ? reason : ''].filter(Boolean).join(' · ')
+    statusButton.setAttribute('aria-label', '主页 · ' + label)
     return label
   }
   updateNavigation()

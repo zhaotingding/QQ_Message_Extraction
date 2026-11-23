@@ -212,11 +212,12 @@ async def _messages_recent(request: web.Request) -> web.Response:
 
     def query(store):
         # 消息仍实时读取；月度统计短暂复用，避免三秒轮询反复扫描整个历史窗口。
+        activity_only = request.query.get("view") == "activity"
         return {"ok": True,
                 "items": [dict(row) for row in store.recent_messages(limit, images_only=images_only,
-                           group_id=group_id, account=account)],
+                           group_id=group_id, account=account)] if not activity_only else [],
                 "related": store.recent_messages(limit, group_id=group_id, account=account,
-                            related_only=True) if account else [],
+                            related_only=True) if account and not activity_only else [],
                 "related_account": account, "activity": cached if cached is not None else store.group_activity(
                     account=account, watch_groups=getattr(pipe, "watch", ()),
                     trend_group=request.query.get("activity_group", ""), days=days)}

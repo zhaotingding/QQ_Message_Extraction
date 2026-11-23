@@ -85,6 +85,14 @@ class MessageStore:
                           (str(account), json.dumps(ids), time.time()))
         self.conn.commit()
 
+    def message_group_choices(self, account: str, watch_groups) -> list:
+        """消息筛选只需群资料和成员快照。"""
+        scope, args = self._activity_group_scope("g.id", account)
+        watched = set(map(str, watch_groups or ()))
+        return [dict(r) for r in self.conn.execute(
+            f"SELECT g.id AS group_id,g.name AS group_name FROM groups g WHERE {scope} ORDER BY g.name,g.id", args)
+            if not watched or str(r["group_id"]) in watched]
+
     def _activity_group_scope(self, column: str, account: str = "") -> tuple[str, tuple]:
         if not account:
             return "1=1", ()
@@ -396,7 +404,7 @@ class MessageStore:
 
     def recent_messages(self, limit: int = 60, images_only: bool = False, group_id: str = "",
                         account: str = "", related_only: bool = False,
-                        keyword_rules: tuple | None = None, offset: int = 0, row_ids=None) -> list:
+                        keyword_rules: tuple | None = None, offset: int = 0, row_ids=None, sender_id: str = "") -> list:
         """最近入库的消息（倒序）。带群名与图片处理状态，供界面直接展示。"""
         keyword_sql = ""
         if keyword_rules is not None:
@@ -408,6 +416,9 @@ class MessageStore:
                            " (SELECT 1 FROM message_images i WHERE i.message_row=m.id"
                            " AND keyword_match('',i.ocr_text,i.vision_text)))")
         sender_sql, sender_params = self._sender_condition("m.")
+        # 活动筛选才加入等值条件，使 SQLite 能按群或发送者的时间索引先定位，再取 LIMIT。
+        identity_sql = (" AND m.group_id=?" if group_id else "") + (" AND m.sender_id=?" if sender_id else "")
+        identities = tuple(value for value in (group_id, sender_id) if value)
         id_sql, id_params = "", ()
         if row_ids is not None:
             id_params = tuple(int(value) for value in row_ids)
@@ -428,12 +439,11 @@ class MessageStore:
                 " COALESCE(g.name, '') AS group_name"
                 " FROM messages m LEFT JOIN groups g ON g.id = m.group_id"
                 " WHERE (?=0 OR EXISTS (SELECT 1 FROM message_images i WHERE i.message_row=m.id))"
-                " AND (?='' OR m.group_id=?)"
                 " AND (?=0 OR (relation<>'' AND m.at_all=0))"
                 f" AND {sender_sql}"
-                + keyword_sql + id_sql + " ORDER BY m.ts DESC, m.id DESC LIMIT ? OFFSET ?",
-                (account, account, account, account, account, int(images_only), group_id, group_id,
-                 int(related_only), *sender_params, *id_params, limit, offset),
+                + identity_sql + keyword_sql + id_sql + " ORDER BY m.ts DESC, m.id DESC LIMIT ? OFFSET ?",
+                (account, account, account, account, account, int(images_only),
+                 int(related_only), *sender_params, *identities, *id_params, limit, offset),
             )
         )
         if not rows:

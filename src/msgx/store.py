@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS messages (
   UNIQUE(group_id, msg_id)
 );
 CREATE INDEX IF NOT EXISTS idx_msg_group_ts ON messages(group_id, ts);
+CREATE INDEX IF NOT EXISTS idx_msg_sender_ts ON messages(sender_id, ts);
 CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages(ts);
 
 CREATE TABLE IF NOT EXISTS message_images (

@@ -1,4 +1,5 @@
 // 实时消息、历史定位与逐群操作。所有群消息和 OCR 内容只作为文本绘制。
+import { decorateAction } from './workbench.js';
 const OPERATION_LABELS = {
   pending: '待发送', sending: '已提交，等待结果', sent: '发送成功',
   unknown: '结果未知', failed: '明确失败', not_sent: '未发送',
@@ -185,8 +186,9 @@ function drawTrend(canvas, trend) {
   });
 }
 
-export function mount(container, app) {
-  const saved = app.state.messages || {};
+export function mount(container, app, { listOnly = false, onSelect } = {}) {
+  const stateKey = listOnly ? 'homeMessages' : 'messages';
+  const saved = app.state[stateKey] || {};
   let disposed = false;
   let rows = [];
   let relatedRows = [];
@@ -194,7 +196,7 @@ export function mount(container, app) {
   let activity = {};
   let account = '';
   const imageBusy = saved.imageBusy || new Set();
-  let activeView = saved.activeView === 'details' ? 'list' : saved.activeView || 'list';
+  let activeView = listOnly || saved.activeView === 'details' ? 'list' : saved.activeView || 'list';
   let selectedId = null;
   let selectedDetails;
   let contextId = null;
@@ -206,11 +208,12 @@ export function mount(container, app) {
   let keywordVersion = 0;
   let keywordRequest = null;
   let keywordQueued = false;
-  let loading = false;
+  let pendingKey = '';
   let refreshQueued = false;
   let liveAvailable = true;
   let job = null;
   let operationBusy = true;
+  let jobInitialized = false;
   let jobVersion = 0;
   let jobTimer;
   const page = node('section', null, 'msgx-messages');
@@ -218,6 +221,17 @@ export function mount(container, app) {
 
   const filter = choice('显示', [['all', '全部消息'], ['images', '仅看图片']], saved.filter || 'all');
   const group = choice('群', [['', '全部群'], ...(saved.group ? [[saved.group, saved.group]] : [])], saved.group || '');
+  let sender = saved.sender || null;
+  const highlight = { group: '', sender: '' };
+  const senderChip = control('', () => { sender = null; highlight.sender = ''; changeFilter(); });
+  senderChip.className = 'filter-chip';
+  senderChip.title = '移除发送者筛选';
+  const clearFilters = decorateAction(control('清除筛选', () => {
+    group.input.value = '';
+    sender = null;
+    highlight.group = highlight.sender = '';
+    changeFilter();
+  }), 'filter');
   const auto = toggle('自动刷新', saved.auto !== false);
   const limit = node('input');
   limit.type = 'number';
@@ -227,15 +241,15 @@ export function mount(container, app) {
   limit.className = 'msgx-limit';
   const countLabel = node('label', '条数');
   countLabel.append(limit);
-  const refreshButton = control('立即刷新', () => refresh(true));
+  const refreshButton = decorateAction(control('立即刷新', () => refresh(true)), 'refresh');
   const backLive = control('返回实时', () => changeFilter());
   backLive.hidden = true;
   const status = node('p', '正在读取消息…', 'msgx-muted');
   status.setAttribute('aria-live', 'polite');
   const toolbar = node('div', null, 'toolbar msgx-toolbar');
-  toolbar.append(auto.label, refreshButton, countLabel, filter.label, group.label, backLive);
+  toolbar.append(auto.label, refreshButton, countLabel, filter.label, group.label, senderChip, clearFilters, backLive);
 
-  const messageGrid = grid(['时间', '群', '发送者', '内容', '图片', '识别 / 摘要', '接收账号']);
+  const messageGrid = grid(['时间', '群', '发送者', '内容', '图片与识别']);
   messageGrid.wrap.classList.add('msgx-current');
   const tabBar = node('div', null, 'msgx-tab-bar');
   const tabs = node('nav', null, 'msgx-message-tabs');
@@ -248,15 +262,17 @@ export function mount(container, app) {
     const view = node('section', null, `msgx-message-view msgx-view-${id}`);
     panel.append(view);
     views.set(id, view);
-    const button = control(name, () => switchView(id));
+    const icons = { list: 'messages', activity: 'usage', related: 'person', keywords: 'tag', broadcast: 'send' };
+    const button = decorateAction(control(name, () => switchView(id)), icons[id]);
     tabButtons.set(id, button);
     tabs.append(button);
   }
   views.get('list').append(messageGrid.wrap);
   const details = node('section', null, 'msgx-detail-view');
-  const openDetails = control('消息详情', () => app.showInspector?.());
+  const openDetails = decorateAction(control('消息详情', () => app.showInspector?.()), 'sidebar');
   openDetails.hidden = !app.showInspector;
   tabBar.append(tabs, openDetails);
+  tabBar.hidden = listOnly;
   page.append(tabBar, toolbar, status, panel);
   app.setInspector?.(details, '消息详情');
 
@@ -288,7 +304,7 @@ export function mount(container, app) {
   const relatedGrid = grid(['时间', '群', '关系', '发送者', '内容']);
   relatedView.append(relatedNote, relatedGrid.wrap);
   const keywordNote = node('p', null, 'msgx-muted');
-  const ruleEdit = control('配置关键词', editRules);
+  const ruleEdit = decorateAction(control('配置关键词', editRules), 'settings');
   const previousKeyword = control('上一页', () => {
     keywordOffset -= 200;
     loadKeywords();
@@ -337,15 +353,53 @@ export function mount(container, app) {
     if (!disposed) app.notify(error.message || String(error));
   }
 
-  function switchView(id) {
+  function switchView(id, fetch = true) {
     activeView = id;
     for (const [key, view] of views) {
       view.hidden = key !== id;
       tabButtons.get(key).setAttribute('aria-pressed', String(key === id));
     }
+    if (!jobInitialized && (id === 'activity' || id === 'broadcast')) {
+      jobInitialized = true;
+      void loadJob('').then(() => {
+        if (disposed) return;
+        operationBusy = false;
+        updateOperationButtons();
+      });
+    }
     if (id === 'activity') renderActivity();
     if (id === 'related') renderRelated();
-    if (id === 'keywords') loadKeywords();
+    if (fetch) void refresh(true);
+  }
+
+  function renderFilters() {
+    senderChip.hidden = !sender;
+    senderChip.textContent = sender ? `发送者：${sender.label} ×` : '';
+    clearFilters.hidden = !group.input.value && !sender;
+  }
+
+  function identityCell(kind, value, label) {
+    if (!value) return label || '—';
+    const id = String(value);
+    const cell = control(label || id, () => {
+      if (highlight[kind] !== id) {
+        highlight[kind] = id;
+        for (const other of page.querySelectorAll(`[data-identity="${kind}"]`)) {
+          other.setAttribute('aria-pressed', String(other.dataset.id === id));
+        }
+        return;
+      }
+      if (kind === 'group') {
+        if (![...group.input.options].some(o => o.value === id)) group.input.add(new Option(label || id, id));
+        group.input.value = id;
+      } else sender = { id, label: label || id };
+      changeFilter();
+    });
+    cell.dataset.identity = kind;
+    cell.dataset.id = id;
+    cell.setAttribute('aria-pressed', String(highlight[kind] === id));
+    cell.title = `${label || id}（${id}）· 单击高亮，再点筛选`;
+    return cell;
   }
 
   function renderMessages() {
@@ -357,10 +411,10 @@ export function mount(container, app) {
         selectedId === row.id ? 'msgx-selected-row' : '',
       ].join(' '),
       cells: [
-        formatTime(row.ts), groupName(row), row.sender_name,
-        Object.assign(control(snippet(row), () => select(row)), { title: snippet(row) }), mediaLabel(row),
-        row.image_id ? `${row.vision_text ? '已识别' : '待识别'} · ${row.include_vision ? '已纳入' : '未纳入'}` : '—',
-        row.receiver_accounts || row.received_by || '历史未知',
+        formatTime(row.ts), identityCell('group', row.group_id, groupName(row)),
+        identityCell('sender', row.sender_id, row.sender_name),
+        Object.assign(control(snippet(row), () => select(row)), { title: snippet(row) }),
+        row.image_id ? `${mediaLabel(row)} · ${row.include_vision ? '已纳入' : '未纳入'}` : mediaLabel(row),
       ],
     })), '没有符合筛选条件的消息');
   }
@@ -372,8 +426,8 @@ export function mount(container, app) {
     for (const element of messageGrid.body.rows) {
       element.classList.toggle('msgx-selected-row', element.dataset.key === String(selectedId));
     }
-    // 详情独立显示，选中相关消息时保留当前列表和用户的侧栏开关。
     renderDetails();
+    onSelect?.();
   }
 
   async function imageAction(action, image, values = {}) {
@@ -457,8 +511,8 @@ export function mount(container, app) {
   function renderRelated() {
     relatedNote.textContent = account ? `QQ ${account} · 本人发出、被单独 @ 或引用回复` : '尚未确定当前 QQ 账号';
     fill(relatedGrid, relatedRows.map(row => ({
-      id: row.id, cells: [formatTime(row.ts), groupName(row), row.relation === 'self' ? '我发出的' : '回复我的',
-        row.sender_name, control(snippet(row), () => select(row))],
+      id: row.id, cells: [formatTime(row.ts), identityCell('group', row.group_id, groupName(row)), row.relation === 'self' ? '我发出的' : '回复我的',
+        identityCell('sender', row.sender_id, row.sender_name), control(snippet(row), () => select(row))],
     })), '没有与当前 QQ 相关的消息');
   }
 
@@ -492,7 +546,7 @@ export function mount(container, app) {
     if (disposed) return;
     const requestedOffset = keywordOffset;
     const requestedGroup = group.input.value;
-    const key = `${requestedGroup}:${requestedOffset}`;
+    const key = JSON.stringify([requestedGroup, sender?.id, requestedOffset]);
     // 历史正则搜索可能长于实时节拍，不叠加同一查询。
     if (keywordRequest !== null) {
       if (force || key !== keywordRequest) {
@@ -507,7 +561,7 @@ export function mount(container, app) {
     nextKeyword.disabled = true;
     keywordNote.textContent = '正在检索已保存的消息…';
     try {
-      const result = await app.call('messages.keywords', { offset: requestedOffset, group_id: requestedGroup });
+      const result = await app.call('messages.keywords', { offset: requestedOffset, group_id: requestedGroup, sender_id: sender?.id || '' });
       if (disposed || version !== keywordVersion) return;
       keywordRows = result.items;
       keywordNote.textContent = `第 ${requestedOffset / 200 + 1} 页 · ${keywordRows.length} 条 · 点击消息定位同群历史`;
@@ -515,7 +569,7 @@ export function mount(container, app) {
       nextKeyword.disabled = !result.more;
       fill(keywordGrid, keywordRows.map(row => ({
         id: row.id, className: 'msgx-hit-row',
-        cells: [formatTime(row.ts), groupName(row), row.sender_name, row.keyword_matches.join('、'),
+        cells: [formatTime(row.ts), identityCell('group', row.group_id, groupName(row)), identityCell('sender', row.sender_id, row.sender_name), row.keyword_matches.join('、'),
           control(snippet(row), () => locate(row.id))],
       })), '没有关键词命中，可配置普通词或正则表达式');
     } catch (error) {
@@ -571,7 +625,7 @@ export function mount(container, app) {
   async function locate(id, anchorId = null) {
     const token = ++contextVersion;
     contextId = id;
-    switchView('list');
+    switchView('list', false);
     backLive.hidden = false;
     status.textContent = '正在定位同群消息…';
     try {
@@ -593,28 +647,30 @@ export function mount(container, app) {
   }
 
   async function refresh(force = false) {
-    if (disposed) return;
-    if (loading) {
-      if (force) {
-        loadVersion++;
-        refreshQueued = true;
-      }
+    if (disposed || activeView === 'broadcast') return;
+    if (activeView === 'keywords') return loadKeywords(force);
+    if (contextId && activeView === 'list') return;
+    const pickedGroup = group.input.value;
+    const args = {view: activeView, sender_id: sender?.id || '', limit: Number(limit.value || 200),
+      images: filter.input.value === 'images', group_id: pickedGroup,
+      activity_group: groupForTrend, activity_days: Number(period.input.value)};
+    const key = JSON.stringify(args);
+    if (pendingKey === key) {
+      if (force) refreshQueued = true;
       return;
     }
-    loading = true;
+    pendingKey = key;
+    refreshQueued = false;
     const token = ++loadVersion;
-    const pickedGroup = group.input.value;
     try {
-      const data = await app.call('messages.recent', {
-        limit: Number(limit.value || 200), images: filter.input.value === 'images', group_id: pickedGroup,
-        activity_group: groupForTrend, activity_days: Number(period.input.value), force_activity: force,
-      });
-      if (disposed || token !== loadVersion) return;
+      const data = await app.call('messages.recent', {...args, force_activity: force});
+      if (disposed || token !== loadVersion || activeView !== args.view) return;
       liveAvailable = data.live;
       account = data.related_account;
       relatedRows = data.related;
-      activity = data.activity;
-      const choices = [['', '全部群'], ...(activity.groups || []).map(row => [row.group_id, `${groupName(row)}（${row.group_id}）`])];
+      if (data.activity) activity = data.activity;
+      const choices = [['', '全部群'], ...(data.groups || activity.groups || []).map(row => [row.group_id, `${groupName(row)}（${row.group_id}）`])];
+      if (pickedGroup && !choices.some(([id]) => id === pickedGroup)) choices.push([pickedGroup, group.input.selectedOptions[0]?.text || pickedGroup]);
       if (choices.length !== group.input.options.length || choices.some(([value, text], index) =>
         group.input.options[index].value !== value || group.input.options[index].text !== text)) {
         group.input.replaceChildren(...choices.map(([value, text]) => new Option(text, value)));
@@ -622,7 +678,7 @@ export function mount(container, app) {
       group.input.value = [...group.input.options].some(option => option.value === pickedGroup) ? pickedGroup : '';
       if (activeView === 'activity') renderActivity();
       if (activeView === 'related') renderRelated();
-      if (!contextId) {
+      if (!contextId && activeView === 'list') {
         rows = expandImages(data.items);
         renderMessages();
         status.textContent = `${data.live ? '实时消息' : '接收服务未运行 · 本地历史'} · ${data.items.length} 条消息`
@@ -633,13 +689,13 @@ export function mount(container, app) {
           renderDetails();
         }
       }
+      if (activeView === 'activity' || activeView === 'related') status.textContent = '';
     } catch (error) {
-      if (!disposed && token === loadVersion && !contextId) status.textContent = `刷新失败：${error.message || error}`;
+      if (!disposed && token === loadVersion) status.textContent = `刷新失败：${error.message || error}`;
     } finally {
-      loading = false;
-      if (refreshQueued && !disposed) {
-        refreshQueued = false;
-        refresh(true);
+      if (token === loadVersion) {
+        pendingKey = '';
+        if (refreshQueued && !disposed) void refresh(true);
       }
     }
   }
@@ -652,8 +708,8 @@ export function mount(container, app) {
     keywordOffset = 0;
     backLive.hidden = true;
     renderDetails();
+    renderFilters();
     refresh(true);
-    if (activeView === 'keywords') loadKeywords();
   }
 
   function updateOperationButtons() {
@@ -800,29 +856,24 @@ export function mount(container, app) {
   }
 
   filter.input.onchange = changeFilter;
-  group.input.onchange = changeFilter;
+  group.input.onchange = () => { highlight.group = group.input.value; changeFilter(); };
   limit.onchange = changeFilter;
-  switchView(activeView);
+  switchView(activeView, false);
+  renderFilters();
   renderDetails();
   updateOperationButtons();
   void refresh().then(() => {
     if (!disposed && saved.contextId) return locate(saved.contextId, saved.selectedId);
   });
-  void loadJob('').then(() => {
-    if (disposed) return;
-    operationBusy = false;
-    updateOperationButtons();
-  });
   const timer = setInterval(() => {
-    if (auto.input.checked && liveAvailable && !contextId && !document.hidden) {
+    if (auto.input.checked && (liveAvailable || app.receiverRunning?.()) && !contextId && !document.hidden) {
       refresh();
-      if (activeView === 'keywords') loadKeywords();
     }
   }, 3000);
   return () => {
-    app.state.messages = {
+    app.state[stateKey] = {
       activeView, contextId, selectedId, trend: groupForTrend, ascending, keywordOffset,
-      filter: filter.input.value, group: group.input.value, auto: auto.input.checked,
+      filter: filter.input.value, group: group.input.value, sender, auto: auto.input.checked,
       limit: limit.value, period: period.input.value, draft: compose.value, imageBusy,
     };
     disposed = true;

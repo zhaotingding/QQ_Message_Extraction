@@ -27,14 +27,30 @@ def _recent(ctx, payload):
     limit = max(1, min(int(payload.get("limit", 200)), 300))
     images_only = payload.get("images") is True
     group = str(payload.get("group_id", ""))
+    sender = str(payload.get("sender_id", ""))
+    view = payload.get("view", "all")
     trend = str(payload.get("activity_group", ""))
     days = int(payload.get("activity_days", 14))
     days = days if days in (7, 14, 30) else 14
     live = ctx.service_running
-    if live:
+    if view in ("list", "related"):
+        # 首屏直接读取本机 WAL，无须等待协议健康、稀疏关联查询或月度统计。
+        cfg = ctx.service_cfg if live and ctx.service_cfg else ctx.cfg
+        account = str(cfg["napcat"].get("account") or "")
+        data = {"items": [], "related": [], "groups": [], "related_account": account, "live": live}
+        try:
+            with ctx.read_store(cfg) as store:
+                if view == "list" or account:
+                    data["items" if view == "list" else "related"] = store.recent_messages(
+                        limit, images_only=images_only, group_id=group, sender_id=sender,
+                        account=account, related_only=view == "related")
+                data["groups"] = store.message_group_choices(account, cfg["watch"].get("groups"))
+        except FileNotFoundError:
+            pass
+    elif live:
         query = {"limit": limit, "images": int(images_only), "group_id": group,
                  "activity_group": trend, "activity_days": days,
-                 "activity_refresh": int(payload.get("force_activity") is True)}
+                 "activity_refresh": int(payload.get("force_activity") is True), "view": view}
         data = ctx.request("/messages/recent", query=query, timeout=10)
     else:
         # 停止服务后仍可查看已入库消息。只读连接保持历史文件原样。
@@ -42,8 +58,9 @@ def _recent(ctx, payload):
         data = {"items": [], "related": [], "related_account": account, "activity": {}}
         try:
             with ctx.read_store() as store:
-                data["items"] = store.recent_messages(limit, images_only=images_only, group_id=group, account=account)
-                if account:
+                if view != "activity":
+                    data["items"] = store.recent_messages(limit, images_only=images_only, group_id=group, account=account)
+                if account and view != "activity":
                     data["related"] = store.recent_messages(limit, group_id=group, account=account, related_only=True)
                 data["activity"] = store.group_activity(account=account, watch_groups=ctx.cfg["watch"]["groups"],
                                                          trend_group=trend, days=days)
@@ -98,7 +115,7 @@ def handle(ctx, action, payload):
                     account = str(cfg["napcat"].get("account") or "")
                     items = store.messages_around(int(payload["id"]), account)
                 else:
-                    items = store.recent_messages(201, group_id=str(payload.get("group_id", "")),
+                    items = store.recent_messages(201, group_id=str(payload.get("group_id", "")), sender_id=str(payload.get("sender_id", "")),
                                                   keyword_rules=rules, offset=max(0, int(payload.get("offset", 0))))
         except FileNotFoundError:
             items = []
