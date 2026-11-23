@@ -28,7 +28,7 @@ class ServiceProcess:
         self.restart_cancelled = False
 
     def spawn(self, *, root: Path, prefs_file: Path, stop_file: Path,
-              config_path=None, automatic: bool = False, desktop_instance: str = ""):
+              config_path=None, automatic: bool = False, desktop_instance: str = "", managed_token: str = ""):
         stop_file.unlink(missing_ok=True)
         env = os.environ.copy()
         env.update(MSGX_PREFS=str(prefs_file), PYTHONUTF8="1", PYTHONNOUSERSITE="1",
@@ -36,6 +36,9 @@ class ServiceProcess:
         for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
             env.pop(name, None)
         env["MSGX_DESKTOP_INSTANCE"] = desktop_instance
+        env.pop("MSGX_MANAGED_WS_TOKEN", None)
+        if managed_token:
+            env["MSGX_MANAGED_WS_TOKEN"] = managed_token
         args = []
         if config_path:
             args += ["--config", str(config_path)]

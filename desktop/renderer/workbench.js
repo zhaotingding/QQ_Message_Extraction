@@ -1,6 +1,8 @@
 import { button, el } from './controls.js'
 
 const paths = {
+  power: 'M12 2.5v9M6.7 5.6a8.4 8.4 0 1 0 10.6 0',
+  rocket: 'M14 6c3-3 7-3 7-3s0 4-3 7l-5 5-4-4 5-5ZM9 11H4l4-4h5m0 8v5l4-4v-5M7 14c-3 0-4 4-4 6 2 0 6-1 6-4M16 7h.01',
   status: 'M3 12h4l2-6 4 12 2-6h6',
   messages: 'M4 4h16a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H9l-5 4v-4H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1ZM7 8h10M7 12h7',
   usage: 'M4 3v17h17M8 16v-4m5 4V8m5 8V5',
@@ -12,7 +14,7 @@ const paths = {
   close: 'm6 6 12 12M6 18 18 6',
 }
 
-function glyph(name) {
+export function glyph(name) {
   const ns = 'http://www.w3.org/2000/svg'
   const svg = document.createElementNS(ns, 'svg')
   const shape = document.createElementNS(ns, 'path')

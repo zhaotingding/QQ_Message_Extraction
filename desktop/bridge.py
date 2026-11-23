@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import secrets
 import socket
 import subprocess
 import sys
@@ -26,7 +27,8 @@ from msgx import __version__, conda_runtime, napcat, prefs, security
 from msgx.app_icon import selected_icon
 from msgx.config import ROOT, abs_path, load
 from msgx.local_client import request_json
-from msgx.runtime_paths import FROZEN
+from msgx.runtime_paths import FROZEN, PROGRAM_ROOT
+from msgx.managed_napcat import ManagedNapCat
 from msgx.service_process import ServiceProcess
 from msgx.store import Store
 
@@ -40,6 +42,7 @@ class Desktop:
         self.service_lock = threading.RLock()
         self.login_lock = threading.Lock()
         self.service = ServiceProcess()
+        self.portable = ManagedNapCat(PROGRAM_ROOT)
         self.instance = uuid.uuid4().hex
         self.stop_file = self.prefs_file.parent / f"electron-{self.instance}.stop"
         self.service_cfg = None
@@ -108,11 +111,13 @@ class Desktop:
 
     def account(self, cfg):
         account = str(cfg.get("napcat", {}).get("account") or "").strip()
+        if not account and cfg.get("napcat", {}).get("managed_dir"):
+            return ""  # 安装版首次从已认证的本机 OneBot 握手识别扫码账号。
         if not (account.isascii() and account.isdigit() and int(account)):
             raise ValueError("请在设置中保存目标 QQ 号。")
         return account
 
-    def start(self, automatic=False):
+    def start(self, automatic=False, *, scan=False):
         with self.service_lock:
             if self.closing:
                 raise RuntimeError("窗口正在关闭。")
@@ -126,6 +131,10 @@ class Desktop:
                 self.account(self.cfg)
                 self.service_cfg = self.cfg
             cfg = self.service_cfg
+            managed = bool(cfg["napcat"].get("managed_dir"))
+            if managed:
+                token = cfg["onebot"].get("access_token") or secrets.token_urlsafe(32)
+                cfg = self.service_cfg = {**cfg, "onebot": {**cfg["onebot"], "access_token": token}}
             for key in ("ws_port", "http_port"):
                 port = int(cfg["onebot"][key])
                 try:
@@ -136,12 +145,25 @@ class Desktop:
             self.stop_file.parent.mkdir(parents=True, exist_ok=True)
             proc = self.service.spawn(root=self.root, prefs_file=self.prefs_file,
                                       stop_file=self.stop_file, config_path=self.config_path,
-                                      automatic=automatic, desktop_instance=self.instance)
+                                      automatic=automatic, desktop_instance=self.instance,
+                                      managed_token=cfg["onebot"]["access_token"] if managed else "")
             self.service_note = "接收服务启动中"
             self.service_failed = False
             self.service_started_at = time.monotonic()
             threading.Thread(target=self.watch_service, args=(proc,), daemon=True).start()
+            if managed:
+                try:
+                    self.start_portable(cfg, scan=scan)
+                except Exception:
+                    self.service.request_stop(self.stop_file)
+                    raise
             return {"note": self.service_note}
+
+    def start_portable(self, cfg, *, scan=False):
+        since = time.time()
+        self.portable.start(cfg, scan=scan)
+        self.login_cfg, self.login_since = cfg, since
+        self.login_note = "正在启动内置协议端，首次登录请用手机 QQ 扫码"
 
     def watch_service(self, proc):
         path = abs_path(self.service_cfg, "db_path").parent / "logs/service-output.log"
@@ -156,6 +178,7 @@ class Desktop:
         with self.service_lock:
             if proc is not self.service.proc:
                 return
+            self.portable.stop()
             expected, recover = self.service.exited(proc, code, closing=self.closing)
             self.service_failed = code != 0 and not expected and not self.closing
             self.verified_proc = None
@@ -188,6 +211,8 @@ class Desktop:
         with self.service_lock:
             self.cancel_recovery()
             self.service.restart_cancelled = True
+            self.portable.stop()
+            self.login_cfg, self.login_note = None, ""
             if self.service_running:
                 self.service.request_stop(self.stop_file)
                 self.service_note = "正在安全停止接收服务"
@@ -204,7 +229,7 @@ class Desktop:
                 break
             try:
                 health = self.request("/health", timeout=2)
-                if str(health.get("target_account")) == account:
+                if not account or str(health.get("target_account")) == account:
                     return True
             except RuntimeError:
                 pass
@@ -225,8 +250,9 @@ class Desktop:
             else:
                 self.service.rebuilding = True
                 self.service.restart_cancelled = False
+                previous_portable = self.portable.proc
                 if not self.service_running:
-                    self.start()
+                    self.start(scan=True)
                 if not self.wait_ready(account):
                     proc = self.service.proc
                     if self.closing or self.service.restart_cancelled:
@@ -236,11 +262,19 @@ class Desktop:
                     until = time.monotonic() + 5
                     while self.service.proc is not None and time.monotonic() < until:
                         time.sleep(0.1)
-                    self.start()
+                    self.start(scan=True)
                     if not self.wait_ready(account):
                         raise RuntimeError("接收服务未就绪，协议端重启未执行。")
                 if self.closing or self.service.restart_cancelled:
                     raise RuntimeError("重启已取消。")
+                if self.service_cfg["napcat"].get("managed_dir"):
+                    with self.service_lock:
+                        if self.closing or self.service.restart_cancelled or not self.service_running:
+                            raise RuntimeError("重启已取消。")
+                        if self.portable.proc is previous_portable:
+                            self.portable.stop()
+                            self.start_portable(self.service_cfg, scan=True)
+                    return {"note": self.login_note}
                 result = napcat.restart_target(cfg)
             self.login_note = str(result["note"])
             if result.get("ok") or result.get("scan"):
@@ -254,12 +288,20 @@ class Desktop:
     def login_status(self, health, known_mtime):
         info = {"note": self.login_note, "pending": bool(self.login_cfg), "qr": None}
         cfg = self.login_cfg
+        # 成功收到消息后 login_cfg 已经释放，仍须显示随后发生的协议进程退出。
+        proc = self.portable.proc
+        if proc is not None:
+            code = proc.poll()
+            if code is not None:
+                return {"note": f"内置协议端已退出（{code}），可点火箭重启协议端。", "pending": False, "qr": None}
         if cfg is None:
             return info
         msg = health.get("last_protocol_message") or {}
         since = max(self.login_since, float(health.get("ws_connected_at") or 0))
+        if cfg["napcat"].get("managed_dir") and health.get("protocol", {}).get("state") == "connected":
+            info["note"] = "QQ 协议已连接，等待首条新群消息验证接收"
         if (health.get("protocol", {}).get("state") == "connected"
-                and str(msg.get("self_id")) == self.account(cfg)
+                and str(msg.get("self_id")) == (self.account(cfg) or health.get("target_account"))
                 and float(msg.get("received_at") or 0) > since
                 and float(msg.get("message_time") or 0) >= int(since)):
             self.login_cfg = None
@@ -286,6 +328,11 @@ class Desktop:
             try:
                 health = self.request("/health", timeout=2.5)
                 self.service.healthy(float(health.get("uptime_seconds") or 0))
+                paired = health.get("target_account")
+                if paired and self.service_cfg["napcat"].get("managed_dir"):
+                    self.service_cfg["napcat"]["account"] = paired
+                    if not self.cfg["napcat"].get("account"):
+                        self.cfg["napcat"]["account"] = paired
             except RuntimeError as exc:
                 note = str(exc)
         running = self.service_running
@@ -296,7 +343,8 @@ class Desktop:
                 "starting": starting, "failed": self.service_failed,
                 "stopping": self.service_running and not self.service.wanted, "health": health, "note": note,
                 "login": self.login_status(health, payload.get("qrMtime")),
-                "account": str(self.cfg.get("napcat", {}).get("account") or "")}
+                "managedProtocol": bool((self.service_cfg if running else self.cfg)["napcat"].get("managed_dir")),
+                "account": str(health.get("target_account") or self.cfg.get("napcat", {}).get("account") or "")}
 
     def close(self, *, for_update=False):
         with self.service_lock:
@@ -358,6 +406,13 @@ class Desktop:
         data_folder = abs_path(self.cfg, "db_path").parent
         if action == "status.log":
             if p.get("source") == "napcat":
+                if self.cfg["napcat"].get("managed_dir"):
+                    file = napcat.napcat_own_log(napcat.resolve_dir(self.cfg))
+                    if file is None:
+                        return self.login_note or "随包协议端已就绪，点击启动服务以连接。"
+                    with file.open("rb") as log_file:
+                        log_file.seek(max(0, os.fstat(log_file.fileno()).st_size - 48000))
+                        return security.redact(log_file.read().decode("utf-8", errors="replace"))
                 return security.redact(napcat.log_tail(self.cfg))
             subpath = {"service": "service.log", "output": "service-output.log"}[p.get("source", "service")]
             path = data_folder / "logs" / subpath

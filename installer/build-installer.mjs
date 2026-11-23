@@ -3,6 +3,7 @@ import path from 'node:path'
 import { parseArgs } from 'node:util'
 import { createRequire } from 'node:module'
 import signing from './signed-feed.cjs'
+import { withPortableProtocol } from './portable-protocol.mjs'
 
 const installer = import.meta.dirname
 const root = path.dirname(installer)
@@ -76,6 +77,7 @@ const config = {
     { from: path.join(root, 'config.yaml'), to: 'config.yaml' },
     { from: icon, to: 'assets/app-icon.ico' },
     { from: path.join(root, 'tools', 'restart_napcat_target.ps1'), to: 'tools/restart_napcat_target.ps1' },
+    { from: path.join(root, 'tools', 'napcat-lifetime.cjs'), to: 'tools/napcat-lifetime.cjs' },
   ],
   publish: preview ? null : publish,
   npmRebuild: false,
@@ -90,8 +92,9 @@ const config = {
   },
 }
 
-await build({ projectDir: desktop, targets: Platform.WINDOWS.createTarget(['nsis'], Arch.x64),
-  publish: 'never', config })
+await withPortableProtocol(installer, backend, stage =>
+  build({ projectDir: desktop, targets: Platform.WINDOWS.createTarget(['nsis'], Arch.x64),
+    publish: 'never', config: { ...config, extraFiles: [{ from: stage, to: 'NapCat' }] } }))
 
 if (!preview && !fs.existsSync(path.join(output, 'latest.yml'))) {
   throw new Error('安装包未生成更新清单 latest.yml。')

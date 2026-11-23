@@ -14,12 +14,39 @@ from aiohttp import web
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from msgx.config import DEFAULTS
+from msgx.managed_napcat import configure
 from msgx.napcat import login_failure
 from msgx.onebot import build_app
 from msgx.pipeline import Pipeline
 
 
 class ConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_managed_first_scan_binds_only_the_authenticated_account(self):
+        self.cfg["napcat"].update(dir="", account="")
+        configure(self.cfg, self.root, True)
+        self.cfg["onebot"]["access_token"] = "local-fixture"
+        runner = web.AppRunner(build_app(self.cfg, self.pipe))
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        url = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}/onebot/ws"
+        try:
+            async with aiohttp.ClientSession() as client:
+                with self.assertRaises(aiohttp.WSServerHandshakeError):
+                    await client.ws_connect(url, headers={"X-Self-ID": "12345"})
+                self.assertFalse((self.root / ".ui/napcat/account.json").exists())
+                headers = {"Authorization": "Bearer local-fixture", "X-Self-ID": "12345"}
+                async with client.ws_connect(url, headers=headers):
+                    self.assertEqual(self.pipe.target_account, "12345")
+                with self.assertRaises(aiohttp.WSServerHandshakeError) as error:
+                    await client.ws_connect(url, headers={**headers, "X-Self-ID": "99999"})
+                self.assertEqual(error.exception.status, 403)
+            restored = copy.deepcopy(DEFAULTS)
+            configure(restored, self.root, True)
+            self.assertEqual(restored["napcat"]["account"], "12345")
+        finally:
+            await runner.cleanup()
+
     async def test_bound_account_blocks_wrong_ws_and_http(self):
         self.cfg['napcat']['account'] = '222'
         self.pipe.target_account = '222'

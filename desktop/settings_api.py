@@ -49,6 +49,7 @@ def _settings(ctx, saved):
         target_chars = DIGEST_DEFAULT_CHARS
     return {
         **_api_state(ctx, saved), "theme": _theme(saved), "prefsPath": str(ctx.prefs_file),
+        "managedProtocol": bool(ctx.cfg.get("napcat", {}).get("managed_dir")),
         "configPath": str(config_path(ctx.config_path, root=ctx.root)), "defaultPrompt": DEFAULT_DIGEST_PROMPT,
         "summaryPrompt": saved.get("summary_prompt") or summary.get("prompt") or DEFAULT_DIGEST_PROMPT,
         "targetChars": target_chars if 1 <= target_chars <= 100000 else DIGEST_DEFAULT_CHARS,
@@ -58,7 +59,7 @@ def _settings(ctx, saved):
         "filters": {**{key: bool(filters[key]) for key in FILTER_FLAGS},
                     "blocked_senders": prefs.blocked_senders(filters),
                     "min_text_length": max(0, int(filters.get("min_text_length") or 0))},
-        "account": str(saved.get("qq_account") or napcat.get("account") or ""),
+        "account": str(saved.get("qq_account") or ctx.cfg.get("napcat", {}).get("account") or ""),
         "napcatDir": saved.get("napcat_dir") or napcat.get("dir") or "",
         "qqPath": saved.get("qq_path") or napcat.get("qq_path") or "",
         "hidden": bool(saved.get("napcat_hidden", napcat.get("hidden", True))),

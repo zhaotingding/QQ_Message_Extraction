@@ -5,7 +5,7 @@
 
 **适用：Windows 10 / 11 x64。** 日常用户使用安装版。开发者可从源码运行，沿用项目专用 Conda 环境。
 
-当前源码版本 **1.0.7**，默认打开 Electron 界面。支持加权群活跃度、确认退群并清理消息（保留摘要）、关键词上下文定位、逐群勾选的二次确认群发和摘要语音朗读。完整变更见 [更新日志](CHANGELOG.md)。
+当前源码版本 **1.0.8**，默认打开 Electron 界面。支持加权群活跃度、确认退群并清理消息（保留摘要）、关键词上下文定位、逐群勾选的二次确认群发和摘要语音朗读。完整变更见 [更新日志](CHANGELOG.md)。
 
 | 你现在要做什么 | 从这里开始 |
 |---|---|
@@ -23,7 +23,7 @@
 公开安装包和稳定更新通过 [GitHub Releases](https://github.com/zhaotingding/QQ_Message_Extraction/releases) 分发。首次安装从项目的稳定 Release 下载 Windows x64 安装 EXE。1.0.6 本地预览包关闭了在线更新，需要手动覆盖安装一次带发布公钥的版本，个人资料沿用。
 
 1. 双击 Windows x64 安装包，为当前用户安装。安装向导默认显示原程序目录或新装默认位置，也可以点「浏览」选择新的或空的程序目录。手动换目录时，确认后由原卸载器移除旧程序，再安装到新位置，个人资料留在原地。程序和业务运行时随包提供，无需先安装 Conda、Node.js 或 Git。
-2. 完成页默认勾选「打开消息萃取并进行基础设置」。点击「完成」后可选择深色或浅色主题，为已有 API 档案填写密钥，也可直接跳过。留空保留已保存的密钥，密钥由当前 Windows 用户的凭据管理器保存。收取群消息时另行准备 QQ 和 NapCat。见 [接入 QQ 与 NapCat](#接入-qq-与-napcat)。
+2. 新装完成后选「开始扫码登录」，用手机 QQ 扫码并确认。在「实时消息」看到你的第一条新群消息，即可确认接收成功。Windows x64 安装包将 NapCat 和 NTQQ 运行组件放在所选目录的 `NapCat/`，本地连接自动配置，首次扫码后记住账号。API 密钥选填，只接收消息可留空。已保存外部 NapCat 目录的用户继续沿用原设置。
 3. 应用原地沿用已有资料。首次从已有资料的源码仓库 `installer/` 下运行安装包时，可自动识别该仓库。没有原资料的用户默认使用 `%LOCALAPPDATA%\msgx\profile`。见 [资料位置与复用](docs/使用与排障.md#安装版资料位置与复用)。
 
 如果想把安装后的程序和源码放在同一个项目里，在目录页选择项目根下的 `installed/`。例如项目在 `D:\Dev\MCP\消息萃取-MCP`，程序便装到 `D:\Dev\MCP\消息萃取-MCP\installed`。该子目录不入库，既有资料继续在原处读写。
@@ -43,7 +43,7 @@
 | 打开界面、运行接收服务、测试 | 普通 PowerShell | 项目目录及配置的数据目录必须可写 |
 | 构建主 EXE | 普通 PowerShell | 先关闭当前主 EXE，确保输出文件可替换 |
 | 安装 QQ / Conda | 取决于安装方式 | 安装器如请求管理员权限，按其提示处理 |
-| 启动或强制重启 NapCat 协议端 | **协议端需要提权** | 当前应用会请求 UAC 授权；确认弹窗即可，不必预先把整个应用以管理员身份启动 |
+| 内置协议端启动或重启 | 普通 Windows 用户 | 点击绿色圆形 ⏻ 电源键启动，点击红色电源键停止；火箭按钮重启协议端。旧式外部 Shell 重启仍可能请求 UAC |
 
 `PermissionError`、`Access is denied` 或 `[WinError 5]` **不能单凭错误名称判断原因**。
 先看报错指向的是环境目录、项目文件、被占用的 EXE，还是提权的 QQ 进程；处理方式见
@@ -131,7 +131,9 @@ conda run -n msgx --no-capture-output python -s -m msgx.main gui
 
 ## 接入 QQ 与 NapCat
 
-### 1. 完成协议端的首次安装
+安装版使用内置组件时，只需在首次设置中扫码；也可以稍后用运行状态页的绿色开关启动。以下步骤适用于源码版，或主动选用外部 NapCat Shell 的用户。
+
+### 1. 配置已有的外部协议端
 
 先安装 QQ，再按 [NapCat 官方 Shell 安装说明](https://napneko.github.io/guide/boot/Shell)
 完成 Windows Shell 的解压、首次启动和登录。下载入口见 [官方 Releases](https://github.com/NapNeko/NapCatQQ/releases/latest)。
@@ -221,7 +223,7 @@ EXE 从完整仓库调用项目 Conda 环境和已安装的 Electron。需要对
 | 用量明细 | 每次请求的 Token、费用估算、结果及消费趋势 |
 | 摘要阅读 | 阅读日报／周报／月报，保存阅读状态、重点和心得，可整篇或分段语音朗读 |
 
-**停止接收：** 点击“停止服务”，等待完成提示；这与退出 QQ / NapCat 是不同的操作。
+**停止接收。** 在运行状态页点击红色「停止服务」，等开关变回绿色。随包启动的协议进程一起退出，外部 QQ / NapCat 独立运行。
 服务未运行时不会生成自动摘要，但仍可查看已经保存的历史内容。
 
 ### 可选：开启模型摘要
@@ -355,6 +357,8 @@ if ($LASTEXITCODE) { throw '导出公钥失败；保留已生成的私钥，单�
 
 **每次发布。** 在已审核的 `main` 对应提交、仓库根目录的普通 PowerShell 中操作。先确认项目 Conda 环境已安装 `.[build]`、Node 满足桌面要求，使用已入库的发布公钥。构建成功会产生 EXE、同名 `.blockmap` 和 `latest.yml`。失败时提供失败命令及日志末尾。
 
+首次打包会在构建机下载并核验固定的 [NapCat Windows x64 便携包](https://github.com/XingYunStar/NapCatQQ/releases/tag/v4.18.42) 和许可文件，缓存位于 `installer/dist/components/`。终端用户安装时离线展开。NapCat 上游已结束发布，安装包附归档来源、上游版权与非商用许可；公开再分发前另核对 NTQQ 组件的适用授权。
+
 ```powershell
 conda run -n msgx --no-capture-output python -s installer/build_backend.py
 if ($LASTEXITCODE) { throw '后台构建失败' }
@@ -364,14 +368,14 @@ npm.cmd run build:installer --prefix desktop
 if ($LASTEXITCODE) { throw '安装包构建失败' }
 ```
 
-**核对并签名。** 仍在仓库根目录普通 PowerShell 中执行。示例版本为 1.0.7。签名工具核对清单、实际 EXE 和包内公钥，成功会生成 `latest.yml.sig`。密钥口令由 OpenSSL 在本机提示输入。签名失败时提供报错，保留口令及私钥在本机。
+**核对并签名。** 仍在仓库根目录普通 PowerShell 中执行。示例版本为 1.0.8。签名工具核对清单、实际 EXE 和包内公钥，成功会生成 `latest.yml.sig`。密钥口令由 OpenSSL 在本机提示输入。签名失败时提供报错，保留口令及私钥在本机。
 
 ```powershell
 $key = Join-Path $env:LOCALAPPDATA 'msgx-release-signing/update-private.pem'
-conda run -n msgx --no-capture-output node installer/sign-release.mjs installer/dist/release/1.0.7 $key
+conda run -n msgx --no-capture-output node installer/sign-release.mjs installer/dist/release/1.0.8 $key
 ```
 
-**在 GitHub 发布。** 负责人在 Releases 新建草稿，选择打包的同一个提交，标签为 `v1.0.7`（后续用对应版本）。把同一次构建的 `msgx-setup-1.0.7-x64.exe`、对应 `.exe.blockmap`、`latest.yml`、`latest.yml.sig` 四个文件作为附件，发布为最新稳定版。下个版本重复构建、签名、发布即可。使用者只需首次手动下载安装 EXE，之后从应用内更新。密钥遗失或泄露时，从可信渠道重新分发带新公钥的安装包，让用户手动安装并恢复更新。
+**在 GitHub 发布。** 负责人在 Releases 新建草稿，选择打包的同一个提交，标签为 `v1.0.8`（后续用对应版本）。把同一次构建的 `msgx-setup-1.0.8-x64.exe`、对应 `.exe.blockmap`、`latest.yml`、`latest.yml.sig` 四个文件作为附件，发布为最新稳定版。下个版本重复构建、签名、发布即可。使用者只需首次手动下载安装 EXE，之后从应用内更新。密钥遗失或泄露时，从可信渠道重新分发带新公钥的安装包，让用户手动安装并恢复更新。
 
 本地安装向导验收可在最后一条命令添加 `-- --local-preview`，输出到 `installer/dist/release/<版本>-project-local/`，包名带 `unsigned`，沿用同一安装标识，在线更新关闭。隔离的双版本更新验证见 [安装版与公开更新](.agents/skills/msgx-windows-release/references/windows.md#安装版与公开更新)。
 

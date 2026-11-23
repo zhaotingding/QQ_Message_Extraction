@@ -6,7 +6,11 @@
 
 安装实现统一在 `installer/`：`build_backend.py` 和 `backend_entry.py` 构建随包后台，`build-installer.mjs` 和 `installer.nsh` 构建 NSIS，`update.cjs` 与 `installed-profile.cjs` 由源码桌面与安装包共用。依赖仍从 `desktop/package.json` 解析。`uninstall.ps1` 只调用当前用户注册的目标卸载器，先用 `-WhatIf` 验证目标；测试实例必须加 `-TestBuild`。旧构建成品不因目录整理删除或搬走。
 
-用户于 2026-11-15 批准独立安装版。Windows x64 NSIS 为当前用户部署 Electron 和业务运行时。开发者继续沿用 Conda 源码链路。程序默认资料根为 `%LOCALAPPDATA%\msgx\profile`。如需沿用源码版资料，先退出原应用，再用安装版的 `--msgx-data-root` 指向原资料根。程序记住选择并原地使用资料。该参数不负责复制、迁移或改写 SQLite 内的文件路径。安装、更新和卸载保留资料。密钥沿用当前 Windows 用户的凭据管理器，QQ 与 NapCat 由各自的安装维护。
+用户于 2026-11-15 批准独立安装版。Windows x64 NSIS 为当前用户部署 Electron 和业务运行时。开发者继续沿用 Conda 源码链路。程序默认资料根为 `%LOCALAPPDATA%\msgx\profile`。如需沿用源码版资料，先退出原应用，再用安装版的 `--msgx-data-root` 指向原资料根。程序记住选择并原地使用资料。该参数不负责复制、迁移或改写 SQLite 内的文件路径。安装、更新和卸载保留资料。密钥沿用当前 Windows 用户的凭据管理器，此段描述 1.0.7 及以前的外部协议端模式。
+
+1.0.8 的构建脚本 `installer/portable-protocol.mjs` 固定 v4.18.42 Windows.Node 归档及 SHA-256，使用选定目录的 `NapCat/`。原上游已停止发布，此二进制来源是社区留档。版权、原上游和归档来源随组件提供；NapCat 许可限制商用，NTQQ 和 Node 各自保留权利。
+
+2026-11-23 本地验收：从 1.0.8 交付 EXE 解出组件，704 个上游文件逐一比对一致，随包 Node 在仅含系统目录的 PATH 下加载了 NTQQ 原生库。独立安装身份在中文空格路径完成新装及覆盖，原模拟账号和消息库校验值一致。在隔离副本中替换协议入口测试扫码、OneBot 连接、新消息入库、电源启停及火箭重启，真实腾讯登录留给笔记本验收。回归入口为 `tests/test_connection.py`、`tests/test_managed_napcat.py` 和 `tests/electron_smoke.cjs`。
 
 自 1.0.7，正式更新以安装包内发布公钥验证 latest.yml.sig，严格识别同一版本的 Windows x64 EXE 后按清单 SHA-512 下载。发布工作流、四个附件和首次密钥配置见 [README](../../../../README.md#构建-windows-安装包)。公钥可提交，正式私钥由发布者保存。Windows Authenticode 可选。
 
