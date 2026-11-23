@@ -64,7 +64,6 @@ def _settings(ctx, saved):
         "account": str(saved.get("qq_account") or ctx.cfg.get("napcat", {}).get("account") or ""),
         "napcatDir": saved.get("napcat_dir") or napcat.get("dir") or "",
         "qqPath": saved.get("qq_path") or napcat.get("qq_path") or "",
-        "hidden": bool(saved.get("napcat_hidden", napcat.get("hidden", True))),
     }
 
 
@@ -164,7 +163,6 @@ def _connection_changes(values, saved):
         raise ValueError("目标 QQ 号须为非零数字账号")
     return {
         "qq_account": account, "napcat_dir": values["napcatDir"].strip(), "qq_path": values["qqPath"].strip(),
-        "napcat_hidden": bool(values["hidden"]),
     }
 
 

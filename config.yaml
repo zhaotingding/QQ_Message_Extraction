@@ -70,7 +70,6 @@ napcat:
   start_script: tools/start_napcat.bat
   restart_script: tools/重启协议端.bat
   dir: ''                  # 在设置页填写本机安装目录，不提交个人路径
-  hidden: true
   log_file: data/logs/napcat.log
   qq_path: ''
 

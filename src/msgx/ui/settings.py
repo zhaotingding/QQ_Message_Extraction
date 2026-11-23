@@ -241,20 +241,6 @@ class SettingsPage:
             ttk.Button(path_row, text="选择", command=action).pack(side="right")
         ttk.Label(nc, text="保存后重启消息服务生效；历史数据保留。首次换号请在 NapCat 管理页切换并扫码。",
                   style="Hint.TLabel").pack(anchor="w", pady=(0, 6))
-        self.v_napcat_hidden = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            nc,
-            text="隐藏控制台窗口启动（推荐）",
-            variable=self.v_napcat_hidden,
-        ).pack(anchor="w")
-        ttk.Label(
-            nc,
-            text="勾上 = 启动协议端时不出现 CMD 窗口；启动失败会显示在状态栏和日志中。\n"
-                 "取消勾选 = 回到「看得见」的模式，会弹控制台并显示完整自检输出（排障时用）。\n"
-                 "两种方式都绕不过 UAC 授权弹窗 —— NapCat 要往 QQ 进程注入 DLL，这是管理员操作。",
-            style="Hint.TLabel",
-        ).pack(anchor="w", pady=(6, 0))
-
         appearance = ttk.LabelFrame(tab, text="程序图标", padding=12)
         appearance.pack(fill="x", pady=(12, 0))
         ttk.Button(appearance, text="选择图标（PNG / ICO）", command=self.choose_app_icon).pack(side="left")
@@ -343,13 +329,6 @@ class SettingsPage:
         self.v_napcat_dir.set(str(p.get("napcat_dir") or self.cfg.get("napcat", {}).get("dir") or ""))
         self.v_qq_path.set(str(p.get("qq_path") or self.cfg.get("napcat", {}).get("qq_path") or ""))
 
-        self.v_napcat_hidden.set(
-            bool(
-                prefs_mod.load_raw(self.prefs_file).get(
-                    "napcat_hidden", (self.cfg.get("napcat") or {}).get("hidden", True)
-                )
-            )
-        )
         self._rt_keyword_rules = ()
         try:
             self._rt_keyword_rules = compile_rules(p.get("message_keywords") or [])
@@ -412,7 +391,6 @@ class SettingsPage:
                 "skip_record": bool(self.v_filters["skip_record"].get()),
                 "min_text_length": minlen,
             },
-            "napcat_hidden": bool(self.v_napcat_hidden.get()),
             "qq_account": account,
             "napcat_dir": self.v_napcat_dir.get().strip(),
             "qq_path": self.v_qq_path.get().strip(),

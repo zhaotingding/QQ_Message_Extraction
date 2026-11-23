@@ -113,7 +113,7 @@ export function mount(container, app) {
       values = {groups: [...selectedGroups], filters: {...Object.fromEntries(Object.entries(filterInputs).map(([key, input]) => [key, input.checked])),
         blocked_senders: [...senderList.options].map(option => option.value), min_text_length: minLength.value}};
     } else if (section === 'connection') {
-      values = {account: qqAccount.value, napcatDir: napcatDir.value, qqPath: qqPath.value, hidden: hidden.checked};
+      values = {account: qqAccount.value, napcatDir: napcatDir.value, qqPath: qqPath.value};
     } else return;
     view = await app.call('settings.save', {section, ...values});
     notify(section === 'reports' ? '设置已保存。' : '设置已保存，重启接收服务后生效。');
@@ -371,7 +371,6 @@ export function mount(container, app) {
   const qqAccount = make('input', { type: 'text', inputMode: 'numeric' });
   const napcatDir = make('input', { type: 'text' });
   const qqPath = make('input', { type: 'text' });
-  const [hidden, hiddenToggle] = check('隐藏 NapCat 控制台窗口');
   const protocol = section('账号与协议端', field('目标 QQ 号', qqAccount),
     row(field('本机 NapCat 目录', napcatDir), button('选择目录', async () => {
       const path = await app.call('desktop.pickDirectory', { kind: 'napcat' });
@@ -379,7 +378,7 @@ export function mount(container, app) {
     })), row(field('QQ.exe 路径（可选）', qqPath), button('选择文件', async () => {
       const path = await app.call('desktop.pickFile', { kind: 'qq' });
       if (path) qqPath.value = path;
-    })), hiddenToggle);
+    })));
 
   const theme = make('select', {});
   options(theme, [['dark', '深色'], ['light', '浅色']], 'dark');
@@ -437,7 +436,6 @@ export function mount(container, app) {
     napcatDir.value = view.napcatDir;
     napcatDir.placeholder = view.protocolSkipped ? '未安装 QQ 组件，可在安装向导补装或选择外部目录' : view.managedProtocol ? '正在使用内置组件，无需选择目录' : '';
     qqPath.value = view.qqPath;
-    hidden.checked = view.hidden;
     theme.value = view.theme;
     app.setTheme(view.theme);
     iconPath.textContent = view.iconPath ? `当前图标 ${view.iconPath}` : '';

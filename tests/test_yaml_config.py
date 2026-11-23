@@ -175,7 +175,7 @@ class YamlTests(unittest.TestCase):
             self.assertNotIn("summary_target_chars", loaded)
             cfg = prefs.apply_to_config(copy.deepcopy(config.DEFAULTS), loaded)
             self.assertEqual(cfg["napcat"]["account"], data["qq_account"])
-            self.assertIs(cfg["napcat"]["hidden"], False)
+            self.assertNotIn("hidden", cfg["napcat"])
             self.assertEqual(cfg["filters"]["blocked_senders"], [])
         prefs.save({**data, "summary_target_chars": 3000}, path)
         with patch.dict(os.environ, {prefs.ENV_PREFS: str(path)}):

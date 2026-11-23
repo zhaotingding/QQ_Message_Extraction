@@ -41,9 +41,6 @@ DEFAULTS: dict = {
     },
     # 仅供参考展示，不入库
     "ui": {"last_tab": 0},
-    # 协议端启动方式：true = 隐藏控制台窗口（默认，用户明确不要任务栏里堆黑框）。
-    # 它是界面上的勾选框，所以必须走偏好；界面不改写 config.yaml。
-    "napcat_hidden": True,
     # 上次群发时勾选的接收群。空列表 = 一个都不预选（默认不选任何群，
     # 必须自己勾；勾过的下次预览自动恢复）。只是界面记忆，不参与服务配置。
     "broadcast_groups": [],
@@ -190,9 +187,6 @@ def apply_to_config(cfg: dict, prefs: dict) -> dict:
             filters["min_text_length"] = 0
         out["filters"] = filters
 
-    # 协议端隐藏启动：勾选框是「明确表达」，所以 true/false 都写下去。
-    if "napcat_hidden" in prefs:
-        out.setdefault("napcat", {})["hidden"] = bool(prefs.get("napcat_hidden"))
     if "qq_account" in prefs:
         out.setdefault("napcat", {})["account"] = str(prefs.get("qq_account") or "").strip()
     for local, key in (("napcat_dir", "dir"), ("qq_path", "qq_path")):
