@@ -4,7 +4,19 @@
 
 ## 安装版与公开更新
 
-2026-11-23 开发分支的在线安装流程使用 `Setup.exe` 和独立 NapCat ZIP。版本化主程序 EXE、blockmap、latest.yml 和 latest.yml.sig 保持旧客户端的更新协议。构建、附件清单见 README。已用回环 HTTP 验证独立入口下载、坏组件拒绝、缓存复用、无 QQ 组件安装及保留选择的覆盖升级。已发布 1.0.8 的四附件流程仍是历史版本的行为。
+### 在线安装与可选组件
+
+2026-11-23 核对开发分支 `c4bc952`。维护下载流程时，按实际消费者选择入口。
+
+| 消费者 | 读取和验证 |
+|---|---|
+| 首次安装 | `Setup.exe` 优先读取同目录的版本化主程序，缺少时取构建时指定的 URL。主程序 SHA-256 与入口内置值一致后才交给安装向导。 [引导程序](../../../../installer/bootstrap.nsi) |
+| 选择 QQ 接收组件 | 选中时检查已验证缓存、相邻 ZIP，再按需下载固定版本。替换旧程序前校验组件 SHA-256、在目标同卷解压并检查必要文件。校验失败应保住旧安装。覆盖或静默更新需继承先前跳过组件的选择。 [组件准备](../../../../installer/protocol-component.nsh) · [归档校验](../../../../installer/prepare-protocol.ps1) |
+| 已安装客户端 | 先用包内公钥验证 `latest.yml.sig`，解析刚验签的 `latest.yml` 原文，将版本、x64 EXE 文件名、大小和 SHA-512 绑定到同一候选。用户点击后从该版本的 tag 下载，避免检查与点击之间 `latest` 已指向另一版本。 [签名更新源](../../../../installer/signed-feed.cjs) |
+
+当前开发分支的 Release 附件共六件。既有更新协议使用版本化主程序、同名 blockmap、清单及清单签名，新增的 `Setup.exe` 和独立 NapCat ZIP 服务首次安装和组件选择。发版时对照[该提交的构建与附件清单](../../../../README.md#构建-windows-安装包)。此前记录的回环安装验收覆盖入口下载、坏组件拒绝、缓存复用、跳过组件及覆盖升级保留选择。本轮另用临时密钥运行[更新器回归](../../../../tests/test_desktop_update.cjs)，未重新构建或公开发布。
+
+### 安装位置与历史验收
 
 安装实现统一在 `installer/`：`build_backend.py` 和 `backend_entry.py` 构建随包后台，`build-installer.mjs` 和 `installer.nsh` 构建 NSIS，`update.cjs` 与 `installed-profile.cjs` 由源码桌面与安装包共用。依赖仍从 `desktop/package.json` 解析。`uninstall.ps1` 只调用当前用户注册的目标卸载器，先用 `-WhatIf` 验证目标；测试实例必须加 `-TestBuild`。旧构建成品不因目录整理删除或搬走。
 
@@ -14,7 +26,7 @@
 
 2026-11-23 本地验收：从 1.0.8 交付 EXE 解出组件，704 个上游文件逐一比对一致，随包 Node 在仅含系统目录的 PATH 下加载了 NTQQ 原生库。独立安装身份在中文空格路径完成新装及覆盖，原模拟账号和消息库校验值一致。在隔离副本中替换协议入口测试扫码、OneBot 连接、新消息入库、电源启停及火箭重启，真实腾讯登录留给笔记本验收。回归入口为 `tests/test_connection.py`、`tests/test_managed_napcat.py` 和 `tests/electron_smoke.cjs`。
 
-自 1.0.7，正式更新以安装包内发布公钥验证 latest.yml.sig，严格识别同一版本的 Windows x64 EXE 后按清单 SHA-512 下载。发布工作流、四个附件和首次密钥配置见 [README](../../../../README.md#构建-windows-安装包)。公钥可提交，正式私钥由发布者保存。Windows Authenticode 可选。
+自 1.0.7，应用内更新采用 Ed25519 清单签名。Windows Authenticode 是独立的 Windows 发布者身份机制。公钥随客户端分发，正式私钥由发布者保管。1.0.6 本地验收版首次切换到这条签名链需手动覆盖安装。
 
 手动安装显示程序目录页，接受新建或空目录。覆盖安装默认显示已注册的原路径。换目录时先验证目标写权限、原卸载记录及新旧程序目录与实际资料目录的关系，再确认迁移。源码仓库兼作资料根时，允许它直属的专用 `installed/`，不入 Git。卸载只管理程序目录，数据库、图片和报告不可设在其中。NSIS 复用旧卸载器保留资料，卸载失败不得在新目录解包。静默更新仍沿用原路径。资料先复用已记住的根或默认目录中的已有资料，再考虑从仓库 `installer/` 下启动安装包时可识别的源码资料。手动安装的完成页可以直接打开基础设置，自动更新重启进入工作台。基础设置复用现有主题和凭据接口，留空保持原密钥。使用 `npm.cmd run build:installer --prefix desktop -- --local-preview` 生成同安装身份的未签名本地验收包，输出到 `installer/dist/release/<版本>-project-local/`，该包关闭在线更新。
 

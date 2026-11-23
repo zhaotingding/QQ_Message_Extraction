@@ -14,7 +14,7 @@ description: 选择或维护 msgx 的隔离测试、Electron 交互验收、旧 
 | 改动 | 验证入口与范围 |
 |---|---|
 | Python 业务或缺陷 | `conda run -n msgx --no-capture-output python -s tests/test_<domain>.py`，先选能够暴露该行为的现有组 |
-| Electron 页面、IPC、桌面后端或接收进程联动 | `conda run -n msgx --no-capture-output node tests/electron_smoke.cjs`，实际打开隔离窗口；页面变化另操作受影响控件 |
+| Electron 页面、IPC、桌面后端或接收进程联动 | `conda run -n msgx --no-capture-output node tests/electron_smoke.cjs`。父脚本打开隔离窗口，并向 reader、settings、messages 子检查传入同一窗口的验收接口。 |
 | 旧 Tk 对照界面 | 对应 `test_gui*`、`test_realtime_gui.py` 或阅读/主题组；结果只覆盖旧 Tk |
 | 跨模块整合 | 确有必要时运行 `conda run -n msgx --no-capture-output python -s tests/run_all.py`；该清单不替代 Electron 入口 |
 | 安装、更新或启动器 | [安装与发布](../msgx-windows-release/SKILL.md)中的相应隔离验证，不因普通业务改动重装 |
@@ -25,5 +25,6 @@ description: 选择或维护 msgx 的隔离测试、Electron 交互验收、旧 
 - 整理测试前对照当前调用链，区分废弃、重复与独有覆盖。完整材料、恢复、费用或状态检查迁到现用入口后才能删旧用例；不靠新增文件数证明质量，也不为适配旧断言改回废弃业务。
 - 断言实际结果：相同字典键不能覆盖失败检查；进程退出不等于连接建立，保存受理不等于落盘。凭据实写等显式跳过项不记通过。
 - 分别报告模拟接口、实际 Electron/Tk、本机 HTTP 与真实平台的覆盖；必要检查通过后交付，不因加载技能重跑全套。
+- 核对单页验收时，从父脚本确认相应子检查实际执行。直接用 Node 打开 `electron_settings_smoke.cjs` 等导出模块不会运行断言。Python 的 `test_usage.py` 则是带退出码的独立断言脚本，按脚本入口执行。2026-11-23 核对。
 
 涉及导入隔离、旧断言或测试迁移时，读取[历史问题与覆盖依据](references/confirmed-workflows.md)对应部分。业务预期仍以当前业务契约为准。
