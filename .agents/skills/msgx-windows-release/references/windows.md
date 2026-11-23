@@ -8,21 +8,24 @@
 
 用户于 2026-11-15 批准独立安装版。Windows x64 NSIS 为当前用户部署 Electron 和业务运行时。开发者继续沿用 Conda 源码链路。程序默认资料根为 `%LOCALAPPDATA%\msgx\profile`。如需沿用源码版资料，先退出原应用，再用安装版的 `--msgx-data-root` 指向原资料根。程序记住选择并原地使用资料。该参数不负责复制、迁移或改写 SQLite 内的文件路径。安装、更新和卸载保留资料。密钥沿用当前 Windows 用户的凭据管理器，QQ 与 NapCat 由各自的安装维护。
 
-安装版查询 [公开的稳定 Release](https://github.com/zhaotingding/QQ_Message_Extraction/releases)。发现新版在「帮助」显示蓝点。用户确认「更新并重启」后才下载和验证，完成摘要编辑保存和应用持有的接收服务退出后再安装。源码版用 Git 更新。正式签名和上传 Release 需分别确认，不能从实现或本地安装测试推定已有公开更新。
+自 1.0.7，正式更新以安装包内发布公钥验证 latest.yml.sig，严格识别同一版本的 Windows x64 EXE 后按清单 SHA-512 下载。发布工作流、四个附件和首次密钥配置见 [README](../../../../README.md#构建-windows-安装包)。公钥可提交，正式私钥由发布者保存。Windows Authenticode 可选。
 
 手动安装显示程序目录页，接受新建或空目录。覆盖安装默认显示已注册的原路径。换目录时先验证目标写权限、原卸载记录及新旧程序目录与实际资料目录的关系，再确认迁移。源码仓库兼作资料根时，允许它直属的专用 `installed/`，不入 Git。卸载只管理程序目录，数据库、图片和报告不可设在其中。NSIS 复用旧卸载器保留资料，卸载失败不得在新目录解包。静默更新仍沿用原路径。资料先复用已记住的根或默认目录中的已有资料，再考虑从仓库 `installer/` 下启动安装包时可识别的源码资料。手动安装的完成页可以直接打开基础设置，自动更新重启进入工作台。基础设置复用现有主题和凭据接口，留空保持原密钥。使用 `npm.cmd run build:installer --prefix desktop -- --local-preview` 生成同安装身份的未签名本地验收包，输出到 `installer/dist/release/<版本>-project-local/`，该包关闭在线更新。
 
 实际验证使用隔离资料根，核对安装程序及后台解释器归属、设置和数据库保留、系统卸载入口、更新重启后的版本及收尾。记录本地源验证和公开 Release 验证的各自结果。用户步骤见 [README 安装版](../../../../README.md#安装版) 和 [安装版资料使用指南](../../../../docs/使用与排障.md#安装版资料位置与复用)。
 
-本地双版本测试在仓库根目录的普通 PowerShell 中运行。先按 [README 构建安装包](../../../../README.md#构建-windows-安装包) 构建后端并安装 npm 依赖，正式签名构建那一步换成：
+使用独立测试密钥验证新链路。先构建后台并安装桌面依赖，为下面的 `$testPub`、`$testKey` 指定一对临时 Ed25519 公私钥路径。使用空闲的测试版本目录。
 
 ```powershell
-npm.cmd run build:installer --prefix desktop -- --test-feed http://127.0.0.1:17391/ --test-version 1.0.5
-npm.cmd run build:installer --prefix desktop -- --test-feed http://127.0.0.1:17391/ --test-version 1.0.6
+npm.cmd run build:installer --prefix desktop -- --test-feed http://127.0.0.1:17391/ --test-version 1.0.5 --test-public-key $testPub
+npm.cmd run build:installer --prefix desktop -- --test-feed http://127.0.0.1:17391/ --test-version 1.0.6 --test-public-key $testPub
+node installer/sign-release.mjs installer/dist/test/1.0.6 $testKey
 conda run -n msgx --no-capture-output python -s -m http.server 17391 --bind 127.0.0.1 --directory installer/dist/test/1.0.6
 ```
 
-第一条和第二条应分别产生 `installer/dist/test/1.0.5/` 和 `1.0.6/` 下的验收安装包。安装低版本，保留起始偏好、批注和历史数据后，在该应用的「帮助」菜单检查更新并安装，确认实际重开的是高版本且资料仍在。只使用独立的「消息萃取（更新验收）」实例和合成资料。测试包不签名，更新源限制为本机回环，不能作为正式发行产物上传。正式包的签名、GitHub 下载和 Release 策略仍需要单独验收。
+安装低版本测试包，在回环更新源提供带签名的高版本。核对应用内提示、下载校验、重启版本及原资料读回。缺失签名、签名损坏、使用不同私钥时禁止交给安装器。历次旧版验收记录仅适用于当时实现。
+
+2026-11-23 已用临时 Ed25519 密钥和独立 Windows 安装标识验证 91.0.1 → 91.0.2。伪签名触发零次安装包请求；有效签名配错误文件时下载校验拒绝安装，原窗口继续工作；正确附件经用户动作触发原位升级，新进程使用同一隔离资料根，标记文件保留。正式构建模式用测试密钥验证四个产物。此记录不涉及个人发布密钥或 GitHub 公开投放。持续回归入口为 `tests/test_desktop_update.cjs`。
 
 2026-11-15 实际验收（Windows x64，回环更新源）：1.0.8 在检测到 1.0.9 时显示蓝点，点击前未下载安装包。点击更新后接收服务以退出码 0 关停，原位置的 1.0.9 自动重开并读回显式选择的资料根、QQ 设置、历史摘要和筛选偏好。卸载后安装文件和注册项移除，隔离数据库与偏好文件 SHA-256 不变。测试安装包在本机 `.ui/installer-build/test/`，无正式签名及公开发布验证。
 

@@ -27,7 +27,7 @@ function createUpdates(updater, { notify, requestClose, restoreBackend }) {
   }
 
   if (updater) {
-    // 发布源和校验配置由安装包内的 app-update.yml 提供。
+    // 安装入口已绑定签名清单提供器；下载和安装仍由 electron-updater 接管。
     updater.autoDownload = false
     updater.autoInstallOnAppQuit = false
     updater.allowPrerelease = false
@@ -53,6 +53,9 @@ function createUpdates(updater, { notify, requestClose, restoreBackend }) {
       return set('current', '当前已是最新正式版。', { version: '' })
     } catch (error) {
       const messages = {
+        ERR_MSGX_SIGNED_MANIFEST: '更新清单签名或内容校验失败，已停止此次更新。',
+        ERR_MSGX_UPDATE_KEY: '安装版缺少有效的更新公钥，请从项目 Release 手动覆盖安装。',
+        HTTP_ERROR_404: '暂未找到稳定版本的更新清单或签名。',
         ERR_UPDATER_LATEST_VERSION_NOT_FOUND: '暂未找到可更新的公开发布版本。',
         ERR_UPDATER_NO_PUBLISHED_VERSIONS: '暂未找到可更新的公开发布版本。',
         ERR_UPDATER_CHANNEL_FILE_NOT_FOUND: '公开发布暂时缺少更新清单。',
@@ -68,7 +71,7 @@ function createUpdates(updater, { notify, requestClose, restoreBackend }) {
     if (!downloaded) {
       set('downloading', '正在准备下载安装包…', { canInstall: false })
       try {
-        // electron-updater 验证发布清单的摘要，并按安装包配置检查签名。
+        // electron-updater 按已验签清单中的 SHA-512 校验下载。
         await updater.downloadUpdate()
       } catch (error) {
         return failed(error, '下载或校验失败。可以稍后重试。', { canInstall: true })
