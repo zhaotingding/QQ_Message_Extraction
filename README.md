@@ -1,11 +1,11 @@
 # 消息萃取（msgx）
 
-接收 QQ 群消息，在本机检索、查看图片 OCR，并按需调用模型生成日报、周报和月报。
-日常接收不会自动向 QQ 群发送消息。手动群发须先预览并二次确认；启用摘要、提示词更新或图片分析时，会把相应材料发送给你配置的 API 服务商。
+在主页查看和筛选 QQ 群消息、阅读图片 OCR。可按需启用日报、周报和月报，也可选一个技术热点，将分散在多份日报里的进展汇成持续更新的主题报。
+群发消息需先预览、逐群勾选并确认。生成报告、更新提示词或调用图片分析时，相应材料会发送给你配置的 API 服务商。
 
 **适用：Windows 10 / 11 x64。** 日常用户使用安装版。开发者可从源码运行，沿用项目专用 Conda 环境。
 
-当前源码版本 **1.0.8**，默认打开 Electron 界面。支持加权群活跃度、确认退群并清理消息（保留摘要）、关键词上下文定位、逐群勾选的二次确认群发和摘要语音朗读。完整变更见 [更新日志](CHANGELOG.md)。
+当前源码版本 **1.10.0**。这一版支持 Windows 轻量在线安装、手动增量主题报和按原币统计的 API 账单。[完整更新日志](CHANGELOG.md)
 
 | 你现在要做什么 | 从这里开始 |
 |---|---|
@@ -20,10 +20,10 @@
 
 ## 安装版
 
-首次安装从 [GitHub Releases](https://github.com/zhaotingding/QQ_Message_Extraction/releases) 下载在线入口 `Setup.exe`。它会取得并校验主程序，随后显示目录和组件选择。接收 QQ 消息时保留 NapCat 勾选；只查看历史时可跳过，以后重开安装向导即可补装。旧版本升级继续使用原签名清单和应用内更新入口。
+打开对应版本的 **Assets**，下载并双击 `Setup.exe`。它会取得并校验主程序，然后让你选择安装目录和 QQ 接收组件。要收消息就勾选组件，只读历史可跳过，以后也能补装。较早的 Release 如果只提供版本化安装程序，下载 `msgx-setup-<版本>-x64.exe` 即可。[GitHub Releases](https://github.com/zhaotingding/QQ_Message_Extraction/releases)
 
 1. 双击 Windows x64 安装包，为当前用户安装。安装向导默认显示原程序目录或新装默认位置，也可以点「浏览」选择新的或空的程序目录。手动换目录时，确认后由原卸载器移除旧程序，再安装到新位置，个人资料留在原地。程序和业务运行时随包提供，无需先安装 Conda、Node.js 或 Git。
-2. 新装完成后选「开始扫码登录」，用手机 QQ 扫码并确认。在「实时消息」看到你的第一条新群消息，即可确认接收成功。Windows x64 安装包将 NapCat 和 NTQQ 运行组件放在所选目录的 `NapCat/`，本地连接自动配置，首次扫码后记住账号。API 密钥选填，只接收消息可留空。已保存外部 NapCat 目录的用户继续沿用原设置。
+2. 选装 QQ 接收组件后，向导会将 NapCat 和 NTQQ 放入所选程序目录的 `NapCat/`。首次打开选「开始扫码登录」，用手机 QQ 确认。在主页看到目标账号收到的一条新群消息，即已验证接收成功。程序会记住账号，已有的外部 NapCat 配置继续生效。只收消息可留空 API 密钥。
 3. 应用原地沿用已有资料。首次从已有资料的源码仓库 `installer/` 下运行安装包时，可自动识别该仓库。没有原资料的用户默认使用 `%LOCALAPPDATA%\msgx\profile`。见 [资料位置与复用](docs/使用与排障.md#安装版资料位置与复用)。
 
 如果想把安装后的程序和源码放在同一个项目里，在目录页选择项目根下的 `installed/`。例如项目在 `D:\Dev\MCP\消息萃取-MCP`，程序便装到 `D:\Dev\MCP\消息萃取-MCP\installed`。该子目录不入库，既有资料继续在原处读写。
@@ -125,7 +125,7 @@ conda run -n msgx --no-capture-output python -s -m msgx.main gui
 ```
 
 前两条安装桌面依赖并生成带项目名称和默认图标的 Electron 界面程序。首次安装及桌面依赖锁文件变化后，先关闭项目窗口再执行这两条命令。
-**成功标志：** 出现“消息萃取”窗口，左栏有运行状态、实时消息、设置、用量明细、摘要阅读。
+**成功标志**是出现「消息萃取」窗口，左栏可以切换主页、实时消息、运行日志、用量明细、摘要阅读和设置。
 干净安装先只核对“待配置”状态，不点击启动服务；不复制旧 `.ui/` 或 `data/`。
 没有 API 密钥也能打开界面；同一 Windows 用户的新克隆仍可能读到已有凭据，不能据此认定密钥已隔离。
 
@@ -192,7 +192,7 @@ qqnt.json
 
 - 已登录且运行中的 NapCat 会按连接设置接入本服务。
 - 需要重新启动并扫码时，再点击 **强制重启**。确认目标账号后，允许 UAC 授权并完成手机扫码。
-- **成功标志：** 服务运行、协议端已连接，并且“实时消息”出现目标账号收到的新群消息。
+- **成功标志**是服务运行、协议端已连接，且主页消息列表出现目标账号收到的新群消息。
 
 “已连接”只证明通信链路建立，不单独证明 QQ 登录和消息接收成功。
 若不收消息，按[接收排障](docs/使用与排障.md#服务运行但没有新消息)逐层检查，避免连续点击重启。
@@ -349,18 +349,7 @@ conda run -n msgx --no-capture-output python -s tools\build_launcher.py
 
 **协作分工。** 开发者按功能提交、测试并提 PR。负责人审查后 Squash 合入 `main`，决定何时发布，合并 PR 不会自动发版。发版前在 PR 中同步源码版本和 CHANGELOG。协作者用公钥构建，用独立测试密钥验收，正式私钥只由发布者保管。
 
-**首次发布只做一次。** 发布者在仓库根目录的普通 PowerShell 中操作，项目 Conda 环境需含 OpenSSL 3。以下命令在仓库外生成口令加密的 Ed25519 私钥，只将公钥导出到 `installer/update-public.pem`。将公钥通过 PR 合入 `main`，私钥和口令另做离线备份。已有配对密钥可直接导出原公钥。失败时提供 OpenSSL 版本和错误文字。
-
-```powershell
-$keyDir = Join-Path $env:LOCALAPPDATA 'msgx-release-signing'
-$key = Join-Path $keyDir 'update-private.pem'
-if ((Test-Path $key) -or (Test-Path installer/update-public.pem)) { throw '已有密钥或公钥，请使用原密钥。' }
-New-Item -ItemType Directory -Path $keyDir -Force | Out-Null
-conda run -n msgx --no-capture-output openssl genpkey -algorithm ED25519 -aes-256-cbc -out $key
-if ($LASTEXITCODE) { throw '生成私钥失败' }
-conda run -n msgx --no-capture-output openssl pkey -in $key -pubout -out installer/update-public.pem
-if ($LASTEXITCODE) { throw '导出公钥失败；保留已生成的私钥，单独重试导出命令。' }
-```
+**更新签名密钥。** 仓库随附客户端使用的 Ed25519 公钥，协作者克隆后即可构建。正式签名由发布者在保存配对私钥的机器上执行，需使用项目 Conda 环境中的 OpenSSL 3。更换发布机器时，从离线备份恢复原加密私钥。下方命令默认它位于 `%LOCALAPPDATA%\msgx-release-signing\update-private.pem`。[发布公钥](installer/update-public.pem)
 
 **每次发布。** 在已审核的 `main` 对应提交、仓库根目录的普通 PowerShell 中操作。先确认项目 Conda 环境已安装 `.[build]`、Node 满足桌面要求，使用已入库的发布公钥。构建成功会产生 EXE、同名 `.blockmap` 和 `latest.yml`。失败时提供失败命令及日志末尾。
 
@@ -375,11 +364,14 @@ npm.cmd run build:installer --prefix desktop
 if ($LASTEXITCODE) { throw '安装包构建失败' }
 ```
 
-**核对并签名。** 仍在仓库根目录普通 PowerShell 中执行。示例版本为 1.0.8。签名工具核对清单、实际 EXE 和包内公钥，成功会生成 `latest.yml.sig`。密钥口令由 OpenSSL 在本机提示输入。签名失败时提供报错，保留口令及私钥在本机。
+**核对并签名。** 在仓库根目录的普通 PowerShell 中，按当前源码版本选择构建目录。签名工具核对清单、EXE 和包内公钥，成功后生成 `latest.yml.sig`。OpenSSL 会在本机提示输入密钥口令。遇到错误时提供报错文字，私钥和口令由发布者保管。
 
 ```powershell
 $key = Join-Path $env:LOCALAPPDATA 'msgx-release-signing/update-private.pem'
-conda run -n msgx --no-capture-output node installer/sign-release.mjs installer/dist/release/1.0.8 $key
+$releaseVersion = conda run -n msgx --no-capture-output python -s -c "import msgx; print(msgx.__version__)"
+if ($LASTEXITCODE) { throw '读取项目版本失败' }
+$releaseDir = Join-Path 'installer/dist/release' $releaseVersion
+conda run -n msgx --no-capture-output node installer/sign-release.mjs $releaseDir $key
 ```
 
 **在 GitHub 发布。** 新建稳定 Release，标签对应打包的提交和源码版本。上传 `Setup.exe`、版本化主程序 EXE、同名 `.exe.blockmap`、`latest.yml`、`latest.yml.sig` 以及 `msgx-napcat-v4.18.42-x64.zip` 六个附件。新用户只需下载 `Setup.exe`；离线安装可将入口、主程序和组件 ZIP 放在同一目录。版本化主程序 EXE 仍供已安装客户端验签更新。开发构建不要替换同版本的已发布附件。
