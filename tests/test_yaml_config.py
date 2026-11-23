@@ -28,6 +28,23 @@ class YamlTests(unittest.TestCase):
         path.write_text(yaml_config.dumps(data), encoding="utf-8")
         return path
 
+    def test_scoped_save_preserves_base_and_explicit_clears(self):
+        cfg = copy.deepcopy(config.DEFAULTS)
+        cfg["napcat"].update(account="12345", dir="external-qq")
+        cfg["watch"]["groups"] = ["100"]
+        cfg["filters"]["min_text_length"] = 12
+        path = self.write("prefs.yaml", {"ui": {"theme": "light"}})
+        with patch.dict(os.environ, {prefs.ENV_PREFS: str(path)}):
+            prefs.update({"summary_target_chars": 2000}, path)
+            result = prefs.apply_to_config(cfg, prefs.load_from_env())
+            self.assertEqual(result["napcat"], cfg["napcat"])
+            self.assertEqual(result["watch"]["groups"], ["100"])
+            self.assertEqual(result["filters"]["min_text_length"], 12)
+            prefs.update({"qq_account": "", "groups": [], "filters": {"min_text_length": 0}}, path)
+            result = prefs.apply_to_config(cfg, prefs.load_from_env())
+            self.assertEqual((result["napcat"]["account"], result["watch"]["groups"], result["filters"]["min_text_length"]),
+                             ("", [], 0))
+
     def test_local_module_update_preserves_false_zero_empty_and_other_modules(self):
         path = self.write("preferences.yaml", {"ui": {"theme": "dark"}, "account": "00123",
                                                "image_analysis": {"enabled": True}})

@@ -1,10 +1,25 @@
-.settings-page { max-width: 1250px; }
-.settings-actions {
-  position: sticky; top: 0; z-index: 1; background: var(--bg);
-  margin: 0 0 12px; padding: 5px 0; border: 0; min-width: 0;
-}
-.settings-section { margin-inline: 0; padding-top: 12px; scroll-margin-top: 90px; }
-.settings-section > legend, .settings-rule-list legend { padding-inline: 5px; font-weight: 650; }
+#page-settings { height:100%; min-height:0; padding:0; }
+.settings-page { height:100%; min-height:0; display:grid; grid-template-columns: clamp(205px,21vw,285px) minmax(0,1fr); }
+.settings-rail { min-height:0; overflow:auto; padding:20px 14px; border-right:1px solid var(--border); background:var(--rail); }
+.settings-search { display:flex; align-items:center; gap:8px; padding:5px 12px; border:1px solid var(--border); border-radius:18px; color:var(--muted); }
+.settings-search:focus-within { border-color:var(--accent); }
+.settings-search input { width:100%; border:0; padding:0; background:transparent; outline:none; }
+.settings-nav-group { display:grid; gap:3px; padding-block:16px 5px; }
+.settings-nav-group h3 { margin:0 0 5px; padding-inline:10px; font-size:14px; color:var(--muted); }
+.settings-nav button { width:100%; border:0; background:transparent; text-align:left; justify-content:flex-start; gap:12px; padding:8px 11px; border-radius:8px; font-size:16px; }
+.settings-nav button:hover { background:var(--button-hover); }
+.settings-nav button[aria-current="page"] { color:var(--text); background:var(--selected); font-weight:650; }
+.settings-rail > button { margin:20px 6px 0; }
+.settings-content { min-width:0; overflow:auto; padding:24px clamp(15px,3vw,46px) 40px; }
+.settings-content > * { max-width:900px; }
+.settings-content h2 { font-size:24px; margin:0 0 6px; }
+.settings-content > [role="status"] { font-size:14px; margin-bottom:20px; }
+.settings-actions { margin:8px 0; padding:0; border:0; }
+.settings-actions button { background:var(--accent); color:var(--accent-text); font-weight:600; }
+.settings-section { min-width:0; margin:0 0 18px; padding:14px 18px 18px; border-radius:9px; }
+.settings-section legend, .settings-rule-list legend { padding-inline:5px; font-weight:650; }
+.settings-advanced { margin-block:10px; }
+.settings-advanced summary { cursor:pointer; padding-block:4px; }
 .settings-section > .toolbar + * { margin-top: 10px; }
 .settings-section > .settings-field + * { margin-top: 8px; }
 .settings-grid {

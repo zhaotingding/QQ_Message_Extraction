@@ -42,7 +42,7 @@ def _api_state(ctx, saved):
 
 def _settings(ctx, saved):
     summary = ctx.base_cfg.get("summary", {})
-    filters = {**prefs.DEFAULTS["filters"], **saved.get("filters", {})}
+    filters = {**prefs.DEFAULTS["filters"], **ctx.base_cfg.get("filters", {}), **saved.get("filters", {})}
     napcat = ctx.base_cfg.get("napcat", {})
     try:
         target_chars = int(saved.get("summary_target_chars") or summary.get("target_chars") or DIGEST_DEFAULT_CHARS)
@@ -51,13 +51,13 @@ def _settings(ctx, saved):
     return {
         **_api_state(ctx, saved), "theme": _theme(saved), "prefsPath": str(ctx.prefs_file),
         "managedProtocol": bool(ctx.cfg.get("napcat", {}).get("managed_dir")),
-        "protocolSkipped": FROZEN and (PROGRAM_ROOT / "protocol-skipped").is_file(),
+        "protocolSkipped": FROZEN and bool(ctx.cfg.get("napcat", {}).get("managed_dir")) and (PROGRAM_ROOT / "protocol-skipped").is_file(),
         "configPath": str(config_path(ctx.config_path, root=ctx.root)), "defaultPrompt": DEFAULT_DIGEST_PROMPT,
         "summaryPrompt": saved.get("summary_prompt") or summary.get("prompt") or DEFAULT_DIGEST_PROMPT,
         "targetChars": target_chars if 1 <= target_chars <= 100000 else DIGEST_DEFAULT_CHARS,
         "promptEvolution": {"enabled": False, "days": 7, "interval_days": 7,
                             **summary.get("prompt_evolution", {}), **saved.get("prompt_evolution", {})},
-        "image": validate_analysis(_image(ctx, saved)), "groups": [str(v) for v in saved.get("groups", [])],
+        "image": validate_analysis(_image(ctx, saved)), "groups": [str(v) for v in saved.get("groups", ctx.base_cfg.get("watch", {}).get("groups", []))],
         "filters": {**{key: bool(filters[key]) for key in FILTER_FLAGS},
                     "blocked_senders": prefs.blocked_senders(filters),
                     "min_text_length": max(0, int(filters.get("min_text_length") or 0))},
@@ -137,7 +137,7 @@ def _image_changes(ctx, values, saved, profiles):
     return {"image_analysis": image, "image_api_profile": profile}
 
 
-def _save_settings(ctx, values, saved):
+def _report_changes(values, saved):
     try:
         chars = int(values["targetChars"])
         if not 1 <= chars <= 100000:
@@ -151,29 +151,52 @@ def _save_settings(ctx, values, saved):
             raise ValueError
     except (TypeError, ValueError):
         raise ValueError("提示词材料须为 2～30 天，更新间隔须为 1～30 天") from None
+    return {
+        "summary_prompt": values["summaryPrompt"].strip(), "summary_target_chars": chars,
+        "prompt_evolution": {**saved.get("prompt_evolution", {}), "enabled": bool(prompt["enabled"]),
+                             "days": days, "interval_days": interval},
+    }
+
+
+def _connection_changes(values, saved):
     account = values["account"].strip()
     if account and (not account.isascii() or not account.isdigit() or int(account) == 0):
         raise ValueError("目标 QQ 号须为非零数字账号")
+    return {
+        "qq_account": account, "napcat_dir": values["napcatDir"].strip(), "qq_path": values["qqPath"].strip(),
+        "napcat_hidden": bool(values["hidden"]),
+    }
+
+
+def _reception_changes(values, saved):
     groups = values["groups"]
     if not isinstance(groups, list) or any(not isinstance(gid, str) or not gid.isascii() or not gid.isdigit() for gid in groups):
         raise ValueError("群号列表无效")
     filters = values["filters"]
-    profiles, active = api_settings.catalog(ctx.base_cfg, saved)
-    if values["id"] != active:
-        raise ValueError("当前 API 配置已切换，请重新加载设置")
-    profiles[active] = api_settings.validate(values["profile"])
-    changes = {
-        **_api_changes(profiles, active), **_image_changes(ctx, values, saved, profiles),
-        "summary_prompt": values["summaryPrompt"].strip(), "summary_target_chars": chars,
-        "prompt_evolution": {**saved.get("prompt_evolution", {}), "enabled": bool(prompt["enabled"]),
-                             "days": days, "interval_days": interval},
+    return {
         "groups": list(dict.fromkeys(groups)),
         "filters": {**saved.get("filters", {}), **{name: bool(filters[name]) for name in FILTER_FLAGS},
                     "blocked_senders": prefs.blocked_senders(filters),
                     "min_text_length": max(0, int(filters["min_text_length"] or 0))},
-        "qq_account": account, "napcat_dir": values["napcatDir"].strip(), "qq_path": values["qqPath"].strip(),
-        "napcat_hidden": bool(values["hidden"]),
     }
+
+
+def _save_settings(ctx, values, saved):
+    parts = {"reports": _report_changes, "connection": _connection_changes, "reception": _reception_changes}
+    if "section" in values:
+        section = values["section"]
+        if section not in parts:
+            raise ValueError("未知设置子页")
+        changes = parts[section](values, saved)
+    else:
+        # 旧界面仍可整页保存。子页只更新自己展示的字段，保留其它页的草稿与磁盘设置。
+        profiles, active = api_settings.catalog(ctx.base_cfg, saved)
+        if values["id"] != active:
+            raise ValueError("当前 API 配置已切换，请重新加载设置")
+        profiles[active] = api_settings.validate(values["profile"])
+        changes = {**_api_changes(profiles, active), **_image_changes(ctx, values, saved, profiles)}
+        for collect in parts.values():
+            changes.update(collect(values, saved))
     return _settings(ctx, _save(ctx, changes))
 
 
