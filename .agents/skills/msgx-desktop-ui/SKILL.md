@@ -1,18 +1,19 @@
 ---
 name: msgx-desktop-ui
-description: 修改或诊断 msgx 的 Electron 界面、桌面与 Python 通信、服务启停、扫码、阅读批注和朗读时使用；涉及旧 Tk 对照界面时也适用。不处理安装打包、SQL 优化或模型任务重提。
+description: 修改或诊断 msgx Electron 的页面导航、消息筛选与定位返回、桌面 IPC、接收启停、扫码和阅读交互时使用，亦适用于旧 Tk 对照。SQL 口径和安装打包分别选对应技能。
 ---
 
 # 桌面交互与进程归属
 
-默认界面为 Electron；`gui --legacy-tk` 仅用于旧界面对照。2026-11-16 按现行入口静态校准；历史运行证据见参考，不代表本次重跑。
+默认界面为 Electron。主页、独立日志页和关键词定位按 2026-11-23 开发分支核对。`gui --legacy-tk` 用于旧界面对照。
 
 ## 先定位实际链路
 
 | 当前问题 | 修改与读取入口 |
 |---|---|
 | 窗口、IPC、启动与退出 | `desktop/main.cjs`、`preload.cjs`、`bridge.py`；读[桌面参考](references/desktop.md)“现行 Electron 入口” |
-| 设置、消息、阅读或消费页面 | 对应 `desktop/renderer/` 模块及 `settings_api.py`、`messages_api.py`、`reader_api.py`；业务契约仍由相应项目 Skill 负责 |
+| 主页消息与关键词定位返回 | 读[首页筛选与详情](references/desktop.md#首页筛选与详情)，核对当前页面、筛选条件和上下文。 |
+| 设置、阅读或消费页面 | 阅读交互查 `desktop/renderer/reader.js` 和 `desktop/reader_api.py`。设置子页落盘见[配置技能](../msgx-config-credentials/SKILL.md)，原币统计见[摘要与记账](../msgx-summary-accounting/SKILL.md)。 |
 | 旧 Tk 控件、坐标或历史故障 | `src/msgx/gui.py`、`ui/`；只读参考中的旧 Tk 部分，不将其当成 Electron 实现 |
 | 安装、升级、EXE 或图标交付 | [Windows 安装与发布](../msgx-windows-release/SKILL.md) |
 

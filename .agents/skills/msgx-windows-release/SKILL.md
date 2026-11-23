@@ -1,6 +1,6 @@
 ---
 name: msgx-windows-release
-description: 验证或修改 msgx 的 Windows 源码启动、轻量 EXE、安装版、应用更新、本地版本发布或图标时使用。不用于消息业务、凭据编辑或仅整理测试用例。
+description: 修改或验证 msgx 的 Windows 源码启动、轻量 EXE、在线安装、可选 QQ 组件、签名更新、发布附件或进程图标时使用。扫码后的接收状态由桌面技能负责。
 ---
 
 # Windows安装与发布
@@ -13,9 +13,10 @@ description: 验证或修改 msgx 的 Windows 源码启动、轻量 EXE、安装
 |---|---|
 | 开发源码或轻量 EXE | 项目 Conda、`desktop/` 与 `tools/build_launcher.py`；检查实际解释器和源码入口 |
 | 面向使用者的安装、卸载、迁移或应用更新 | `installer/`；随包运行时、独立资料根、安装登记与更新重启分别核对 |
-| 正式发布或 GitHub 更新 | 核对发布提交、版本、包内 Ed25519 公钥、在线安装入口、组件和签名更新附件；回环验收与 GitHub 实际分发分别记录 |
+| 首次下载入口或 QQ 组件补装 | 核对 `Setup.exe` 对主程序的固定摘要，以及组件的选择、缓存、校验和替换次序。见[在线安装与组件](references/windows.md#在线安装与可选组件)。 |
+| 已安装客户端更新或正式发版 | 核对发布提交、包内公钥、签过名的同一份清单及其绑定的版本化主程序。验收分别记录回环结果和实际发布结果。 |
 
-2026-11-16 的当前布局已采用 `installer/`；参考中的旧目录和测试版本号是历史证据，不是另一个维护源，也不是本次建议执行的版本升级。
+实现入口为 `installer/`。在线安装与旧客户端更新的分工于 2026-11-23 按开发分支核对。参考中的测试版本号仅用于复现实验。
 
 - 开发者自行准备Conda，一项目一个独立环境，默认名 `msgx`；PowerShell统一使用 `conda run -n msgx --no-capture-output python -s ...` 安装、源码运行和测试。业务依赖只维护 `pyproject.toml`，pip使用 `--isolated install --no-user`；不向公共 `base`、全局Python或用户site-packages安装，不创建或嵌套venv。不得借用作者目录、未跟踪EXE、凭据或数据作为启动前提。
 - 源码版沿用独立 Conda 和轻量 EXE。NapCat 的 BAT/VBS 和目标重启 PS1 属于协议/UAC 实现，保留现有用途。
