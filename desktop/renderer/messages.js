@@ -73,6 +73,16 @@ function mediaLabel(row) {
   return row.has_media ? '已跳过' : '—';
 }
 
+function imageCell(row) {
+  const state = mediaLabel(row);
+  if (!row.image_id) return state;
+  const recognition = row.vision_text ? '已识别' :
+    ['已过滤', '仅 OCR', '已跳过'].includes(state) ? '待识别' : '';
+  const labels = [...new Set([state, recognition, row.include_vision ? '已纳入摘要' : '未纳入摘要'].filter(Boolean))];
+  const text = labels.join(' · ');
+  return Object.assign(node('span', text), { title: text });
+}
+
 function expandImages(rows) {
   // 每张图片保留自己的 OCR、状态及当前纳入摘要的选择。
   return rows.flatMap(row => row.images?.length
@@ -414,7 +424,7 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
         formatTime(row.ts), identityCell('group', row.group_id, groupName(row)),
         identityCell('sender', row.sender_id, row.sender_name),
         Object.assign(control(snippet(row), () => select(row)), { title: snippet(row) }),
-        row.image_id ? `${mediaLabel(row)} · ${row.include_vision ? '已纳入' : '未纳入'}` : mediaLabel(row),
+        imageCell(row),
       ],
     })), '没有符合筛选条件的消息');
   }
@@ -669,7 +679,7 @@ export function mount(container, app, { listOnly = false, onSelect } = {}) {
       account = data.related_account;
       relatedRows = data.related;
       if (data.activity) activity = data.activity;
-      const choices = [['', '全部群'], ...(data.groups || activity.groups || []).map(row => [row.group_id, `${groupName(row)}（${row.group_id}）`])];
+      const choices = [['', '全部群'], ...(data.groups || activity.groups || []).map(row => [row.group_id, row.group_name && row.group_name !== row.group_id ? `${row.group_name}（${row.group_id}）` : String(row.group_id)])];
       if (pickedGroup && !choices.some(([id]) => id === pickedGroup)) choices.push([pickedGroup, group.input.selectedOptions[0]?.text || pickedGroup]);
       if (choices.length !== group.input.options.length || choices.some(([value, text], index) =>
         group.input.options[index].value !== value || group.input.options[index].text !== text)) {

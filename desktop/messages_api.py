@@ -40,6 +40,7 @@ def _recent(ctx, payload):
         data = {"items": [], "related": [], "groups": [], "related_account": account, "live": live}
         try:
             with ctx.read_store(cfg) as store:
+                store.conn.execute("BEGIN")  # 消息、逐图信息和选群范围取自同一 WAL 快照。
                 if view == "list" or account:
                     data["items" if view == "list" else "related"] = store.recent_messages(
                         limit, images_only=images_only, group_id=group, sender_id=sender,
